@@ -1676,9 +1676,7 @@ impl<'a, 't> Elab<'a, 't> {
             let Some(i) = inst.insts.iter().find(|i| i.name == name && i.dims.is_empty()) else {
                 continue;
             };
-            let Some((m, _)) = self.modules.get(inst.module).copied() else {
-                return None;
-            };
+            let (m, _) = self.modules.get(inst.module).copied()?;
             if m.kind != "interface" {
                 return None;
             }
