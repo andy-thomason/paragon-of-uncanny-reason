@@ -243,9 +243,11 @@ fn literal_sty(l: &Literal) -> STy {
     }
 }
 
-/// Does lowering this expression have side effects (so it can't be speculated)?
+/// Does lowering this expression have side effects, or could it fail (a
+/// member of a null handle), so it can't be speculated?
 fn has_effects(e: &Expr) -> bool {
     match e {
+        Expr::Member { .. } => true,
         Expr::Call { .. } | Expr::IncDec { .. } | Expr::Assign { .. } | Expr::New { .. } => true,
         Expr::SysCall { name, .. } => matches!(
             *name,
@@ -259,7 +261,6 @@ fn has_effects(e: &Expr) -> bool {
         Expr::Concat(v) => v.iter().any(has_effects),
         Expr::Repl { items, .. } => items.iter().any(has_effects),
         Expr::Index { base, index } => has_effects(base) || has_effects(index),
-        Expr::Member { base, .. } => has_effects(base),
         _ => false,
     }
 }

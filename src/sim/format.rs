@@ -91,6 +91,27 @@ fn conv(
             };
             format!("'{{{}}}", items.join(", "))
         }
+        ('p', Value::Bits(b))
+            if matches!(ty, Type::Bits { fields: Some(f), .. } if !f.is_empty()) =>
+        {
+            // A packed struct: its members by name.
+            let Type::Bits {
+                fields: Some(f), ..
+            } = ty
+            else {
+                unreachable!()
+            };
+            let mut items = Vec::new();
+            // Members are most significant first; each runs up to the one before.
+            let mut top = b.width;
+            for fld in f {
+                let w = top.saturating_sub(fld.offset).max(1);
+                let v = b.select(fld.offset as i64, w, true);
+                items.push(format!("{}:'h{}", fld.name, radix(&v, 4, false)));
+                top = fld.offset;
+            }
+            format!("'{{{}}}", items.join(", "))
+        }
         ('p', Value::Bits(b)) if natural => decimal(b, signed),
         ('p', v) => pattern_elem(v),
         ('s', Value::Str(s)) => s.clone(),
@@ -163,7 +184,13 @@ fn pattern_elem(v: &Value) -> String {
         }
         Value::Obj(None) => "null".into(),
         Value::Obj(Some(o)) => {
-            let items: Vec<String> = o.0.borrow().fields.iter().map(pattern_elem).collect();
+            let o = o.0.borrow();
+            let items: Vec<String> = o
+                .fields
+                .iter()
+                .zip(o.names.iter())
+                .map(|(v, n)| format!("{n}:{}", pattern_elem(v)))
+                .collect();
             format!("'{{{}}}", items.join(", "))
         }
     }

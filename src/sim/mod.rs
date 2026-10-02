@@ -682,8 +682,19 @@ impl<'d, 'a> Simulator<'d, 'a> {
                     .iter()
                     .map(|(_, ty)| crate::eval::default_for(&self.d.types, &self.d.types[ty.0 as usize]))
                     .collect();
+                let names = Rc::new(
+                    self.d.classes[c.0 as usize]
+                        .fields
+                        .iter()
+                        .map(|(n, _)| n.to_string())
+                        .collect(),
+                );
                 Some(Value::Obj(Some(crate::eval::ObjRef(Rc::new(RefCell::new(
-                    crate::eval::Object { class: *c, fields },
+                    crate::eval::Object {
+                        class: *c,
+                        fields,
+                        names,
+                    },
                 ))))))
             }
             Op::CopyObj(v) => match self.val(t, *v) {

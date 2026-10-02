@@ -36,6 +36,8 @@ impl PartialEq for ObjRef {
 pub struct Object {
     pub class: ClassId,
     pub fields: Vec<Value>,
+    /// The properties' names, for `%p`.
+    pub names: std::rc::Rc<Vec<String>>,
 }
 
 impl Value {
