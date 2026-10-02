@@ -71,78 +71,63 @@ impl<'a, 't> Elab<'a, 't> {
             .flat_map(|i| i.iter())
             .chain(extra.iter())
             .collect();
+        let hard: Vec<&ConstraintItem<'a>> = all
+            .iter()
+            .copied()
+            .filter(|i| !matches!(i, ConstraintItem::Soft(_)))
+            .collect();
+        let soft: Vec<&ConstraintItem<'a>> = all
+            .iter()
+            .copied()
+            .filter(|i| matches!(i, ConstraintItem::Soft(_)))
+            .collect();
         let has = |this: &Self, name: &str| this.classes[c.0 as usize].methods.contains_key(name);
         if has(self, "pre_randomize") {
             self.method_call(cx, c, Some(obj), "pre_randomize", &[], false)?;
         }
         let int = Ty::bits(32, true, false);
         let it = self.ir_type(&int);
-        let bit = self.bits_type(1, false, false);
-        let ok = cx.b.new_slot(it);
-        let tries = cx.b.new_slot(it);
-        let zero = cx.b.emit(Op::Const(Bits::zero(32)), it, at);
-        for s in [ok, tries] {
+        // The old values, kept for a failure.
+        let mut saved = Vec::new();
+        for (idx, _, ty) in rand {
+            let ft = self.ir_type(ty);
+            let v = cx.b.emit(Op::LoadField { obj, field: *idx }, ft, at);
+            let slot = cx.b.new_slot(ft);
             cx.b.effect(
                 Op::StoreSlot {
-                    slot: s,
+                    slot,
                     part: None,
-                    value: zero,
+                    value: v,
                 },
                 at,
             );
+            saved.push((*idx, slot, ft));
         }
-        let (head, body, found, exit) = (
-            cx.b.new_block(),
-            cx.b.new_block(),
-            cx.b.new_block(),
-            cx.b.new_block(),
-        );
-        cx.b.goto(head);
-        let n = cx.b.emit(Op::LoadSlot(tries), it, at);
-        let limit = cx.b.emit(Op::Const(Bits::from_u64(32, TRIES)), it, at);
-        let more = cx.b.emit(Op::Binary(BinOp::Lt, n, limit), bit, at);
-        cx.b.terminate(Terminator::Branch {
-            cond: more,
-            then: (body, vec![]),
-            els: (exit, vec![]),
-        });
-        cx.b.switch_to(body);
+        let ok = cx.b.new_slot(it);
+        let zero = cx.b.emit(Op::Const(Bits::zero(32)), it, at);
         let one = cx.b.emit(Op::Const(Bits::from_u64(32, 1)), it, at);
-        let n1 = cx.b.emit(Op::Binary(BinOp::Add, n, one), it, at);
         cx.b.effect(
             Op::StoreSlot {
-                slot: tries,
+                slot: ok,
                 part: None,
-                value: n1,
+                value: zero,
             },
             at,
         );
-        // Choose, then compute the dependent properties.
-        let mut derived = Vec::new();
-        for (idx, name, ty) in rand {
-            if !ty.is_integral() || !ty.unpacked.is_empty() {
-                continue;
-            }
-            let d = self.domain(name, ty, &all);
-            let v = match d.equal {
-                Some(e) => {
-                    derived.push((*idx, ty.clone(), e));
-                    continue;
-                }
-                None => self.random_in(cx, ty, &d.ranges, at),
-            };
-            self.store_field(cx, obj, *idx, v, at);
+        let (found, exit) = (cx.b.new_block(), cx.b.new_block());
+        // Every soft constraint, then without the earliest ones: a later
+        // soft constraint wins over an earlier one, a hard one over both.
+        for k in 0..=soft.len() {
+            let mut items = hard.clone();
+            items.extend(soft[k..].iter().copied());
+            self.attempt(cx, obj, rand, &items, found, at)?;
         }
-        for (idx, ty, e) in derived {
-            let v = self.lower_to(cx, &e, &ty)?;
+        // No luck: put the old values back.
+        for (idx, slot, ft) in saved {
+            let v = cx.b.emit(Op::LoadSlot(slot), ft, at);
             self.store_field(cx, obj, idx, v, at);
         }
-        let holds = self.constraints_hold(cx, &all)?;
-        cx.b.terminate(Terminator::Branch {
-            cond: holds,
-            then: (found, vec![]),
-            els: (head, vec![]),
-        });
+        cx.b.terminate(Terminator::Jump(exit, vec![]));
         cx.b.switch_to(found);
         cx.b.effect(
             Op::StoreSlot {
@@ -158,6 +143,87 @@ impl<'a, 't> Elab<'a, 't> {
         cx.b.terminate(Terminator::Jump(exit, vec![]));
         cx.b.switch_to(exit);
         Ok(cx.b.emit(Op::LoadSlot(ok), it, at))
+    }
+
+    /// Up to [`TRIES`] tries at `items`, going to `found` on success and
+    /// carrying on after otherwise. Nothing if a domain is empty.
+    fn attempt(
+        &mut self,
+        cx: &mut Cx<'a>,
+        obj: Val,
+        rand: &[(u32, &'a str, Ty<'a>)],
+        items: &[&ConstraintItem<'a>],
+        found: BlockId,
+        at: &'a str,
+    ) -> EResult<()> {
+        let mut plan = Vec::new();
+        for (idx, name, ty) in rand {
+            if !ty.is_integral() || !ty.unpacked.is_empty() {
+                continue;
+            }
+            let d = self.domain(name, ty, items);
+            if d.equal.is_none() && d.ranges.is_empty() && ty.width() <= 64 {
+                return Ok(());
+            }
+            plan.push((*idx, ty.clone(), d));
+        }
+        let int = Ty::bits(32, true, false);
+        let it = self.ir_type(&int);
+        let bit = self.bits_type(1, false, false);
+        let tries = cx.b.new_slot(it);
+        let zero = cx.b.emit(Op::Const(Bits::zero(32)), it, at);
+        cx.b.effect(
+            Op::StoreSlot {
+                slot: tries,
+                part: None,
+                value: zero,
+            },
+            at,
+        );
+        let (head, body, done) = (cx.b.new_block(), cx.b.new_block(), cx.b.new_block());
+        cx.b.goto(head);
+        let n = cx.b.emit(Op::LoadSlot(tries), it, at);
+        let limit = cx.b.emit(Op::Const(Bits::from_u64(32, TRIES)), it, at);
+        let more = cx.b.emit(Op::Binary(BinOp::Lt, n, limit), bit, at);
+        cx.b.terminate(Terminator::Branch {
+            cond: more,
+            then: (body, vec![]),
+            els: (done, vec![]),
+        });
+        cx.b.switch_to(body);
+        let one = cx.b.emit(Op::Const(Bits::from_u64(32, 1)), it, at);
+        let n1 = cx.b.emit(Op::Binary(BinOp::Add, n, one), it, at);
+        cx.b.effect(
+            Op::StoreSlot {
+                slot: tries,
+                part: None,
+                value: n1,
+            },
+            at,
+        );
+        // Choose, then compute the dependent properties.
+        let mut derived = Vec::new();
+        for (idx, ty, d) in plan {
+            match d.equal {
+                Some(e) => derived.push((idx, ty, e)),
+                None => {
+                    let v = self.random_in(cx, &ty, &d.ranges, at);
+                    self.store_field(cx, obj, idx, v, at);
+                }
+            }
+        }
+        for (idx, ty, e) in derived {
+            let v = self.lower_to(cx, &e, &ty)?;
+            self.store_field(cx, obj, idx, v, at);
+        }
+        let holds = self.constraints_hold(cx, items)?;
+        cx.b.terminate(Terminator::Branch {
+            cond: holds,
+            then: (found, vec![]),
+            els: (head, vec![]),
+        });
+        cx.b.switch_to(done);
+        Ok(())
     }
 
     fn store_field(&mut self, cx: &mut Cx<'a>, obj: Val, field: u32, value: Val, at: &'a str) {
@@ -213,7 +279,13 @@ impl<'a, 't> Elab<'a, 't> {
             (0, (1i128 << w) - 1)
         };
         let full = (lo, hi);
-        let mut sets: Option<Vec<(i128, i128)>> = None;
+        // An enum takes only its own values.
+        let mut sets: Option<Vec<(i128, i128)>> = ty.names.as_ref().map(|names| {
+            names
+                .iter()
+                .filter_map(|(_, b)| b.to_i64(ty.signed).map(|v| (v as i128, v as i128)))
+                .collect()
+        });
         let mut equal = None;
         let mut conj: Vec<Expr<'a>> = Vec::new();
         for it in items {
