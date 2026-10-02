@@ -426,7 +426,10 @@ fn compile_and_run(
                 file: String::new(),
                 line: 0,
                 col: 0,
-                message: "Simulation step limit reached (an infinite zero-delay loop?)".into(),
+                message: format!(
+                    "Simulation step limit reached at time {} (no $finish, or a zero-delay loop?)",
+                    sim.time
+                ),
                 notes: Vec::new(),
             }));
             Finish::Aborted

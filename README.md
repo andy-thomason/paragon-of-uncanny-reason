@@ -17,14 +17,11 @@ the rules, and [`docs/design/`](docs/design/) for the design documents.
 | Preprocessor (`` `define ``, `` `ifdef ``, `` `include ``, `-E`) | Working. Matches Verilator's golden output; see below |
 | Lexer and parser (AST of `&str` slices) | Working for the common subset: 64% of CC0 test sources parse; the rest stop at a named unsupported construct, mostly classes |
 | Test manifest and runner | Working: classifies all 4,447 Verilator tests and reports progress by tier |
-| Elaboration to a linear IR | Working for the common subset: 27% of self-checking tests elaborate; `paragon --ir` prints the IR |
-| Simulation | Not started |
+| Elaboration to a linear IR | Working for the common subset plus strings, unpacked arrays, interfaces; `paragon --ir` prints the IR |
+| Simulation | Reference interpreter working: 37% of self-checking tests pass |
 
 `simulate()` compiles the source and returns a running `Simulation` that
-streams events such as `$display` output. The pipeline exists as far as
-elaboration, so today it returns
-`Error::NotImplemented { stage: Stage::Simulate }` after elaborating. The
-signature will stay the same as the simulator arrives.
+streams events such as `$display` output from the reference interpreter.
 
 The preprocessor is tested against Verilator's own CC0 golden files:
 
@@ -152,12 +149,24 @@ proc Always in count:
 `n + 1` is computed at 32 bits, because the unsized `1` is 32 bits wide, and
 then truncated to 4 bits, as IEEE 1800 §11.8 requires.
 
-Running without `-E` or `--ir` simulates. For now that stops after elaboration:
+Running without `-E` or `--ir` simulates, printing `$display` output as it
+happens:
 
 ```console
-$ paragon count.sv
-%Error: Simulate is not implemented yet
+$ cat hello.sv
+module t;
+  logic [3:0] n = 0;
+  initial repeat (3) #10 begin n++; $display("[%0t] n=%0d", $time, n); end
+  initial #35 $finish;
+endmodule
+$ paragon hello.sv
+[10] n=1
+[20] n=2
+[30] n=3
 ```
+
+`--clock clk` drives a top-level input as a clock, as Verilator's test bench
+does, and `-GNAME=VALUE` overrides a top-level parameter.
 
 ## Library
 
@@ -193,7 +202,7 @@ block_on(async {
     let mut sim = match simulate(source).await {
         Ok(sim) => sim,
         Err(Error::Diagnostics(diags)) => return diags.iter().for_each(|d| eprintln!("{d}")),
-        Err(e) => return eprintln!("{e}"), // today: "Simulate is not implemented yet"
+        Err(e) => return eprintln!("{e}"),
     };
     while let Some(event) = sim.next_event().await {
         match event {
@@ -259,9 +268,9 @@ async fn main() -> Result<(), libparagon::Error> {
 ## Progress against the Verilator test suite
 
 `paragon-runner` runs every Verilator regression test through `libparagon`
-and reports how far each one gets. Today, 567 of the 2,139 self-checking
-simulation tests (27%) elaborate completely and wait only for the simulator.
-Most of the rest stop at classes, interfaces or assertions. See
+and reports how far each one gets. Today, 801 of the 2,139 self-checking
+simulation tests (37%) pass. Most of the rest stop at classes, assertions or
+other constructs not supported yet. See
 [`docs/design/01-test-suite-taxonomy.md`](docs/design/01-test-suite-taxonomy.md).
 
 ```console
