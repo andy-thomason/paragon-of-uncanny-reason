@@ -258,7 +258,8 @@ fn format_e(r: f64) -> String {
     }
 }
 
-fn format_g(r: f64) -> String {
+/// `%g`, as C prints it.
+pub fn format_g(r: f64) -> String {
     if r == 0.0 {
         return "0".into();
     }

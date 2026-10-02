@@ -355,6 +355,48 @@ pub enum Op {
         format: Option<FormatId>,
         args: Vec<Val>,
     },
+
+    // Strings. `Concat`, `Repl`, `Mux` and the comparisons also work on
+    // strings when their operands or result are strings; `Convert` turns
+    // integral values into strings and back (LRM 6.16).
+    /// A built-in string method; pure.
+    StrFunc {
+        func: StrFunc,
+        args: Vec<Val>,
+    },
+    /// `$sformatf`: a formatted string.
+    Sformat {
+        format: FormatId,
+        args: Vec<Val>,
+    },
+}
+
+/// The built-in string methods (LRM 6.16). Those that change the string
+/// (`putc`, `itoa`, ...) return the new string, which elaboration stores.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StrFunc {
+    Len,
+    /// `s.getc(i)`, also `s[i]`.
+    Getc,
+    /// `(s, i, c)`: `s` with byte `i` replaced, if it is in range and `c` is not 0.
+    Putc,
+    ToUpper,
+    ToLower,
+    Compare,
+    Icompare,
+    /// `(s, i, j)`.
+    Substr,
+    Atoi,
+    Atohex,
+    Atooct,
+    Atobin,
+    Atoreal,
+    /// `(value)`: the decimal text of an integer.
+    Itoa,
+    Hextoa,
+    Octtoa,
+    Bintoa,
+    Realtoa,
 }
 
 /// A part of a value to write: `width` bits from bit `lsb`.

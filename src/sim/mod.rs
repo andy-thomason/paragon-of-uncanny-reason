@@ -21,7 +21,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, VecDeque};
 use std::rc::Rc;
 
-pub use format::format_display;
+pub use format::{format_display, format_g};
 
 /// Where a simulation sends what it produces.
 pub trait Sink {
@@ -611,6 +611,21 @@ impl<'d, 'a> Simulator<'d, 'a> {
                 };
                 sink.report(*severity, &msg, inst.at, self.time);
                 None
+            }
+            Op::Sformat { format, args } => {
+                let vals: Vec<(Value, &Type)> = args
+                    .iter()
+                    .map(|a| (self.val(t, *a), self.val_ty(t, *a)))
+                    .collect();
+                let unit = self.d.scopes[frame_scope.0 as usize].unit;
+                let text = format_display(
+                    &self.d.formats[format.0 as usize],
+                    &vals,
+                    self.time,
+                    unit,
+                    self.d.precision,
+                );
+                Some(Value::Str(text))
             }
             Op::TriggerEvent(v) => {
                 self.wake(*v, &Value::Bits(Bits::zero(1)), &Value::Bits(Bits::ones(1)));

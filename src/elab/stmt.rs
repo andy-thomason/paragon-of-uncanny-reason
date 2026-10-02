@@ -916,6 +916,16 @@ impl<'a, 't> Elab<'a, 't> {
     fn expr_stmt(&mut self, cx: &mut Cx<'a>, e: &'t Expr<'a>) -> EResult<()> {
         match e {
             Expr::SysCall { name, args } => self.lower_systask(cx, name, args),
+            Expr::Call { func, args } if matches!(&**func, Expr::Member { base, .. } if self.is_str(Some(cx), base)) =>
+            {
+                let Expr::Member { base, name } = &**func else {
+                    unreachable!()
+                };
+                if !self.str_mutate(cx, base, name, args)? {
+                    self.str_method(cx, base, name, args)?;
+                }
+                Ok(())
+            }
             Expr::Call { func, args } => {
                 let f = self.resolve_func(Some(cx), func)?;
                 let vals = self.call_args(cx, f, args, func.at())?;
@@ -1380,6 +1390,21 @@ impl<'a, 't> Elab<'a, 't> {
                 );
                 Ok(())
             }
+            "$sformat" | "$swrite" | "$swriteb" | "$swriteh" | "$swriteo" => {
+                let Some(Arg::Ordered(Some(dst))) = args.first() else {
+                    return Err(self.error(name, format!("{name} needs a destination")));
+                };
+                let radix = match name {
+                    "$swriteb" => 'b',
+                    "$swriteh" => 'h',
+                    "$swriteo" => 'o',
+                    _ => 'd',
+                };
+                let (format, vals) = self.build_format(cx, &args[1..], radix, name)?;
+                let stt = self.add_type(Type::String);
+                let v = cx.b.emit(Op::Sformat { format, args: vals }, stt, name);
+                self.store_string(cx, dst, v)
+            }
             // Waveform dumping is not modelled yet; these have no effect on behaviour.
             "$dumpfile" | "$dumpvars" | "$dumpon" | "$dumpoff" | "$dumpall" | "$dumpflush"
             | "$dumplimit" => Ok(()),
@@ -1395,10 +1420,10 @@ impl<'a, 't> Elab<'a, 't> {
     /// Turn `$display`-style arguments into a format and its values. String
     /// literal arguments are formats for the arguments after them; other
     /// arguments print in the default radix.
-    fn build_format(
+    pub(crate) fn build_format(
         &mut self,
         cx: &mut Cx<'a>,
-        args: &'t [Arg<'a>],
+        args: &[Arg<'a>],
         radix: char,
         at: &'a str,
     ) -> EResult<(FormatId, Vec<Val>)> {
@@ -1464,7 +1489,7 @@ impl<'a, 't> Elab<'a, 't> {
         Ok((self.add_format(pieces), vals))
     }
 
-    fn format_arg(&mut self, cx: &mut Cx<'a>, e: &'t Expr<'a>, spec: char) -> EResult<Val> {
+    fn format_arg(&mut self, cx: &mut Cx<'a>, e: &Expr<'a>, spec: char) -> EResult<Val> {
         if matches!(spec, 'e' | 'f' | 'g') {
             return self.lower_real(cx, e);
         }

@@ -161,6 +161,26 @@ fn lookup_op(table: &[(&str, BinOp)], op: &str) -> Option<BinOp> {
     table.iter().find(|(o, _)| *o == op).map(|(_, b)| *b)
 }
 
+/// The type of a string method's value; `None` for one that has none.
+fn str_method_type(name: &str) -> Option<STy> {
+    let int = STy::Bits {
+        w: 32,
+        s: true,
+        f: false,
+    };
+    Some(match name {
+        "len" | "compare" | "icompare" | "atoi" | "atohex" | "atooct" | "atobin" => int,
+        "getc" => STy::Bits {
+            w: 8,
+            s: false,
+            f: false,
+        },
+        "toupper" | "tolower" | "substr" => STy::Str,
+        "atoreal" => STy::Real,
+        _ => return None,
+    })
+}
+
 fn literal_sty(l: &Literal) -> STy {
     match l {
         Literal::Bits { bits, signed, .. } => STy::Bits {
@@ -300,6 +320,24 @@ impl<'a, 't> Elab<'a, 't> {
                 s: false,
                 f: false,
             },
+            Expr::Member { base, name } if self.is_str(cx, base) => match str_method_type(name) {
+                Some(t) => t,
+                None => return Err(self.not_yet(name, &format!("string method {name}"))),
+            },
+            Expr::Call { func, .. } if matches!(&**func, Expr::Member { base, .. } if self.is_str(cx, base)) =>
+            {
+                let Expr::Member { name, .. } = &**func else {
+                    unreachable!()
+                };
+                match str_method_type(name) {
+                    Some(t) => t,
+                    None => {
+                        return Err(
+                            self.error(name, format!("String method '{name}' has no value"))
+                        );
+                    }
+                }
+            }
             Expr::Ident(_)
             | Expr::Member { .. }
             | Expr::Index { .. }
@@ -339,7 +377,9 @@ impl<'a, 't> Elab<'a, 't> {
             }
             Expr::Cond { then, els, .. } => {
                 let (a, b) = (self.self_type_cx(cx, then)?, self.self_type_cx(cx, els)?);
-                if a == STy::Real || b == STy::Real {
+                if a == STy::Str || b == STy::Str {
+                    STy::Str
+                } else if a == STy::Real || b == STy::Real {
                     STy::Real
                 } else {
                     STy::Bits {
@@ -358,6 +398,9 @@ impl<'a, 't> Elab<'a, 't> {
                         continue;
                     }
                     let t = self.self_type_cx(cx, i)?;
+                    if t == STy::Str {
+                        return Ok(STy::Str);
+                    }
                     w += t.width();
                     f |= t.four();
                 }
@@ -366,6 +409,9 @@ impl<'a, 't> Elab<'a, 't> {
             Expr::Repl { count, items } => {
                 let n = self.const_int(count)?;
                 let inner = self.self_type_cx(cx, &Expr::Concat(items.clone()))?;
+                if inner == STy::Str {
+                    return Ok(STy::Str);
+                }
                 STy::Bits {
                     w: inner.width() * n.max(0) as u32,
                     s: false,
@@ -448,6 +494,7 @@ impl<'a, 't> Elab<'a, 't> {
                 s: false,
                 f: false,
             },
+            "$sformatf" | "$psprintf" => STy::Str,
             "$realtobits" => STy::Bits {
                 w: 64,
                 s: false,
@@ -546,6 +593,10 @@ impl<'a, 't> Elab<'a, 't> {
                 let Some((bt, _)) = self.path_type(cx, base)? else {
                     return Ok(None);
                 };
+                if bt.base == Base::Str && bt.unpacked.is_empty() {
+                    // `s[i]`: a byte of the string.
+                    return Ok(Some((Ty::bits(8, false, false), true)));
+                }
                 if !bt.unpacked.is_empty() {
                     let mut t = bt.clone();
                     t.unpacked.remove(0);
@@ -1046,12 +1097,15 @@ impl<'a, 't> Elab<'a, 't> {
         match st {
             STy::Bits { w, s, f } => Ok((self.lower(cx, e, Want { w, s, f })?, st)),
             STy::Real => Ok((self.lower_real(cx, e)?, st)),
-            STy::Str => Err(self.not_yet(e.at(), "string values")),
+            STy::Str => Ok((self.lower_str(cx, e)?, st)),
         }
     }
 
     /// Lower an expression as the right-hand side of an assignment to `ty`.
     pub(crate) fn lower_to(&mut self, cx: &mut Cx<'a>, e: &Expr<'a>, ty: &Ty<'a>) -> EResult<Val> {
+        if ty.base == Base::Str && ty.unpacked.is_empty() {
+            return self.lower_str(cx, e);
+        }
         if ty.is_real() {
             return self.lower_real(cx, e);
         }
@@ -1173,6 +1227,34 @@ impl<'a, 't> Elab<'a, 't> {
         let at = e.at();
         self.last_at = at;
         let t = self.want_type(want);
+        // A string in an integral context: its bytes (LRM 6.16).
+        if matches!(
+            e,
+            Expr::Ident(_)
+                | Expr::Member { .. }
+                | Expr::Scoped { .. }
+                | Expr::Concat(_)
+                | Expr::Repl { .. }
+                | Expr::Cond { .. }
+                | Expr::Call { .. }
+                | Expr::SysCall { .. }
+        ) && self.is_str(Some(cx), e)
+        {
+            let v = self.lower_str(cx, e)?;
+            return Ok(cx.b.emit(Op::Convert(v), t, at));
+        }
+        match e {
+            Expr::Member { base, name } if self.is_str(Some(cx), base) => {
+                let (v, st) = self.str_method(cx, base, name, &[])?;
+                return Ok(self.resize(cx, v, st, want, at));
+            }
+            Expr::Index { base, index } if self.is_str(Some(cx), base) => {
+                let args = [Arg::Ordered(Some((**index).clone()))];
+                let (v, st) = self.str_method(cx, base, "getc", &args)?;
+                return Ok(self.resize(cx, v, st, want, at));
+            }
+            _ => {}
+        }
         match e {
             Expr::Number(n) => match parse_literal(n) {
                 Ok(Literal::Bits {
@@ -1541,7 +1623,11 @@ impl<'a, 't> Elab<'a, 't> {
                     self.self_type_cx(Some(cx), rhs)?,
                 );
                 let bit = self.bt(1, false, !matches!(b, BinOp::CaseEq | BinOp::CaseNe));
-                let v = if x == STy::Real || y == STy::Real {
+                let v = if x == STy::Str || y == STy::Str {
+                    let a = self.lower_str(cx, lhs)?;
+                    let c = self.lower_str(cx, rhs)?;
+                    cx.b.emit(Op::Binary(b, a, c), bit, at)
+                } else if x == STy::Real || y == STy::Real {
                     let a = self.lower_real(cx, lhs)?;
                     let c = self.lower_real(cx, rhs)?;
                     cx.b.emit(Op::Binary(b, a, c), bit, at)
@@ -1716,6 +1802,11 @@ impl<'a, 't> Elab<'a, 't> {
         func: &Expr<'a>,
         args: &[Arg<'a>],
     ) -> EResult<(Val, STy)> {
+        if let Expr::Member { base, name } = func
+            && self.is_str(Some(cx), base)
+        {
+            return self.str_method(cx, base, name, args);
+        }
         let f = self.resolve_func(Some(cx), func)?;
         if cx.const_mode {
             // A constant function: make sure its body exists to be evaluated.
@@ -1909,6 +2000,11 @@ impl<'a, 't> Elab<'a, 't> {
                     st,
                 ))
             }
+            "$sformatf" | "$psprintf" => {
+                let (format, vals) = self.build_format(cx, args, 'd', name)?;
+                let stt = self.add_type(Type::String);
+                Ok((cx.b.emit(Op::Sformat { format, args: vals }, stt, name), st))
+            }
             "$itor" => {
                 let Some(a) = arg(0) else {
                     return Err(self.error(name, "$itor needs an argument"));
@@ -1937,6 +2033,204 @@ impl<'a, 't> Elab<'a, 't> {
         }
     }
 
+    // ------------------------------------------------------------ strings
+
+    /// Is `e` string-valued? (Quietly false if its type can't be worked out.)
+    pub(crate) fn is_str(&mut self, cx: Option<&Cx<'a>>, e: &Expr<'a>) -> bool {
+        if matches!(e, Expr::Str(_) | Expr::Number(_)) {
+            return false;
+        }
+        let n = self.diags.len();
+        let r = self.self_type_cx(cx, e).ok() == Some(STy::Str);
+        self.diags.truncate(n);
+        r
+    }
+
+    /// A string-valued expression. Integral values convert to strings.
+    pub(crate) fn lower_str(&mut self, cx: &mut Cx<'a>, e: &Expr<'a>) -> EResult<Val> {
+        let stt = self.add_type(Type::String);
+        let at = e.at();
+        if let Expr::Str(s) = e {
+            let text = crate::eval::latin1(&super::decode_string_bytes(&s[1..s.len() - 1]));
+            return Ok(cx.b.emit(Op::ConstStr(text), stt, at));
+        }
+        let st = self.self_type_cx(Some(cx), e)?;
+        match st {
+            STy::Real => return Err(self.error(at, "Real value used as a string")),
+            STy::Bits { .. } => {
+                let (v, _) = self.lower_self(cx, e)?;
+                return Ok(cx.b.emit(Op::Convert(v), stt, at));
+            }
+            STy::Str => {}
+        }
+        match e {
+            Expr::Concat(items) => {
+                let mut parts = Vec::new();
+                for i in items {
+                    if !self.is_zero_repl(i) {
+                        parts.push(self.lower_str(cx, i)?);
+                    }
+                }
+                Ok(cx.b.emit(Op::Concat(parts), stt, at))
+            }
+            Expr::Repl { count, items } => {
+                let n = self.const_int(count)?;
+                let v = self.lower_str(cx, &Expr::Concat(items.clone()))?;
+                Ok(cx.b.emit(
+                    Op::Repl {
+                        value: v,
+                        count: n.max(0) as u32,
+                    },
+                    stt,
+                    at,
+                ))
+            }
+            Expr::Cond {
+                cond, then, els, ..
+            } => {
+                let c = self.truth(cx, cond)?;
+                let a = self.lower_str(cx, then)?;
+                let b = self.lower_str(cx, els)?;
+                Ok(cx.b.emit(
+                    Op::Mux {
+                        cond: c,
+                        then: a,
+                        els: b,
+                    },
+                    stt,
+                    at,
+                ))
+            }
+            Expr::Call { func, args } => Ok(self.lower_call(cx, func, args)?.0),
+            Expr::SysCall { name, args } => Ok(self.lower_sys(cx, name, args)?.0),
+            Expr::Member { base, name } if self.is_str(Some(cx), base) => {
+                Ok(self.str_method(cx, base, name, &[])?.0)
+            }
+            Expr::Ident(_) | Expr::Member { .. } | Expr::Index { .. } | Expr::Scoped { .. } => {
+                let Some(p) = self.path(cx, e)? else {
+                    return Err(self.not_yet(at, "this kind of name"));
+                };
+                Ok(self.load_path(cx, &p)?.0)
+            }
+            Expr::Cast { expr, .. } => self.lower_str(cx, expr),
+            other => Err(self.not_yet(other.at(), "this string expression")),
+        }
+    }
+
+    /// A string method that returns a value: `s.len()`, `s.substr(i, j)`...
+    pub(crate) fn str_method(
+        &mut self,
+        cx: &mut Cx<'a>,
+        base: &Expr<'a>,
+        name: &'a str,
+        args: &[Arg<'a>],
+    ) -> EResult<(Val, STy)> {
+        let Some(st) = str_method_type(name) else {
+            return Err(self.not_yet(name, &format!("string method {name}")));
+        };
+        let s = self.lower_str(cx, base)?;
+        let arg = |i: usize| match args.get(i) {
+            Some(Arg::Ordered(Some(e))) => Some(e.clone()),
+            _ => None,
+        };
+        let int = Ty::bits(32, true, false);
+        let need = |this: &mut Self, cx: &mut Cx<'a>, i: usize, string: bool| -> EResult<Val> {
+            let Some(e) = arg(i) else {
+                return Err(
+                    this.error(name, format!("Too few arguments to string method '{name}'"))
+                );
+            };
+            if string {
+                this.lower_str(cx, &e)
+            } else {
+                this.lower_to(cx, &e, &int)
+            }
+        };
+        let (func, mut extra) = match name {
+            "len" => (StrFunc::Len, vec![]),
+            "getc" => (StrFunc::Getc, vec![need(self, cx, 0, false)?]),
+            "toupper" => (StrFunc::ToUpper, vec![]),
+            "tolower" => (StrFunc::ToLower, vec![]),
+            "compare" => (StrFunc::Compare, vec![need(self, cx, 0, true)?]),
+            "icompare" => (StrFunc::Icompare, vec![need(self, cx, 0, true)?]),
+            "substr" => (
+                StrFunc::Substr,
+                vec![need(self, cx, 0, false)?, need(self, cx, 1, false)?],
+            ),
+            "atoi" => (StrFunc::Atoi, vec![]),
+            "atohex" => (StrFunc::Atohex, vec![]),
+            "atooct" => (StrFunc::Atooct, vec![]),
+            "atobin" => (StrFunc::Atobin, vec![]),
+            _ => (StrFunc::Atoreal, vec![]),
+        };
+        let mut all = vec![s];
+        all.append(&mut extra);
+        let t = match st {
+            STy::Str => self.add_type(Type::String),
+            STy::Real => self.add_type(Type::Real),
+            STy::Bits { w, s, f } => self.bt(w, s, f),
+        };
+        Ok((cx.b.emit(Op::StrFunc { func, args: all }, t, name), st))
+    }
+
+    /// A string method that changes the string: `putc`, `itoa` and friends.
+    /// False if `name` is not one.
+    pub(crate) fn str_mutate(
+        &mut self,
+        cx: &mut Cx<'a>,
+        base: &Expr<'a>,
+        name: &'a str,
+        args: &[Arg<'a>],
+    ) -> EResult<bool> {
+        let arg = |i: usize| match args.get(i) {
+            Some(Arg::Ordered(Some(e))) => Some(e.clone()),
+            _ => None,
+        };
+        let func = match name {
+            "putc" => StrFunc::Putc,
+            "itoa" => StrFunc::Itoa,
+            "hextoa" => StrFunc::Hextoa,
+            "octtoa" => StrFunc::Octtoa,
+            "bintoa" => StrFunc::Bintoa,
+            "realtoa" => StrFunc::Realtoa,
+            _ => return Ok(false),
+        };
+        let Some(a0) = arg(0) else {
+            return Err(self.error(name, format!("Too few arguments to string method '{name}'")));
+        };
+        let vals = match func {
+            StrFunc::Putc => {
+                let Some(a1) = arg(1) else {
+                    return Err(self.error(name, "putc needs an index and a character"));
+                };
+                let s = self.lower_str(cx, base)?;
+                let i = self.lower_to(cx, &a0, &Ty::bits(32, true, false))?;
+                let c = self.lower_to(cx, &a1, &Ty::bits(8, false, false))?;
+                vec![s, i, c]
+            }
+            StrFunc::Realtoa => vec![self.lower_real(cx, &a0)?],
+            _ => vec![self.lower_self(cx, &a0)?.0],
+        };
+        let stt = self.add_type(Type::String);
+        let v = cx.b.emit(Op::StrFunc { func, args: vals }, stt, name);
+        self.store_string(cx, base, v)?;
+        Ok(true)
+    }
+
+    /// Store a string value into `lhs`, converting if it is integral.
+    pub(crate) fn store_string(&mut self, cx: &mut Cx<'a>, lhs: &Expr<'a>, v: Val) -> EResult<()> {
+        let Some(p) = self.path(cx, lhs)? else {
+            return Err(self.error(lhs.at(), "Illegal assignment target"));
+        };
+        let v = if p.ty.base == Base::Str {
+            v
+        } else {
+            let t = self.bt(p.width, p.ty.signed, p.ty.four_state());
+            cx.b.emit(Op::Convert(v), t, lhs.at())
+        };
+        self.store_path(cx, &p, v, false)
+    }
+
     /// Assign to `lhs`, which may be a concatenation of paths.
     pub(crate) fn assign(
         &mut self,
@@ -1945,6 +2239,16 @@ impl<'a, 't> Elab<'a, 't> {
         rhs: &Expr<'a>,
         nba: bool,
     ) -> EResult<()> {
+        if let Expr::Index { base, index } = lhs
+            && self.is_str(Some(cx), base)
+        {
+            let args = [
+                Arg::Ordered(Some((**index).clone())),
+                Arg::Ordered(Some(rhs.clone())),
+            ];
+            self.str_mutate(cx, base, "putc", &args)?;
+            return Ok(());
+        }
         if let Expr::Concat(parts) = lhs {
             let mut paths = Vec::new();
             for p in parts {
