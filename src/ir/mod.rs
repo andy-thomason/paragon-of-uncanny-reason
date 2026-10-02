@@ -166,6 +166,10 @@ pub enum Type<'a> {
     Struct {
         fields: Vec<Field<'a>>,
     },
+    /// The result of a subroutine with `output` or `inout` arguments: its
+    /// value (if any) then the final value of each such argument, as an
+    /// array value.
+    Tuple(Vec<TypeId>),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -375,6 +379,8 @@ pub enum Op {
     // Strings. `Concat`, `Repl`, `Mux` and the comparisons also work on
     // strings when their operands or result are strings; `Convert` turns
     // integral values into strings and back (LRM 6.16).
+    /// The values, in order, as an array value (a [`Type::Tuple`]).
+    Tuple(Vec<Val>),
     /// Element `index` (linear) of an array value.
     ArrayElem { value: Val, index: Val },
     /// `len` elements of an array value from linear element `start`.

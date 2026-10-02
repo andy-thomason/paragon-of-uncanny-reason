@@ -30,6 +30,9 @@ pub(crate) struct Cx<'a> {
     pub(crate) const_mode: bool,
     /// The innermost named block, which owns static variables declared in it.
     pub(crate) block_scope: Option<ScopeId>,
+    /// For a subroutine with output arguments: the block every return goes
+    /// to, which collects the results.
+    pub(crate) exit: Option<BlockId>,
 }
 
 impl<'a> Cx<'a> {
@@ -41,6 +44,7 @@ impl<'a> Cx<'a> {
             is_func: false,
             const_mode,
             block_scope: None,
+            exit: None,
         }
     }
 }
@@ -2083,21 +2087,112 @@ impl<'a, 't> Elab<'a, 't> {
             // A constant function: make sure its body exists to be evaluated.
             self.ensure_lowered(f)?;
         }
-        let vals = self.call_args(cx, f, args, func.at())?;
+        match self.emit_call(cx, f, args, func.at())? {
+            Some(r) => Ok(r),
+            None => Err(self.error(func.at(), "Void function used in an expression")),
+        }
+    }
+
+    /// Call `f`, then copy its output arguments back to the caller's
+    /// expressions. Returns the value, if it has one.
+    pub(crate) fn emit_call(
+        &mut self,
+        cx: &mut Cx<'a>,
+        f: FuncId,
+        args: &[Arg<'a>],
+        at: &'a str,
+    ) -> EResult<Option<(Val, STy)>> {
         let sig = self.sig(f)?;
-        let Some(ret) = sig.ret else {
-            return Err(self.error(func.at(), "Void function used in an expression"));
+        let vals = self.call_args(cx, f, args, at)?;
+        let outs: Vec<usize> = (0..sig.params.len())
+            .filter(|&i| sig.dirs[i] != super::Dir::Input)
+            .collect();
+        let call = Op::Call {
+            func: f,
+            args: vals,
         };
-        let rt = self.ir_type(&ret);
-        let v = cx.b.emit(
-            Op::Call {
-                func: f,
-                args: vals,
-            },
-            rt,
-            func.at(),
-        );
-        Ok((v, sty_of(&ret)))
+        if outs.is_empty() {
+            return Ok(match &sig.ret {
+                Some(ret) => {
+                    let rt = self.ir_type(ret);
+                    Some((cx.b.emit(call, rt, at), sty_of(ret)))
+                }
+                None => {
+                    cx.b.effect(call, at);
+                    None
+                }
+            });
+        }
+        let tt = self.tuple_type(&sig);
+        let t = cx.b.emit(call, tt, at);
+        let int = self.bt(32, true, false);
+        let mut k = 0;
+        let mut elem = |this: &mut Self, cx: &mut Cx<'a>, ty: &Ty<'a>| {
+            let i = cx.b.emit(Op::Const(Bits::from_u64(32, k)), int, at);
+            k += 1;
+            let et = this.ir_type(ty);
+            cx.b.emit(Op::ArrayElem { value: t, index: i }, et, at)
+        };
+        let ret = match &sig.ret {
+            Some(r) => Some((elem(self, cx, r), sty_of(r))),
+            None => None,
+        };
+        for i in outs {
+            let (name, ty) = &sig.params[i];
+            let v = elem(self, cx, ty);
+            let actual = match args.get(i) {
+                Some(Arg::Ordered(Some(e))) => e.clone(),
+                Some(Arg::Named(n, Some(e))) if n == name => e.clone(),
+                // An omitted argument's default is where its value goes.
+                _ => match sig.defaults.get(i).cloned().flatten() {
+                    Some(e) => e,
+                    None => continue,
+                },
+            };
+            self.store_value(cx, &actual, v, ty)?;
+        }
+        Ok(ret)
+    }
+
+    /// The result type of a subroutine with output arguments.
+    pub(crate) fn tuple_type(&mut self, sig: &super::Sig<'a>) -> TypeId {
+        let mut ts = Vec::new();
+        if let Some(r) = &sig.ret {
+            ts.push(self.ir_type(r));
+        }
+        for (i, (_, ty)) in sig.params.iter().enumerate() {
+            if sig.dirs[i] != super::Dir::Input {
+                ts.push(self.ir_type(ty));
+            }
+        }
+        self.add_type(Type::Tuple(ts))
+    }
+
+    /// Store `v`, a value of type `ty`, into `lhs`, converting as an assignment does.
+    pub(crate) fn store_value(&mut self, cx: &mut Cx<'a>, lhs: &Expr<'a>, v: Val, ty: &Ty<'a>) -> EResult<()> {
+        if ty.is_integral() {
+            return self.assign_val(cx, lhs, v, sty_of(ty), false);
+        }
+        let Some(p) = self.path(cx, lhs)? else {
+            return Err(self.error(lhs.at(), "Illegal assignment target"));
+        };
+        let v = if ty.is_real() && p.ty.is_integral() {
+            let t = self.bt(p.width, p.ty.signed, p.ty.four_state());
+            cx.b.emit(
+                Op::Resize {
+                    value: v,
+                    extend: Extend::Sign,
+                },
+                t,
+                lhs.at(),
+            )
+        } else if ty.base == Base::Str && p.ty.is_integral() {
+            let t = self.bt(p.width, p.ty.signed, p.ty.four_state());
+            cx.b.emit(Op::Convert(v), t, lhs.at())
+        } else {
+            v
+        };
+        self.store_path(cx, &p, v, false)
     }
 
     pub(crate) fn call_args(
@@ -2113,6 +2208,13 @@ impl<'a, 't> Elab<'a, 't> {
         }
         let mut vals = Vec::new();
         for (i, (name, ty)) in sig.params.iter().enumerate() {
+            if sig.dirs[i] == super::Dir::Output {
+                // An output starts at its type's default value.
+                let irt = self.ir_type(ty);
+                let d = crate::eval::default_for(&self.d.types, &self.d.types[irt.0 as usize]);
+                vals.push(self.emit_value(cx, &d, ty, at));
+                continue;
+            }
             let given = match args.get(i) {
                 Some(Arg::Ordered(Some(e))) => Some(e.clone()),
                 Some(Arg::Named(n, Some(e))) if n == name => Some(e.clone()),

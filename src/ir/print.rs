@@ -48,6 +48,10 @@ impl Design<'_> {
             Type::Queue { elem, .. } => format!("{} [$]", self.type_name(*elem)),
             Type::Assoc { elem, .. } => format!("{} [*]", self.type_name(*elem)),
             Type::Struct { .. } => "struct".into(),
+            Type::Tuple(ts) => format!(
+                "({})",
+                ts.iter().map(|t| self.type_name(*t)).collect::<Vec<_>>().join(", ")
+            ),
         }
     }
 }
@@ -182,6 +186,7 @@ impl BodyFmt<'_, '_> {
             Op::LoadRange { var, start, len } => {
                 format!("load {}[%{} +: {len}]", self.var(*var), start.0)
             }
+            Op::Tuple(v) => format!("tuple ({})", Self::vals(v)),
             Op::ArrayElem { value, index } => format!("elem %{}[%{}]", value.0, index.0),
             Op::ArraySlice { value, start, len } => {
                 format!("slice %{}[%{} +: {len}]", value.0, start.0)

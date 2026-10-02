@@ -90,6 +90,9 @@ pub struct Options {
     pub time_limit: Option<std::time::Duration>,
     /// The top module's instance name (Verilator's `--l2-name`).
     pub top_instance: Option<String>,
+    /// Library files (`-v`): read like the others, but their modules are
+    /// only used where instantiated.
+    pub lib_files: Vec<String>,
 }
 
 impl Default for Options {
@@ -111,6 +114,7 @@ impl Default for Options {
             params: Vec::new(),
             time_limit: None,
             top_instance: None,
+            lib_files: Vec::new(),
         }
     }
 }
@@ -589,6 +593,7 @@ fn front_end<'a>(
         text: source,
         disk: opts.read_includes_from_disk,
         extra: &opts.extra_files,
+        libs: &opts.lib_files,
     };
     let pp_opts = pp::Options {
         include_dirs: opts.include_dirs.clone(),
@@ -604,8 +609,12 @@ fn front_end<'a>(
     // for modules nobody defines (as Verilator's -y does).
     let mut queue: Vec<String> = std::iter::once(&opts.source_name)
         .chain(&opts.extra_files)
+        .chain(&opts.lib_files)
         .cloned()
         .collect();
+    let first_found = queue.len();
+    // Library files: `-v` ones, and any found by searching (`-y`).
+    let mut library: Vec<usize> = Vec::new();
     let mut next = 0;
     loop {
         if next == queue.len() {
@@ -616,7 +625,12 @@ fn front_end<'a>(
             if found.is_empty() {
                 break;
             }
-            queue.extend(found);
+            for f in found {
+                queue.push(f);
+            }
+        }
+        if opts.lib_files.contains(&queue[next]) || next >= first_found {
+            library.push(trees.len());
         }
         let file = queue[next].clone();
         next += 1;
@@ -658,6 +672,7 @@ fn front_end<'a>(
             root_name: opts.root_name.clone(),
             params: opts.params.clone(),
             top_instance: opts.top_instance.clone(),
+            library_files: library,
         };
         let (design, elab_diags) = elab::elaborate(sm, &trees, &eopts);
         diags.extend(elab_diags.iter().map(|d| resolve(sm, d)));
@@ -714,13 +729,14 @@ struct TextFs<'s> {
     disk: bool,
     /// Extra source files, always read from disk.
     extra: &'s [String],
+    libs: &'s [String],
 }
 
 impl FileSystem for TextFs<'_> {
     fn read(&self, path: &str) -> Option<String> {
         if path == self.name {
             Some(self.text.to_string())
-        } else if self.disk || self.extra.iter().any(|e| e == path) {
+        } else if self.disk || self.extra.iter().chain(self.libs).any(|e| e == path) {
             // Library files are found by the caller and read from disk too.
             std::fs::read_to_string(path).ok()
         } else {

@@ -169,6 +169,7 @@ pub fn eval_pure<'v, 't: 'v>(
             }
             Value::Array(v)
         }
+        Op::Tuple(parts) => Value::Array(parts.iter().map(|p| arg(*p).0.clone()).collect()),
         Op::ArrayElem { value, index } => {
             let i = bits(*index).and_then(|b| b.to_i64(signed(*index)));
             match (arg(*value).0, i) {

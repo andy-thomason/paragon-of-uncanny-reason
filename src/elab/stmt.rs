@@ -285,10 +285,14 @@ impl<'a, 't> Elab<'a, 't> {
         let sig = self.sig(id)?;
         let mut cx = Cx::new(false);
         cx.is_func = true;
-        for (name, ty) in &sig.params {
+        let mut out_slots = Vec::new();
+        for (i, (name, ty)) in sig.params.iter().enumerate() {
             let irt = self.ir_type(ty);
             let v = cx.b.block_param(BlockId(0), irt);
             let slot = cx.b.new_slot(irt);
+            if sig.dirs[i] != super::Dir::Input {
+                out_slots.push((slot, irt));
+            }
             cx.b.effect(
                 Op::StoreSlot {
                     slot,
@@ -305,6 +309,9 @@ impl<'a, 't> Elab<'a, 't> {
             cx.locals[0].insert(f.name, Sym::Slot(slot, ret.clone()));
             cx.ret = Some((slot, ret.clone()));
         }
+        if !out_slots.is_empty() {
+            cx.exit = Some(cx.b.new_block());
+        }
         let mut waits = Vec::new();
         for d in &f.decls {
             if matches!(d, ast::ModuleItem::Port(_)) {
@@ -315,15 +322,32 @@ impl<'a, 't> Elab<'a, 't> {
         for s in &f.stmts {
             self.lower_stmt(&mut cx, s, &mut waits)?;
         }
-        let end = match cx.ret.clone() {
-            Some((slot, ret)) => {
+        if let Some(exit) = cx.exit {
+            // Every return comes here: the value, then the outputs.
+            cx.b.terminate(Terminator::Jump(exit, vec![]));
+            cx.b.switch_to(exit);
+            let mut vals = Vec::new();
+            if let Some((slot, ret)) = cx.ret.clone() {
                 let irt = self.ir_type(&ret);
-                let v = cx.b.emit(Op::LoadSlot(slot), irt, f.end);
-                Terminator::Return(Some(v))
+                vals.push(cx.b.emit(Op::LoadSlot(slot), irt, f.end));
             }
-            None => Terminator::Return(None),
-        };
-        cx.b.terminate(end);
+            for (slot, irt) in &out_slots {
+                vals.push(cx.b.emit(Op::LoadSlot(*slot), *irt, f.end));
+            }
+            let tt = self.tuple_type(&sig);
+            let t = cx.b.emit(Op::Tuple(vals), tt, f.end);
+            cx.b.terminate(Terminator::Return(Some(t)));
+        } else {
+            let end = match cx.ret.clone() {
+                Some((slot, ret)) => {
+                    let irt = self.ir_type(&ret);
+                    let v = cx.b.emit(Op::LoadSlot(slot), irt, f.end);
+                    Terminator::Return(Some(v))
+                }
+                None => Terminator::Return(None),
+            };
+            cx.b.terminate(end);
+        }
         let (mut body, calls) = cx.b.finish(Terminator::Unreachable);
         // Implicit waits inside a task: no callee reads, so finish them now.
         for w in waits {
@@ -816,6 +840,21 @@ impl<'a, 't> Elab<'a, 't> {
                     return Err(self.error(kw, "return outside a function or task"));
                 }
                 match (value, cx.ret.clone()) {
+                    (Some(v), Some((slot, ty))) if cx.exit.is_some() => {
+                        let v = self.lower_to(cx, v, &ty)?;
+                        cx.b.effect(
+                            Op::StoreSlot {
+                                slot,
+                                part: None,
+                                value: v,
+                            },
+                            kw,
+                        );
+                        cx.b.terminate(Terminator::Jump(cx.exit.unwrap(), vec![]));
+                    }
+                    (None, None) if cx.exit.is_some() => {
+                        cx.b.terminate(Terminator::Jump(cx.exit.unwrap(), vec![]));
+                    }
                     (Some(v), Some((_, ty))) => {
                         let v = self.lower_to(cx, v, &ty)?;
                         cx.b.terminate(Terminator::Return(Some(v)));
@@ -930,27 +969,7 @@ impl<'a, 't> Elab<'a, 't> {
             }
             Expr::Call { func, args } => {
                 let f = self.resolve_func(Some(cx), func)?;
-                let vals = self.call_args(cx, f, args, func.at())?;
-                match self.sig(f)?.ret {
-                    Some(t) => {
-                        let rt = self.ir_type(&t);
-                        cx.b.emit(
-                            Op::Call {
-                                func: f,
-                                args: vals,
-                            },
-                            rt,
-                            func.at(),
-                        );
-                    }
-                    None => cx.b.effect(
-                        Op::Call {
-                            func: f,
-                            args: vals,
-                        },
-                        func.at(),
-                    ),
-                }
+                self.emit_call(cx, f, args, func.at())?;
                 Ok(())
             }
             Expr::Ident(n) | Expr::Scoped { name: n, .. } => match self.lookup_cx(Some(cx), n) {

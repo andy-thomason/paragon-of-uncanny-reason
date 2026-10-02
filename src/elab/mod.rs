@@ -41,6 +41,9 @@ pub struct ElabOptions {
     pub params: Vec<(String, String)>,
     /// The instance name of the top module (`--l2-name`); by default its module name.
     pub top_instance: Option<String>,
+    /// Indices of the files that are libraries (`-v`, `-y`): their modules
+    /// are used where instantiated but are never tops.
+    pub library_files: Vec<usize>,
 }
 
 /// Elaborate parsed files into a design.
@@ -109,6 +112,8 @@ pub(crate) struct PortInfo<'a> {
 #[derive(Clone, Debug)]
 pub(crate) struct Sig<'a> {
     pub params: Vec<(&'a str, Ty<'a>)>,
+    /// The direction of each parameter.
+    pub dirs: Vec<Dir>,
     /// Default values of the parameters, where given.
     pub defaults: Vec<Option<ast::Expr<'a>>>,
     pub ret: Option<Ty<'a>>,
@@ -412,7 +417,19 @@ impl<'a, 't> Elab<'a, 't> {
             let _ = self.declare_item(item);
         }
 
-        // Tops: modules nobody instantiates.
+        // Tops: modules nobody instantiates, outside library files.
+        let mut library = HashSet::new();
+        let mut order = HashMap::new();
+        for (fi, f) in files.iter().enumerate() {
+            for (ii, item) in f.items.iter().enumerate() {
+                if let ast::Item::Module(m) = item {
+                    order.entry(m.name).or_insert((fi, ii));
+                    if opts.library_files.contains(&fi) {
+                        library.insert(m.name);
+                    }
+                }
+            }
+        }
         let mut used = HashSet::new();
         for (m, _) in self.modules.values() {
             collect_instances(&m.items, &mut used);
@@ -436,10 +453,15 @@ impl<'a, 't> Elab<'a, 't> {
                 .modules
                 .values()
                 .map(|(m, _)| *m)
-                .filter(|m| !used.contains(m.name) && m.kind != "interface")
+                .filter(|m| {
+                    !used.contains(m.name)
+                        && m.kind != "interface"
+                        && !library.contains(m.name)
+                })
                 .collect(),
         };
-        tops.sort_by_key(|m| m.name.as_ptr() as usize);
+        // In source order: file, then position in the file.
+        tops.sort_by_key(|m| order.get(m.name).copied().unwrap_or((usize::MAX, 0)));
         let mut overrides = Vec::new();
         for (name, value) in &opts.params {
             let name = self
@@ -1277,6 +1299,9 @@ impl<'a, 't> Elab<'a, 't> {
                 _ => None,
             })
         };
+        let mut dirs = Vec::new();
+        // An argument without a direction takes the previous one's (LRM 13.3).
+        let mut last = Dir::Input;
         for (dir, ty, name, dims) in ports {
             let ty = match ty {
                 ast::DataType::Implicit {
@@ -1285,15 +1310,23 @@ impl<'a, 't> Elab<'a, 't> {
                 } if packed.is_empty() && f.ports.is_none() => retyped(name).unwrap_or(ty),
                 _ => ty,
             };
-            if !matches!(dir, None | Some("input")) {
-                return Err(self.not_yet(name, "output and inout subroutine arguments"));
-            }
+            last = match dir {
+                None => last,
+                Some("input") => Dir::Input,
+                Some("output") => Dir::Output,
+                // `ref` arguments are copied in and out, which is the same
+                // unless the callee waits or the caller's variable changes meanwhile.
+                Some("inout" | "ref") | Some("const ref") => Dir::Inout,
+                Some(d) => return Err(self.not_yet(name, &format!("{d} subroutine arguments"))),
+            };
+            dirs.push(last);
             let mut t = self.resolve_type(ty)?;
             t.unpacked = self.unpacked_dims(dims)?;
             params.push((name, t));
         }
         Ok(Sig {
             params,
+            dirs,
             defaults,
             ret,
         })
