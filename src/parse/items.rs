@@ -974,7 +974,7 @@ impl<'a> Parser<'a> {
         let item = match self.peek() {
             Some(Token::Keyword("function" | "task")) => {
                 let proto = quals.iter().any(|q| matches!(*q, "pure" | "extern"));
-                ClassMember::Item(self.subroutine_of(proto)?)
+                ClassMember::Item(Box::new(self.subroutine_of(proto)?))
             }
             Some(Token::Keyword("constraint")) => {
                 self.bump();
@@ -993,10 +993,10 @@ impl<'a> Parser<'a> {
                 self.end_label()?;
                 ClassMember::Covergroup(name)
             }
-            Some(Token::Keyword("class")) => ClassMember::Item(ModuleItem::Class(self.class_decl(None)?)),
+            Some(Token::Keyword("class")) => ClassMember::Item(Box::new(ModuleItem::Class(self.class_decl(None)?))),
             Some(Token::Keyword("typedef" | "parameter" | "localparam" | "import")) => {
                 match self.module_item()? {
-                    Some(i) => ClassMember::Item(i),
+                    Some(i) => ClassMember::Item(Box::new(i)),
                     None => return Ok(None),
                 }
             }
@@ -1007,7 +1007,7 @@ impl<'a> Parser<'a> {
                     .copied()
                     .filter(|q| VAR_QUALIFIERS.contains(q))
                     .collect();
-                ClassMember::Item(ModuleItem::Var(self.var_decl(var_quals, None)?))
+                ClassMember::Item(Box::new(ModuleItem::Var(self.var_decl(var_quals, None)?)))
             }
         };
         Ok(Some(ClassItem { quals, item }))

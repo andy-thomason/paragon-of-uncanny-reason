@@ -242,7 +242,7 @@ pub struct ClassItem<'a> {
 #[derive(Clone, Debug)]
 pub enum ClassMember<'a> {
     /// A property, method, typedef, parameter or nested class.
-    Item(ModuleItem<'a>),
+    Item(Box<ModuleItem<'a>>),
     /// `constraint name { ... }`, kept by name only.
     Constraint(&'a str),
     /// A covergroup, kept by name only.
