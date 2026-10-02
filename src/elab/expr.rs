@@ -38,6 +38,9 @@ pub(crate) struct Cx<'a> {
     /// In a constraint: the object being randomised, whose members names
     /// stand for first.
     pub(crate) with_obj: Option<(Val, ClassId)>,
+    /// Iterators of array methods' `with` clauses, and their index slots
+    /// (for `item.index`).
+    pub(crate) iters: Vec<(&'a str, SlotId)>,
 }
 
 impl<'a> Cx<'a> {
@@ -52,6 +55,7 @@ impl<'a> Cx<'a> {
             exit: None,
             dollar: None,
             with_obj: None,
+            iters: Vec::new(),
         }
     }
 }
@@ -577,6 +581,10 @@ impl<'a, 't> Elab<'a, 't> {
                     }
                 }
             }
+            Expr::With { base, expr } => match self.with_method_type(cx, base, expr)? {
+                Some(st) => st,
+                None => return Err(self.not_yet(e.at(), "this array method with a 'with' clause")),
+            },
             Expr::Keyword("null") => STy::Class(None),
             Expr::WithConstraints { .. } => STy::Bits {
                 w: 32,
@@ -726,6 +734,11 @@ impl<'a, 't> Elab<'a, 't> {
                 },
                 _ => return Err(self.not_yet(e.at(), "nested scopes")),
             },
+            Expr::Member { base, name: "index" }
+                if matches!(&**base, Expr::Ident(n) if cx.is_some_and(|c| c.iters.iter().any(|(i, _)| i == n))) =>
+            {
+                Some((Ty::bits(32, true, false), false))
+            }
             Expr::Member { base, name } if self.handle_class(cx, base).is_some() => {
                 let c = self.handle_class(cx, base).unwrap();
                 match self.class_member(c, name)? {
@@ -1071,6 +1084,14 @@ impl<'a, 't> Elab<'a, 't> {
                 }
                 _ => return Err(self.not_yet(at, "nested scopes")),
             },
+            Expr::Member { base, name: "index" }
+                if matches!(&**base, Expr::Ident(n) if cx.iters.iter().any(|(i, _)| i == n)) =>
+            {
+                let Expr::Ident(n) = &**base else { unreachable!() };
+                let slot = cx.iters.iter().rev().find(|(i, _)| i == n).unwrap().1;
+                let int = Ty::bits(32, true, false);
+                self.root_path(cx, Some(Sym::Slot(slot, int)), at)?
+            }
             Expr::Member { base, name } if self.handle_class(Some(cx), base).is_some() => {
                 let c = self.handle_class(Some(cx), base).unwrap();
                 // `super.x` is this object's `x` as the base class sees it.
@@ -2074,6 +2095,7 @@ impl<'a, 't> Elab<'a, 't> {
                 ))
             }
             Expr::Call { func, args } => Ok(self.lower_call(cx, func, args)?.0),
+            Expr::With { base, expr } => Ok(self.lower_with_method(cx, base, expr)?.0),
             Expr::Cast { expr, .. } => self.lower_dynamic(cx, expr, ty),
             Expr::Ident(_) | Expr::Member { .. } | Expr::Index { .. } | Expr::Scoped { .. } => {
                 let Some(p) = self.path(cx, e)? else {
@@ -2278,6 +2300,289 @@ impl<'a, 't> Elab<'a, 't> {
         };
         self.store_path(cx, &kp, chosen, false)?;
         Ok(Some((ok, int)))
+    }
+
+    /// The array, method name and iterator name of `a.m(x) with (...)`.
+    fn with_parts<'e>(&self, base: &'e Expr<'a>) -> Option<(&'e Expr<'a>, &'a str, &'a str)> {
+        let (func, args) = match base {
+            Expr::Call { func, args } => (&**func, &args[..]),
+            m @ Expr::Member { .. } => (m, &[][..]),
+            _ => return None,
+        };
+        let Expr::Member { base: arr, name } = func else {
+            return None;
+        };
+        let iter = match args.first() {
+            Some(Arg::Ordered(Some(Expr::Ident(i)))) => *i,
+            _ => "item",
+        };
+        Some((arr, name, iter))
+    }
+
+    /// The type of `a.m() with (expr)`, if it is a method with one.
+    fn with_method_type(
+        &mut self,
+        cx: Option<&Cx<'a>>,
+        base: &Expr<'a>,
+        expr: &Expr<'a>,
+    ) -> EResult<Option<STy>> {
+        let Some((arr, name, iter)) = self.with_parts(base) else {
+            return Ok(None);
+        };
+        let Some(t) = self.array_type_opt(cx, arr) else {
+            return Ok(None);
+        };
+        let mut elem = t.clone();
+        elem.unpacked.remove(0);
+        let queue = |e: &Ty<'a>| {
+            let mut q = e.clone();
+            q.unpacked = vec![UDim::Queue];
+            sty_of(&q)
+        };
+        Ok(Some(match name {
+            "sum" | "product" | "and" | "or" | "xor" => {
+                // The type of the `with` expression, with the iterator bound.
+                let mut tmp = Cx::new(false);
+                if let Some(c) = cx {
+                    tmp.locals = c.locals.clone();
+                    tmp.with_obj = c.with_obj;
+                    tmp.iters = c.iters.clone();
+                }
+                tmp.locals.push(HashMap::from([(iter, Sym::Slot(SlotId(0), elem.clone()))]));
+                tmp.iters.push((iter, SlotId(0)));
+                self.self_type_cx(Some(&tmp), expr)?
+            }
+            "find" | "find_first" | "find_last" | "min" | "max" => queue(&elem),
+            "find_index" | "find_first_index" | "find_last_index" => queue(&Ty::bits(32, true, false)),
+            _ => return Ok(None),
+        }))
+    }
+
+    /// `a.m(x) with (expr)`: a loop over the elements, left to right, with
+    /// the iterator (`item` by default) and `item.index` bound.
+    pub(crate) fn lower_with_method(
+        &mut self,
+        cx: &mut Cx<'a>,
+        base: &Expr<'a>,
+        expr: &Expr<'a>,
+    ) -> EResult<(Val, STy, Ty<'a>)> {
+        let at = base.at();
+        let Some((arr, name, iter)) = self.with_parts(base) else {
+            return Err(self.not_yet(at, "this 'with' clause"));
+        };
+        let Some(t) = self.array_type(cx, arr) else {
+            return Err(self.error(arr.at(), "Not an array"));
+        };
+        let Some(st) = self.with_method_type(Some(cx), base, expr)? else {
+            return Err(self.not_yet(name, &format!("array method {name} with a 'with' clause")));
+        };
+        let mut elem = t.clone();
+        elem.unpacked.remove(0);
+        let et = self.ir_type(&elem);
+        let Some(p) = self.path(cx, arr)? else {
+            return Err(self.error(arr.at(), "Not an array"));
+        };
+        let (whole, _) = self.load_path(cx, &p)?;
+        // Left to right: a fixed-size array's elements are stored right to left.
+        let mut q = elem.clone();
+        q.unpacked = vec![UDim::Queue];
+        let qt = self.ir_type(&q);
+        let items = if matches!(t.unpacked[0], UDim::Fixed(..)) {
+            cx.b.emit(
+                Op::ArrFunc {
+                    func: ArrFunc::Reverse,
+                    args: vec![whole],
+                },
+                qt,
+                at,
+            )
+        } else if matches!(t.unpacked[0], UDim::Assoc(_)) {
+            return Err(self.not_yet(at, "'with' methods of associative arrays"));
+        } else {
+            whole
+        };
+        let int = Ty::bits(32, true, false);
+        let it = self.ir_type(&int);
+        let n = self.arr_op(cx, ArrFunc::Size, vec![items], &int, at);
+        let rty = st.ty();
+        let rty = match name {
+            "find" | "find_first" | "find_last" | "min" | "max" => q.clone(),
+            "find_index" | "find_first_index" | "find_last_index" => {
+                let mut iq = int.clone();
+                iq.unpacked = vec![UDim::Queue];
+                iq
+            }
+            _ => rty,
+        };
+        let rt = self.ir_type(&rty);
+        // The result so far; for min and max, also the best key.
+        let acc = cx.b.new_slot(rt);
+        let start = match name {
+            "sum" | "or" | "xor" => cx.b.emit(Op::Const(Bits::zero(rty.width().max(1))), rt, at),
+            "product" => cx.b.emit(Op::Const(Bits::from_u64(rty.width().max(1), 1)), rt, at),
+            "and" => cx.b.emit(Op::Const(Bits::ones(rty.width().max(1))), rt, at),
+            _ => cx.b.emit(Op::Concat(vec![]), rt, at),
+        };
+        cx.b.effect(
+            Op::StoreSlot {
+                slot: acc,
+                part: None,
+                value: start,
+            },
+            at,
+        );
+        let best = cx.b.new_slot(it);
+        let islot = cx.b.new_slot(it);
+        let item = cx.b.new_slot(et);
+        let zero = cx.b.emit(Op::Const(Bits::zero(32)), it, at);
+        cx.b.effect(
+            Op::StoreSlot {
+                slot: islot,
+                part: None,
+                value: zero,
+            },
+            at,
+        );
+        let bit = self.bits_type(1, false, false);
+        let (head, body, exit) = (cx.b.new_block(), cx.b.new_block(), cx.b.new_block());
+        cx.b.goto(head);
+        let i = cx.b.emit(Op::LoadSlot(islot), it, at);
+        let more = cx.b.emit(Op::Binary(BinOp::Lt, i, n), bit, at);
+        cx.b.terminate(Terminator::Branch {
+            cond: more,
+            then: (body, vec![]),
+            els: (exit, vec![]),
+        });
+        cx.b.switch_to(body);
+        let iv = cx.b.emit(Op::ArrayElem { value: items, index: i }, et, at);
+        cx.b.effect(
+            Op::StoreSlot {
+                slot: item,
+                part: None,
+                value: iv,
+            },
+            at,
+        );
+        cx.locals.push(HashMap::from([(iter, Sym::Slot(item, elem.clone()))]));
+        cx.iters.push((iter, islot));
+        let r = (|| -> EResult<()> {
+            let cur = cx.b.emit(Op::LoadSlot(acc), rt, at);
+            let new = match name {
+                "sum" | "product" | "and" | "or" | "xor" => {
+                    let v = self.lower_to(cx, expr, &rty)?;
+                    let op = match name {
+                        "sum" => BinOp::Add,
+                        "product" => BinOp::Mul,
+                        "and" => BinOp::And,
+                        "or" => BinOp::Or,
+                        _ => BinOp::Xor,
+                    };
+                    cx.b.emit(Op::Binary(op, cur, v), rt, at)
+                }
+                "min" | "max" => {
+                    // Keep the element with the smallest (largest) key.
+                    let k = self.lower_to(cx, expr, &int)?;
+                    let b = cx.b.emit(Op::LoadSlot(best), it, at);
+                    let first = cx.b.emit(Op::Binary(BinOp::Eq, i, zero), bit, at);
+                    let op = if name == "min" { BinOp::Lt } else { BinOp::Gt };
+                    let better = cx.b.emit(Op::Binary(op, k, b), bit, at);
+                    let take = cx.b.emit(Op::Binary(BinOp::Or, first, better), bit, at);
+                    let nb = cx.b.emit(
+                        Op::Mux {
+                            cond: take,
+                            then: k,
+                            els: b,
+                        },
+                        it,
+                        at,
+                    );
+                    cx.b.effect(
+                        Op::StoreSlot {
+                            slot: best,
+                            part: None,
+                            value: nb,
+                        },
+                        at,
+                    );
+                    let one = cx.b.emit(Op::Concat(vec![iv]), rt, at);
+                    cx.b.emit(
+                        Op::Mux {
+                            cond: take,
+                            then: one,
+                            els: cur,
+                        },
+                        rt,
+                        at,
+                    )
+                }
+                _ => {
+                    // The locators: add the element (or index) if it matches.
+                    let c = self.truth(cx, expr)?;
+                    let x = if name.ends_with("_index") { i } else { iv };
+                    let pushed = cx.b.emit(
+                        Op::ArrFunc {
+                            func: ArrFunc::PushBack,
+                            args: vec![cur, x],
+                        },
+                        rt,
+                        at,
+                    );
+                    let keep = if name.starts_with("find_last") {
+                        // Only the latest match.
+                        cx.b.emit(Op::Concat(vec![x]), rt, at)
+                    } else {
+                        pushed
+                    };
+                    let ok = cx.b.emit(Op::Unary(UnOp::RedOr, c), bit, at);
+                    let first_only = name.starts_with("find_first");
+                    let none_yet = {
+                        let size = self.arr_op(cx, ArrFunc::Size, vec![cur], &int, at);
+                        cx.b.emit(Op::Binary(BinOp::Eq, size, zero), bit, at)
+                    };
+                    let take = if first_only {
+                        cx.b.emit(Op::Binary(BinOp::And, ok, none_yet), bit, at)
+                    } else {
+                        ok
+                    };
+                    cx.b.emit(
+                        Op::Mux {
+                            cond: take,
+                            then: keep,
+                            els: cur,
+                        },
+                        rt,
+                        at,
+                    )
+                }
+            };
+            cx.b.effect(
+                Op::StoreSlot {
+                    slot: acc,
+                    part: None,
+                    value: new,
+                },
+                at,
+            );
+            Ok(())
+        })();
+        cx.iters.pop();
+        cx.locals.pop();
+        r?;
+        let i = cx.b.emit(Op::LoadSlot(islot), it, at);
+        let one = cx.b.emit(Op::Const(Bits::from_u64(32, 1)), it, at);
+        let i1 = cx.b.emit(Op::Binary(BinOp::Add, i, one), it, at);
+        cx.b.effect(
+            Op::StoreSlot {
+                slot: islot,
+                part: None,
+                value: i1,
+            },
+            at,
+        );
+        cx.b.terminate(Terminator::Jump(head, vec![]));
+        cx.b.switch_to(exit);
+        let v = cx.b.emit(Op::LoadSlot(acc), rt, at);
+        Ok((v, sty_of(&rty), rty))
     }
 
     /// An array method with a value: `q.size()`, `a.sum()`, `q.pop_front()`...
@@ -2607,6 +2912,10 @@ impl<'a, 't> Elab<'a, 't> {
             }
             Expr::Member { base, name } if self.array_type(cx, base).is_some() => {
                 let (v, st) = self.array_method(cx, base, name, &[])?;
+                return Ok(self.resize(cx, v, st, want, at));
+            }
+            Expr::With { base, expr } => {
+                let (v, st, _) = self.lower_with_method(cx, base, expr)?;
                 return Ok(self.resize(cx, v, st, want, at));
             }
             Expr::WithConstraints { call, items } => {
