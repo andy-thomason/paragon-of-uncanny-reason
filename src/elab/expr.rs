@@ -1175,7 +1175,21 @@ impl<'a, 't> Elab<'a, 't> {
         let t = self.want_type(want);
         match e {
             Expr::Number(n) => match parse_literal(n) {
-                Ok(Literal::Bits { bits, signed, .. }) => {
+                Ok(Literal::Bits {
+                    mut bits,
+                    signed,
+                    sized,
+                }) => {
+                    // An unsized literal whose leftmost digit is X or Z
+                    // extends with X or Z to the context's width (LRM 5.7.1).
+                    let (mv, mu) = bits.msb();
+                    if !sized && mu && want.w > bits.width {
+                        let natural = bits.width;
+                        bits = bits.resize(want.w, false);
+                        for i in natural..want.w {
+                            bits.set_bit(i, mv, true);
+                        }
+                    }
                     let c = cx.b.emit(
                         Op::Const(bits.clone()),
                         self.bt(bits.width, signed, bits.has_unknown()),

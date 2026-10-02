@@ -26,6 +26,9 @@ fn main() -> ExitCode {
         } else if let Some(def) = arg.strip_prefix("-D") {
             let (name, value) = def.split_once('=').unwrap_or((def, ""));
             opts.defines.push((name.into(), value.into()));
+        } else if let Some(g) = arg.strip_prefix("-G") {
+            let (name, value) = g.split_once('=').unwrap_or((g, "1"));
+            opts.params.push((name.into(), value.into()));
         } else if let Some(dirs) = arg.strip_prefix("+incdir+") {
             opts.include_dirs
                 .extend(dirs.split('+').filter(|d| !d.is_empty()).map(String::from));

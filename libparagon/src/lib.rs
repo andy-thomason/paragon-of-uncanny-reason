@@ -83,6 +83,11 @@ pub struct Options {
     /// A name for the test bench around the top modules, which prefixes
     /// hierarchical names: `Some("top")` makes `%m` print `top.t`.
     pub root_name: Option<String>,
+    /// `-Gname=value` overrides for top-level parameters.
+    pub params: Vec<(String, String)>,
+    /// Stop a simulation that runs longer than this (wall-clock time); it
+    /// then ends with [`Finish::Aborted`] and a diagnostic.
+    pub time_limit: Option<std::time::Duration>,
 }
 
 impl Default for Options {
@@ -101,6 +106,8 @@ impl Default for Options {
             max_steps: None,
             clocks: Vec::new(),
             root_name: None,
+            params: Vec::new(),
+            time_limit: None,
         }
     }
 }
@@ -392,7 +399,13 @@ fn compile_and_run(
             sim.set_input(var, paragon_of_uncanny_reason::ir::Bits::zero(w));
         }
     }
-    let mut sink = EventSink { sm: &sm, events };
+    let deadline = opts.time_limit.map(|d| std::time::Instant::now() + d);
+    let mut sink = EventSink {
+        sm: &sm,
+        events,
+        deadline,
+        checks: std::cell::Cell::new(0),
+    };
     let end = sim.run(&mut sink);
     let finish = match end {
         sim::End::Finish => Finish::Finish,
@@ -411,7 +424,20 @@ fn compile_and_run(
             }));
             Finish::Aborted
         }
-        sim::End::Cancelled => Finish::Aborted,
+        sim::End::Cancelled => {
+            if sink.timed_out() {
+                let _ = events.send(Event::Diagnostic(Diagnostic {
+                    severity: Severity::Error,
+                    code: None,
+                    file: String::new(),
+                    line: 0,
+                    col: 0,
+                    message: "Simulation time limit reached".into(),
+                    notes: Vec::new(),
+                }));
+            }
+            Finish::Aborted
+        }
     };
     let _ = events.send(Event::Finished {
         finish,
@@ -423,6 +449,16 @@ fn compile_and_run(
 struct EventSink<'s> {
     sm: &'s SourceMap,
     events: &'s EventSender,
+    deadline: Option<std::time::Instant>,
+    /// Calls to `cancelled`, so the clock is read only now and then.
+    checks: std::cell::Cell<u32>,
+}
+
+impl EventSink<'_> {
+    fn timed_out(&self) -> bool {
+        self.deadline
+            .is_some_and(|d| std::time::Instant::now() >= d)
+    }
 }
 
 impl sim::Sink for EventSink<'_> {
@@ -455,7 +491,9 @@ impl sim::Sink for EventSink<'_> {
     }
 
     fn cancelled(&self) -> bool {
-        self.events.is_closed()
+        let n = self.checks.get().wrapping_add(1);
+        self.checks.set(n);
+        self.events.is_closed() || (n % 1024 == 0 && self.timed_out())
     }
 }
 
@@ -615,6 +653,7 @@ fn front_end<'a>(
         let eopts = elab::ElabOptions {
             top: opts.top.clone(),
             root_name: opts.root_name.clone(),
+            params: opts.params.clone(),
         };
         let (design, elab_diags) = elab::elaborate(sm, &trees, &eopts);
         diags.extend(elab_diags.iter().map(|d| resolve(sm, d)));

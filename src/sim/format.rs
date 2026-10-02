@@ -139,11 +139,7 @@ fn conv(
 fn to_real(v: &Value, signed: bool) -> f64 {
     match v {
         Value::Real(r) => *r,
-        Value::Bits(b) => match b.to_i64(signed) {
-            Some(i) if signed => i as f64,
-            Some(i) => i as u64 as f64,
-            None => b.to_u64() as f64,
-        },
+        Value::Bits(b) => crate::eval::bits_to_f64(b, signed),
         Value::Str(_) => 0.0,
     }
 }
@@ -180,13 +176,17 @@ fn decimal(b: &Bits, signed: bool) -> String {
         let v = mag.val[0] as u128 | (mag.val.get(1).copied().unwrap_or(0) as u128) << 64;
         digits = v.to_string();
     } else {
-        let mut v = mag;
-        let ten18 = Bits::from_u64(v.width, 1_000_000_000_000_000_000);
+        // Short division by 10^18 over 64-bit limbs.
+        let mut limbs: Vec<u64> = mag.val.clone();
         let mut chunks = Vec::new();
-        while !v.is_zero() {
-            let r = v.div_rem(&ten18, false, true).to_u64();
-            chunks.push(r);
-            v = v.div_rem(&ten18, false, false);
+        while limbs.iter().any(|&l| l != 0) {
+            let mut rem: u128 = 0;
+            for l in limbs.iter_mut().rev() {
+                let cur = (rem << 64) | *l as u128;
+                *l = (cur / 1_000_000_000_000_000_000) as u64;
+                rem = cur % 1_000_000_000_000_000_000;
+            }
+            chunks.push(rem as u64);
         }
         for (i, c) in chunks.iter().rev().enumerate() {
             if i == 0 {

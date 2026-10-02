@@ -385,6 +385,14 @@ impl<'a, 't> Elab<'a, 't> {
         let base = self.resolve_type(&d.ty)?;
         for v in &d.vars {
             self.last_at = v.name;
+            // The type declaration of a non-ANSI argument, already a slot.
+            if cx.is_func
+                && cx.locals.len() == 1
+                && v.init.is_none()
+                && matches!(cx.locals[0].get(v.name), Some(Sym::Slot(..)))
+            {
+                continue;
+            }
             let mut ty = base.clone();
             ty.unpacked = self.unpacked_dims(&v.dims)?;
             if automatic && !ty.unpacked.is_empty() {

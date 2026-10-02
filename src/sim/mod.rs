@@ -226,14 +226,38 @@ impl<'d, 'a> Simulator<'d, 'a> {
     /// Run the whole simulation.
     pub fn run(&mut self, sink: &mut dyn Sink) -> End {
         let d = self.d;
+        let comb = |k: ProcKind| {
+            matches!(
+                k,
+                ProcKind::ContAssign | ProcKind::AlwaysComb | ProcKind::AlwaysLatch
+            )
+        };
+        // Combinational logic settles before anything else starts, so
+        // `initial` blocks see its values at time 0, as in Verilator. (The
+        // LRM leaves the order open.)
+        let combs: Vec<&Process> = d.procs.iter().filter(|p| comb(p.kind)).collect();
+        for p in data_flow_order(&combs) {
+            let t = self.spawn(&p.body, p.scope, BlockId(0), None, Vec::new(), None);
+            self.active.push_back(t);
+        }
+        let mut settled = None;
+        while let Some(t) = self.active.pop_front() {
+            if let Some(end) = self.run_thread(t, sink) {
+                settled = Some(end);
+                break;
+            }
+        }
         for p in &d.procs {
-            if p.kind == ProcKind::Final {
+            if p.kind == ProcKind::Final || comb(p.kind) {
                 continue;
             }
             let t = self.spawn(&p.body, p.scope, BlockId(0), None, Vec::new(), None);
             self.active.push_back(t);
         }
-        let end = self.schedule(sink);
+        let end = match settled {
+            Some(end) => end,
+            None => self.schedule(sink),
+        };
         // `final` blocks run once, at the end, whatever ended the simulation.
         if matches!(end, End::Finish | End::Stop | End::Quiescent | End::Fatal) {
             for p in &d.procs {
@@ -411,6 +435,9 @@ impl<'d, 'a> Simulator<'d, 'a> {
             self.steps += 1;
             if self.steps > self.max_steps {
                 return Some(End::Hung);
+            }
+            if self.steps % 65536 == 0 && sink.cancelled() {
+                return Some(End::Cancelled);
             }
             let Some(frame) = self.threads[t].frames.last_mut() else {
                 self.finish_thread(t);
@@ -830,6 +857,62 @@ impl<'d, 'a> Simulator<'d, 'a> {
     fn ready(&mut self, t: ThreadId) {
         self.threads[t].state = State::Ready;
     }
+}
+
+/// Processes ordered so that one writing a variable comes before those
+/// reading it, where that is possible; otherwise in their given order.
+fn data_flow_order<'p, 'a>(procs: &[&'p Process<'a>]) -> Vec<&'p Process<'a>> {
+    let vars = |p: &Process, write: bool| -> Vec<VarId> {
+        let mut v = Vec::new();
+        for b in &p.body.blocks {
+            for i in &b.insts {
+                match (&i.op, write) {
+                    (
+                        Op::Store { var, .. }
+                        | Op::NbaStore { var, .. }
+                        | Op::StoreElem { var, .. },
+                        true,
+                    )
+                    | (Op::Load(var) | Op::LoadElem { var, .. }, false) => v.push(*var),
+                    _ => {}
+                }
+            }
+        }
+        v
+    };
+    let writes: Vec<Vec<VarId>> = procs.iter().map(|p| vars(p, true)).collect();
+    let reads: Vec<Vec<VarId>> = procs.iter().map(|p| vars(p, false)).collect();
+    // Process i must wait for each j != i that writes something i reads.
+    let n = procs.len();
+    let mut before: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut writers: std::collections::HashMap<VarId, Vec<usize>> = Default::default();
+    for (j, w) in writes.iter().enumerate() {
+        for v in w {
+            writers.entry(*v).or_default().push(j);
+        }
+    }
+    for (i, r) in reads.iter().enumerate() {
+        for v in r {
+            for &j in writers.get(v).into_iter().flatten() {
+                if j != i && !before[i].contains(&j) {
+                    before[i].push(j);
+                }
+            }
+        }
+    }
+    // Repeatedly take the first process whose writers have all been taken;
+    // on a cycle, take the first remaining one.
+    let mut done = vec![false; n];
+    let mut order = Vec::with_capacity(n);
+    while order.len() < n {
+        let next = (0..n)
+            .find(|&i| !done[i] && before[i].iter().all(|&j| done[j]))
+            .or_else(|| (0..n).find(|&i| !done[i]))
+            .unwrap();
+        done[next] = true;
+        order.push(procs[next]);
+    }
+    order
 }
 
 enum Flow {

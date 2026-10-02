@@ -140,8 +140,10 @@ pub fn eval_pure<'v, 't: 'v>(
         Op::Resize { value, extend } => {
             let (w, _, _) = bits_info(ty)?;
             match arg(*value).0 {
-                // A real converted to an integral type rounds to nearest.
-                Value::Real(r) => fix(Bits::from_i64(w, r.round() as i64)),
+                // A real converted to an integral type rounds to nearest,
+                // except for `$rtoi`, which truncates.
+                Value::Real(r) if *extend == Extend::Truncate => fix(Bits::from_f64(w, r.trunc())),
+                Value::Real(r) => fix(Bits::from_f64(w, r.round())),
                 Value::Bits(b) => fix(b.resize(w, *extend == Extend::Sign)),
                 Value::Str(_) => return None,
             }
@@ -163,22 +165,29 @@ pub fn eval_pure<'v, 't: 'v>(
             }
         },
         Op::Convert(v) => match (arg(*v).0, ty) {
-            (Value::Bits(b), Type::Real) => {
-                let s = signed(*v);
-                Value::Real(match b.to_i64(s) {
-                    Some(i) if s => i as f64,
-                    Some(i) => i as u64 as f64,
-                    None => 0.0,
-                })
-            }
-            (Value::Real(r), Type::Bits { width, .. }) => {
-                fix(Bits::from_i64(*width, r.round() as i64))
-            }
+            (Value::Bits(b), Type::Real) => Value::Real(bits_to_f64(b, signed(*v))),
+            (Value::Real(r), Type::Bits { width, .. }) => fix(Bits::from_f64(*width, r.round())),
             (v, _) => v.clone(),
         },
         _ => return None,
     };
     Some(v)
+}
+
+/// The real value of an integral value; X and Z bits count as 0.
+pub fn bits_to_f64(b: &Bits, signed: bool) -> f64 {
+    let mut b = b.clone();
+    b.to_two_state();
+    if let Some(i) = b.to_i64(signed) {
+        return if signed { i as f64 } else { i as u64 as f64 };
+    }
+    let neg = signed && b.msb().0;
+    let mag = if neg { b.neg() } else { b };
+    let mut r = 0.0;
+    for i in (0..mag.width).rev() {
+        r = r * 2.0 + if mag.bit(i).0 { 1.0 } else { 0.0 };
+    }
+    if neg { -r } else { r }
 }
 
 fn real_binary(op: BinOp, p: f64, q: f64, fix: &dyn Fn(Bits) -> Value) -> Option<Value> {

@@ -50,6 +50,24 @@ impl Bits {
         b
     }
 
+    /// An integral value of a real, which should already be rounded or
+    /// truncated; bits above `width` are dropped. NaN and infinities are 0.
+    pub fn from_f64(width: u32, r: f64) -> Bits {
+        if !r.is_finite() {
+            return Bits::zero(width);
+        }
+        if r.abs() < 9.2e18 {
+            return Bits::from_i64(width, r as i64);
+        }
+        // mantissa * 2^exp, built at the full width.
+        let bits = r.abs().to_bits();
+        let exp = ((bits >> 52) & 0x7ff) as i64 - 1075;
+        let mantissa = (bits & ((1 << 52) - 1)) | (1 << 52);
+        let m = Bits::from_u64(width.max(64), mantissa).shl(exp.max(0) as u64);
+        let m = if r < 0.0 { m.neg() } else { m };
+        m.resize(width, false)
+    }
+
     pub fn from_bool(v: bool) -> Bits {
         Bits::from_u64(1, v as u64)
     }
@@ -118,7 +136,7 @@ impl Bits {
         ((self.val[w] >> b) & 1 == 1, (self.unk(w) >> b) & 1 == 1)
     }
 
-    fn set_bit(&mut self, i: u32, v: bool, u: bool) {
+    pub fn set_bit(&mut self, i: u32, v: bool, u: bool) {
         let (w, b) = ((i / 64) as usize, i % 64);
         self.val[w] = (self.val[w] & !(1 << b)) | ((v as u64) << b);
         if u || self.unknown.is_some() {

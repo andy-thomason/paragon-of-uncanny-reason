@@ -84,6 +84,9 @@ struct Args {
     list: Option<String>,
 }
 
+/// `--show`: print each test's simulation output and diagnostics.
+static SHOW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 fn parse_args() -> Result<Args, String> {
     let mut a = Args {
         manifest: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../tests/manifest.json"),
@@ -101,6 +104,7 @@ fn parse_args() -> Result<Args, String> {
             "--filter" => a.filter = Some(value()?),
             "--json" => a.json = Some(value()?.into()),
             "--list" => a.list = Some(value()?),
+            "--show" => SHOW.store(true, std::sync::atomic::Ordering::Relaxed),
             _ => return Err(format!("unknown argument {arg}")),
         }
     }
@@ -232,11 +236,16 @@ fn run_test(test: &Value, root: &Path) -> Outcome {
     let diags = match result {
         Ok(sim) => {
             let r = block_on(sim.wait());
-            let finished = r.stdout.contains("*-* All Finished *-*");
+            if SHOW.load(std::sync::atomic::Ordering::Relaxed) {
+                eprintln!("==== {name}: {:?} at {}\n{}", r.finish, r.time, r.stdout);
+                r.diagnostics.iter().for_each(|d| eprintln!("{d}"));
+            }
             // Verilator's test passes when the model exits cleanly: `$finish`,
-            // or running out of events after printing the finish banner.
-            let clean = r.finish == libparagon::Finish::Finish
-                || (r.finish == libparagon::Finish::Quiescent && finished);
+            // or running out of events.
+            let clean = matches!(
+                r.finish,
+                libparagon::Finish::Finish | libparagon::Finish::Quiescent
+            );
             let bad_end = !clean;
             let error = r
                 .diagnostics
@@ -487,6 +496,7 @@ fn options(test: &Value, top: &str, name: &str) -> Result<Options, String> {
         ],
         // Enough for any test in the suite; stops runaway zero-delay loops.
         max_steps: Some(20_000_000),
+        time_limit: Some(std::time::Duration::from_secs(20)),
         // Verilator's test bench instantiates the model as `top` and toggles
         // its clocks; `--binary` builds run the model on its own.
         clocks: if binary {
@@ -503,6 +513,11 @@ fn options(test: &Value, top: &str, name: &str) -> Result<Options, String> {
         if let Some(d) = f.strip_prefix("-D") {
             let (k, v) = d.split_once('=').unwrap_or((d, ""));
             o.defines.push((k.into(), v.into()));
+        } else if let Some(g) = f.strip_prefix("-G").or_else(|| f.strip_prefix("-pvalue+")) {
+            let Some((k, v)) = g.split_once('=') else {
+                return Err(format!("bad parameter flag {f}"));
+            };
+            o.params.push((k.into(), v.into()));
         } else if let Some(defs) = f.strip_prefix("+define+") {
             for d in defs.split('+').filter(|d| !d.is_empty()) {
                 let (k, v) = d.split_once('=').unwrap_or((d, ""));

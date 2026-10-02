@@ -36,6 +36,9 @@ pub struct ElabOptions {
     pub top: Option<String>,
     /// See [`Design::root_name`].
     pub root_name: Option<String>,
+    /// `-Gname=value`: overrides for the top modules' parameters. A value is
+    /// a number or a quoted string.
+    pub params: Vec<(String, String)>,
 }
 
 /// Elaborate parsed files into a design.
@@ -435,9 +438,28 @@ impl<'a, 't> Elab<'a, 't> {
                 .collect(),
         };
         tops.sort_by_key(|m| m.name.as_ptr() as usize);
+        let mut overrides = Vec::new();
+        for (name, value) in &opts.params {
+            let name = self
+                .sm
+                .add(name.clone(), crate::source::Origin::CommandLine)
+                .1;
+            match cmdline_override(value) {
+                Ok(o) => overrides.push((Some(name), o)),
+                Err(m) => {
+                    self.error(name, m);
+                }
+            }
+        }
         // Phase A: the whole scope tree, with ports connected and generates expanded.
         for m in tops {
-            if let Ok(s) = self.instantiate_begin(m, m.name, None, &[], m.name) {
+            // Only the parameters a top declares are overridden.
+            let ov: Vec<_> = overrides
+                .iter()
+                .filter(|(n, _)| module_declares_param(m, n.unwrap()))
+                .cloned()
+                .collect();
+            if let Ok(s) = self.instantiate_begin(m, m.name, None, &ov, m.name) {
                 if self.d.top.is_none() {
                     self.d.top = Some(s);
                 }
@@ -854,11 +876,16 @@ impl<'a, 't> Elab<'a, 't> {
             self.declare(a.name, Sym::Type(ty));
             return Ok(());
         }
-        let declared = match &p.ty {
+        // `parameter signed P = ...`: the value's width, with this signedness.
+        let sign_only = match &p.ty {
             Some(ast::DataType::Implicit {
-                signing: None,
+                signing: Some(s),
                 packed,
-            }) if packed.is_empty() => None,
+            }) if packed.is_empty() => Some(*s == "signed"),
+            _ => None,
+        };
+        let declared = match &p.ty {
+            Some(ast::DataType::Implicit { packed, .. }) if packed.is_empty() => None,
             Some(t) => {
                 let mut ty = self.resolve_type(t)?;
                 ty.unpacked = self.unpacked_dims(&a.dims)?;
@@ -893,6 +920,14 @@ impl<'a, 't> Elab<'a, 't> {
                     }
                 }
             }
+        };
+        let (value, ty) = match sign_only {
+            Some(signed) if ty.is_integral() && ty.signed != signed => {
+                let mut to = ty.clone();
+                to.signed = signed;
+                (convert_value(&value, &ty, &to), to)
+            }
+            _ => (value, ty),
         };
         self.declare(a.name, Sym::Param(value, ty));
         Ok(())
@@ -1229,7 +1264,21 @@ impl<'a, 't> Elab<'a, 't> {
                 })
                 .collect(),
         };
+        // `input num; real num;`: a later declaration gives an untyped port its type.
+        let retyped = |name: &str| {
+            f.decls.iter().find_map(|d| match d {
+                ast::ModuleItem::Var(v) if v.vars.iter().any(|x| x.name == name) => Some(&v.ty),
+                _ => None,
+            })
+        };
         for (dir, ty, name, dims) in ports {
+            let ty = match ty {
+                ast::DataType::Implicit {
+                    signing: None,
+                    packed,
+                } if packed.is_empty() && f.ports.is_none() => retyped(name).unwrap_or(ty),
+                _ => ty,
+            };
             if !matches!(dir, None | Some("input")) {
                 return Err(self.not_yet(name, "output and inout subroutine arguments"));
             }
@@ -1641,6 +1690,44 @@ enum Early<'a, 't> {
         Option<Override<'a>>,
     ),
     Item(&'t ast::ModuleItem<'a>),
+}
+
+/// A `-G` value: a number (`10`, `8'hff`, `1.5`) or a quoted string.
+fn cmdline_override<'a>(value: &str) -> Result<Override<'a>, String> {
+    if value.len() >= 2 && value.starts_with('"') && value.ends_with('"') {
+        let text = decode_string(&value[1..value.len() - 1]);
+        let w = (text.len() as u32 * 8).max(8);
+        let mut b = Bits::zero(w);
+        for (i, byte) in text.bytes().rev().enumerate() {
+            b.insert(i as i64 * 8, &Bits::from_u64(8, byte as u64));
+        }
+        let mut ty = Ty::scalar(Base::Bit { four: true });
+        ty.packed = vec![(w as i64 - 1, 0)];
+        return Ok(Override::Value(Value::Bits(b), ty));
+    }
+    match crate::bits::parse_literal(value) {
+        Ok(crate::bits::Literal::Bits { bits, signed, .. }) => {
+            let mut ty = Ty::scalar(Base::Bit { four: true });
+            ty.packed = vec![(bits.width as i64 - 1, 0)];
+            ty.signed = signed;
+            Ok(Override::Value(Value::Bits(bits), ty))
+        }
+        Ok(crate::bits::Literal::Real(r)) => {
+            Ok(Override::Value(Value::Real(r), Ty::scalar(Base::Real)))
+        }
+        _ => Err(format!("Unsupported parameter value: '{value}'")),
+    }
+}
+
+fn module_declares_param(m: &ast::Module<'_>, name: &str) -> bool {
+    let in_items = m.items.iter().any(
+        |i| matches!(i, ast::ModuleItem::Param(p) if p.assigns.iter().any(|a| a.name == name)),
+    );
+    in_items
+        || m.params
+            .iter()
+            .flatten()
+            .any(|p| p.assigns.iter().any(|a| a.name == name))
 }
 
 #[derive(Clone, Debug)]
