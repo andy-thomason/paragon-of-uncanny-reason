@@ -1,0 +1,12 @@
+[package]
+name = "libparagon"
+version = "0.1.0"
+edition = "2024"
+description = "Async entry points for the Paragon SystemVerilog simulator"
+
+[dependencies]
+paragon-of-uncanny-reason = { path = ".." }
+
+[[bin]]
+name = "paragon"
+path = "src/main.rs"

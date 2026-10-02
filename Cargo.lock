@@ -3,5 +3,12 @@
 version = 4
 
 [[package]]
+name = "libparagon"
+version = "0.1.0"
+dependencies = [
+ "paragon-of-uncanny-reason",
+]
+
+[[package]]
 name = "paragon-of-uncanny-reason"
 version = "0.1.0"
