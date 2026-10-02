@@ -179,6 +179,9 @@ pub(crate) struct Elab<'a, 't> {
     pub(crate) sm: &'a SourceMap,
     /// Where made syntax lives.
     made: &'t Arena<Vec<ast::PortConn<'a>>>,
+    /// Interface instances made early, because a declaration used a type
+    /// from them; phase A skips them.
+    early_insts: HashSet<usize>,
     pub(crate) d: Design<'a>,
     pub(crate) diags: Vec<Diag<'a>>,
     modules: HashMap<&'a str, (&'t ast::Module<'a>, (i8, i8))>,
@@ -211,6 +214,7 @@ impl<'a, 't> Elab<'a, 't> {
         let mut e = Elab {
             sm,
             made,
+            early_insts: HashSet::new(),
             d: Design::default(),
             diags: Vec::new(),
             modules: HashMap::new(),
@@ -713,7 +717,7 @@ impl<'a, 't> Elab<'a, 't> {
         &mut self,
         m: &'t ast::Module<'a>,
         overrides: &[(Option<&'a str>, Override<'a>)],
-        iface: Option<(ScopeId, &'t [ast::PortConn<'a>])>,
+        bind: Option<(ScopeId, &'t [ast::PortConn<'a>])>,
     ) -> EResult<()> {
         for imp in &m.imports {
             self.import(imp)?;
@@ -813,6 +817,13 @@ impl<'a, 't> Elab<'a, 't> {
                             var: VarId(u32::MAX),
                             ty: Ty::scalar(Base::Void),
                         });
+                        // Bound now: later port types may come from it.
+                        if let Some((parent, conns)) = bind {
+                            let saved = std::mem::replace(&mut self.cur, parent);
+                            let r = self.connect_ifaces(cur, conns, m.name);
+                            self.cur = saved;
+                            r?;
+                        }
                         continue;
                     }
                     if p.default.is_some() {
@@ -853,7 +864,7 @@ impl<'a, 't> Elab<'a, 't> {
         }
 
         // Interface ports first: declarations may use their types.
-        if let Some((p, conns)) = iface
+        if let Some((p, conns)) = bind
             && !conns.is_empty()
         {
             let saved = std::mem::replace(&mut self.cur, p);
@@ -1619,6 +1630,9 @@ impl<'a, 't> Elab<'a, 't> {
             overrides.push((name, self.override_value(e)?));
         }
         for i in &inst.insts {
+            if self.early_insts.contains(&(i as *const ast::Inst as usize)) {
+                continue;
+            }
             if !i.dims.is_empty() {
                 self.instance_array(m, i, &overrides)?;
                 continue;
@@ -1638,6 +1652,44 @@ impl<'a, 't> Elab<'a, 't> {
             r?;
         }
         Ok(())
+    }
+
+    /// Instantiate the interface instance `name` of the current module now,
+    /// for a declaration that uses a type from it (`typedef m.t t;`).
+    pub(crate) fn early_interface(&mut self, name: &str) -> Option<ScopeId> {
+        let items = self.scopes[self.cur.0 as usize].items;
+        for item in items {
+            let ast::ModuleItem::Instance(inst) = item else {
+                continue;
+            };
+            let Some(i) = inst.insts.iter().find(|i| i.name == name && i.dims.is_empty()) else {
+                continue;
+            };
+            let Some((m, _)) = self.modules.get(inst.module).copied() else {
+                return None;
+            };
+            if m.kind != "interface" {
+                return None;
+            }
+            let mut overrides = Vec::new();
+            for p in inst.params.iter().flatten() {
+                let (pn, e) = match p {
+                    ast::ParamArg::Ordered(e) => (None, Some(e)),
+                    ast::ParamArg::Named(n, e) => (Some(*n), e.as_ref()),
+                };
+                let Some(e) = e else { continue };
+                overrides.push((pn, self.override_value(e).ok()?));
+            }
+            let parent = self.cur;
+            let child = self
+                .instantiate_begin(m, i.name, Some(parent), &overrides, &i.conns, i.name)
+                .ok()?;
+            self.connect(child, &i.conns, i.name).ok()?;
+            self.expand_scope(child).ok()?;
+            self.early_insts.insert(i as *const ast::Inst as usize);
+            return Some(child);
+        }
+        None
     }
 
     /// `sub s[l:r] (...)`: one instance per index, named `s[i]`. A

@@ -212,7 +212,11 @@ impl<'a, 't> Elab<'a, 't> {
                 name,
                 packed,
             } => {
-                let Some(s) = self.hier_scope(None, iface) else {
+                let s = self.hier_scope(None, iface).or_else(|| match &**iface {
+                    ast::Expr::Ident(n) => self.early_interface(n),
+                    _ => None,
+                });
+                let Some(s) = s else {
                     return Err(self.error(iface.at(), format!("Can't find interface '{}'", iface.at())));
                 };
                 let Some(super::Sym::Type(mut t)) = self.lookup_child(s, name) else {
