@@ -41,6 +41,8 @@ pub(crate) struct Cx<'a> {
     /// Iterators of array methods' `with` clauses, and their index slots
     /// (for `item.index`).
     pub(crate) iters: Vec<(&'a str, SlotId)>,
+    /// In an assertion: the registers `$past` reads, by expression.
+    pub(crate) past: HashMap<String, Vec<VarId>>,
 }
 
 impl<'a> Cx<'a> {
@@ -56,6 +58,7 @@ impl<'a> Cx<'a> {
             dollar: None,
             with_obj: None,
             iters: Vec::new(),
+            past: HashMap::new(),
         }
     }
 }
@@ -632,6 +635,17 @@ impl<'a, 't> Elab<'a, 't> {
                 f: false,
             },
             "$sformatf" | "$psprintf" => STy::Str,
+            "$rose" | "$fell" | "$stable" | "$changed" => STy::Bits {
+                w: 1,
+                s: false,
+                f: false,
+            },
+            "$past" | "$sampled" => {
+                let Some(Arg::Ordered(Some(a))) = args.first() else {
+                    return Err(self.error(name, format!("{name} needs an argument")));
+                };
+                self.self_type_cx(cx, a)?
+            }
             "$cast" => STy::Bits {
                 w: 1,
                 s: false,
@@ -3975,6 +3989,9 @@ impl<'a, 't> Elab<'a, 't> {
                     ),
                     st,
                 ))
+            }
+            "$past" | "$rose" | "$fell" | "$stable" | "$changed" | "$sampled" => {
+                self.lower_sampled(cx, name, args)
             }
             "$cast" => {
                 let (Some(dst), Some(src)) = (arg(0), arg(1)) else {

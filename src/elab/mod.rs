@@ -14,6 +14,7 @@
 //! lowered into a small body and run by [`crate::eval::eval_const`].
 
 mod build;
+mod assert;
 mod class;
 mod randomize;
 mod expr;
@@ -58,7 +59,8 @@ pub fn elaborate<'a>(
 ) -> (Design<'a>, Vec<Diag<'a>>) {
     let made = Arena::default();
     let made_subs = Arena::default();
-    let mut e = Elab::new(sm, &made, &made_subs);
+    let made_timing = Arena::default();
+    let mut e = Elab::new(sm, &made, &made_subs, &made_timing);
     e.d.root_name = opts.root_name.clone();
     e.assertions = opts.assertions;
     e.run(files, opts);
@@ -160,6 +162,11 @@ struct ScopeInfo<'a, 't> {
     /// For a class scope: the base class's scope, searched before the
     /// enclosing one (inherited members).
     base_scope: Option<ScopeId>,
+    /// Named properties and sequences declared here.
+    props: HashMap<&'a str, &'t ast::ModuleItem<'a>>,
+    /// `default clocking` and `default disable iff` here.
+    default_clock: Option<&'t ast::Timing<'a>>,
+    default_disable: Option<&'t ast::Expr<'a>>,
 }
 
 /// An implicit sensitivity list to complete once all functions are lowered.
@@ -198,6 +205,7 @@ pub(crate) struct Elab<'a, 't> {
     /// Where made syntax lives.
     made: &'t Arena<Vec<ast::PortConn<'a>>>,
     made_subs: &'t Arena<ast::Subroutine<'a>>,
+    pub(crate) made_timing: &'t Arena<ast::Timing<'a>>,
     /// Class declarations, and the classes made from them.
     pub(crate) class_defs: Vec<class::ClassDef<'a, 't>>,
     pub(crate) classes: Vec<class::ClassInfo<'a, 't>>,
@@ -244,11 +252,13 @@ impl<'a, 't> Elab<'a, 't> {
         sm: &'a SourceMap,
         made: &'t Arena<Vec<ast::PortConn<'a>>>,
         made_subs: &'t Arena<ast::Subroutine<'a>>,
+        made_timing: &'t Arena<ast::Timing<'a>>,
     ) -> Self {
         let mut e = Elab {
             sm,
             made,
             made_subs,
+            made_timing,
             class_defs: Vec::new(),
             classes: Vec::new(),
             func_class: HashMap::new(),
@@ -335,6 +345,9 @@ impl<'a, 't> Elab<'a, 't> {
             funcs: Vec::new(),
             inits: Vec::new(),
             base_scope: None,
+            props: HashMap::new(),
+            default_clock: None,
+            default_disable: None,
         });
         ScopeId(self.d.scopes.len() as u32 - 1)
     }
@@ -1246,6 +1259,12 @@ impl<'a, 't> Elab<'a, 't> {
         let cur = self.cur;
         match item {
             I::Class(c) => self.declare_class(c),
+            I::PropertyDecl { name, .. } | I::SequenceDecl { name, .. } => {
+                self.info(cur).props.insert(name, item);
+            }
+            I::DefaultClocking(t) => self.info(cur).default_clock = Some(t),
+            I::DefaultDisable(e) => self.info(cur).default_disable = Some(e),
+            I::Assertion(_) => {}
             I::Param(p) => {
                 for a in &p.assigns {
                     self.declare_param(p, a, None)?;
@@ -1547,6 +1566,7 @@ impl<'a, 't> Elab<'a, 't> {
                     .iter()
                     .try_for_each(|(lhs, rhs)| self.cont_assign(lhs, rhs, kw)),
                 I::Process { kw, stmt } => self.lower_process(kw, stmt),
+                I::Assertion(a) => self.lower_assertion(a),
                 I::Gate(g) => self.gate(g),
                 I::Generate(items) => self.build_code(items),
                 I::ElabTask(e) => self.elab_task(e),

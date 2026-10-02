@@ -25,8 +25,6 @@ const PROCESSES: &[&str] = &[
 /// Constructs recognised but not yet implemented, with a description.
 const NOT_YET_ITEMS: &[(&str, &str)] = &[
     ("covergroup", "covergroups"),
-    ("property", "properties"),
-    ("sequence", "sequences"),
     ("constraint", "constraints"),
     ("clocking", "clocking blocks"),
     ("checker", "checkers"),
@@ -507,25 +505,35 @@ impl<'a> Parser<'a> {
                 while self.bump().is_some_and(|t| t != Token::Op(";")) {}
                 return Ok(None);
             }
-            Token::Keyword(kw @ ("assert" | "assume" | "cover")) => {
+            Token::Keyword(kw @ ("assert" | "assume" | "cover" | "restrict")) => {
                 if self.is_kw_at(1, "property") || self.is_kw_at(1, "sequence") {
-                    return Err(self.not_yet(kw, "concurrent assertions"));
+                    ModuleItem::Assertion(self.concurrent_assertion(None)?)
+                } else {
+                    return Err(self.not_yet(kw, "immediate assertions at module level"));
                 }
-                return Err(self.not_yet(kw, "immediate assertions at module level"));
             }
+            Token::Keyword("property" | "sequence") => self.property_decl()?,
             Token::Keyword("default")
                 if self.is_kw_at(1, "clocking") || self.is_kw_at(1, "disable") =>
             {
-                return Err(self.not_yet(t.text(), "default clocking"));
+                self.default_clocking()?
             }
             Token::Keyword(k) if NOT_YET_ITEMS.iter().any(|(w, _)| *w == k) => {
                 let what = NOT_YET_ITEMS.iter().find(|(w, _)| *w == k).unwrap().1;
                 return Err(self.not_yet(k, what));
             }
             Token::Keyword("interface") => return Err(self.not_yet(t.text(), "interface classes")),
+            Token::Ident(label) | Token::EscapedIdent(label)
+                if self.is_op_at(1, ":")
+                    && matches!(self.peek_at(2), Some(Token::Keyword("assert" | "assume" | "cover" | "restrict")))
+                    && (self.is_kw_at(3, "property") || self.is_kw_at(3, "sequence")) =>
+            {
+                self.bump();
+                self.bump();
+                ModuleItem::Assertion(self.concurrent_assertion(Some(label))?)
+            }
             Token::Ident(_) | Token::EscapedIdent(_) if self.is_op_at(1, ":") => {
-                // A labelled concurrent assertion or similar.
-                return Err(self.not_yet(t.text(), "labelled module items (concurrent assertions)"));
+                return Err(self.not_yet(t.text(), "labelled module items"));
             }
             Token::SystemIdent("$unit") if self.is_op_at(1, "::") => {
                 ModuleItem::Var(self.var_decl(Vec::new(), None)?)

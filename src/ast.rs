@@ -231,6 +231,74 @@ pub struct ClassDecl<'a> {
     pub end: &'a str,
 }
 
+/// A concurrent assertion (LRM 16.14).
+#[derive(Clone, Debug)]
+pub struct Assertion<'a> {
+    /// `assert`, `assume`, `cover` or `restrict`.
+    pub kw: &'a str,
+    pub label: Option<&'a str>,
+    pub spec: PropSpec<'a>,
+    pub pass: Option<Box<Stmt<'a>>>,
+    pub fail: Option<Box<Stmt<'a>>>,
+}
+
+/// `[@(clock)] [disable iff (cond)] property`
+#[derive(Clone, Debug)]
+pub struct PropSpec<'a> {
+    pub clock: Option<Timing<'a>>,
+    pub disable: Option<Expr<'a>>,
+    pub prop: Prop<'a>,
+}
+
+/// A property expression (LRM 16.12), the commonly used part.
+#[derive(Clone, Debug)]
+pub enum Prop<'a> {
+    Seq(Seq<'a>),
+    /// `ante |-> cons` (`overlap`) or `ante |=> cons`.
+    Implies {
+        ante: Seq<'a>,
+        overlap: bool,
+        cons: Box<Prop<'a>>,
+    },
+    Not(Box<Prop<'a>>),
+    And(Box<Prop<'a>>, Box<Prop<'a>>),
+    Or(Box<Prop<'a>>, Box<Prop<'a>>),
+    If {
+        cond: Expr<'a>,
+        then: Box<Prop<'a>>,
+        els: Option<Box<Prop<'a>>>,
+    },
+    /// `s_eventually`, `until`, `nexttime` and the like: by keyword.
+    Unsupported(&'a str),
+}
+
+/// A sequence expression (LRM 16.7).
+#[derive(Clone, Debug)]
+pub enum Seq<'a> {
+    Expr(Expr<'a>),
+    /// `lhs ##[min:max] rhs`; no `lhs` for a leading delay. `max` is `None`
+    /// for a single delay, `Some(None)` for `$`.
+    Delay {
+        lhs: Option<Box<Seq<'a>>>,
+        min: Expr<'a>,
+        max: Option<Option<Expr<'a>>>,
+        rhs: Box<Seq<'a>>,
+    },
+    /// `s[*n]`, `s[*m:n]`, `e[->n]`, `e[=n]`.
+    Repeat {
+        seq: Box<Seq<'a>>,
+        kind: &'a str,
+        min: Expr<'a>,
+        max: Option<Option<Expr<'a>>>,
+    },
+    /// `and`, `or`, `intersect`, `throughout`, `within`.
+    Binary {
+        op: &'a str,
+        lhs: Box<Seq<'a>>,
+        rhs: Box<Seq<'a>>,
+    },
+}
+
 /// An item of a constraint block (LRM 18.5).
 #[derive(Clone, Debug)]
 pub enum ConstraintItem<'a> {
@@ -288,6 +356,24 @@ pub enum ModuleItem<'a> {
     /// A forward typedef: `typedef name;` or `typedef enum name;`.
     ForwardTypedef(&'a str),
     Class(ClassDecl<'a>),
+    /// `[label:] assert|assume|cover property (...) [pass] [else fail];`
+    Assertion(Assertion<'a>),
+    /// `property name [(args)]; ... endproperty`
+    PropertyDecl {
+        name: &'a str,
+        ports: Vec<&'a str>,
+        spec: PropSpec<'a>,
+    },
+    /// `sequence name [(args)]; ... endsequence`
+    SequenceDecl {
+        name: &'a str,
+        ports: Vec<&'a str>,
+        seq: Seq<'a>,
+    },
+    /// `default clocking [name] @(...); endclocking`
+    DefaultClocking(Timing<'a>),
+    /// `default disable iff (expr);`
+    DefaultDisable(Expr<'a>),
     Import(Vec<Import<'a>>),
     /// `assign [#delay] lhs = rhs, ...;`
     Assign {

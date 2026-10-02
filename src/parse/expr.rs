@@ -165,7 +165,8 @@ impl<'a> Parser<'a> {
         let mut e = self.primary()?;
         loop {
             match self.peek() {
-                Some(Token::Op("[")) => {
+                // `a[*2]`, `a[->1]`, `a[=3]` are sequence repetitions.
+                Some(Token::Op("[")) if !matches!(self.peek_at(1), Some(Token::Op("*" | "->" | "="))) => {
                     self.bump();
                     let left = self.expr()?;
                     e = match self.peek() {

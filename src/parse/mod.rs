@@ -6,6 +6,7 @@
 //! [`NOT_YET`](crate::diag::NOT_YET), so a test run can tell parser gaps
 //! from real syntax errors.
 
+mod assert;
 mod expr;
 mod items;
 mod stmt;
@@ -124,6 +125,14 @@ impl<'a> Parser<'a> {
     pub(crate) fn eat_kw_of(&mut self, kws: &[&str]) -> Option<&'a str> {
         match self.peek() {
             Some(Token::Keyword(k)) if kws.contains(&k) => self.bump().map(Token::text),
+            _ => None,
+        }
+    }
+
+    /// Eat one of several operators.
+    pub(crate) fn eat_op_of(&mut self, ops: &[&str]) -> Option<&'a str> {
+        match self.peek() {
+            Some(Token::Op(o)) if ops.contains(&o) => self.bump().map(Token::text),
             _ => None,
         }
     }

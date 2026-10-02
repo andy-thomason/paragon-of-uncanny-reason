@@ -63,7 +63,13 @@ impl<'a, 't> Elab<'a, 't> {
     }
 
     /// Push a finished process body, turning its pending waits into fixups.
-    fn push_process(&mut self, cx: Cx<'a>, kind: ProcKind, at: &'a str, waits: Vec<PendingWait>) {
+    pub(crate) fn push_process(
+        &mut self,
+        cx: Cx<'a>,
+        kind: ProcKind,
+        at: &'a str,
+        waits: Vec<PendingWait>,
+    ) {
         let (body, calls) = cx.b.finish(Terminator::Unreachable);
         let proc = self.d.procs.len();
         for w in waits {
@@ -1816,7 +1822,7 @@ impl<'a, 't> Elab<'a, 't> {
 
     // ------------------------------------------------------------ timing
 
-    fn lower_timing(&mut self, cx: &mut Cx<'a>, t: &'t ast::Timing<'a>) -> EResult<()> {
+    pub(crate) fn lower_timing(&mut self, cx: &mut Cx<'a>, t: &'t ast::Timing<'a>) -> EResult<()> {
         let resume = cx.b.new_block();
         match t {
             ast::Timing::Delay(e) => {
