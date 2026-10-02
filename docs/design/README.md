@@ -65,5 +65,5 @@ Each design doc ends with a **Provenance** section that lists the sources used.
 | 09 | `09-diagnostics.md`: warning and error catalogue and message format | Planned |
 | 10 | `10-cli-options.md`: command-line options classified by effect | Planned |
 | 11 | `11-test-runner.md`: our clean-room test runner design | Planned |
-| 20 | `20-architecture.md`: our proc-macro architecture and performance strategy | Planned |
+| 20 | [Architecture](20-architecture.md): pipeline, AST vs IR, IR design, back ends | Draft (§1–2) |
 | 21 | `21-rust-verification.md`: exploratory Rust-native, UVM-like verification library | Exploratory |

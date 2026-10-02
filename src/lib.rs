@@ -4,6 +4,7 @@
 
 pub mod ast;
 pub mod diag;
+pub mod ir;
 pub mod keywords;
 pub mod lex;
 pub mod parse;
