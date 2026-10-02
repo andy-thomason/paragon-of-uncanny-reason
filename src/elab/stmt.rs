@@ -620,8 +620,9 @@ impl<'a, 't> Elab<'a, 't> {
                 cx.b.new_block(),
                 cx.b.new_block(),
             );
+            // It starts by renewing, in case something changed before it ran.
             cx.b.terminate(Terminator::Fork {
-                children: vec![watch],
+                children: vec![check],
                 join: Join::None,
                 resume,
             });
