@@ -17,8 +17,8 @@ the rules, and [`docs/design/`](docs/design/) for the design documents.
 | Preprocessor (`` `define ``, `` `ifdef ``, `` `include ``, `-E`) | Working. Matches Verilator's golden output; see below |
 | Lexer and parser (AST of `&str` slices) | Working for the common subset: 64% of CC0 test sources parse; the rest stop at a named unsupported construct, mostly classes |
 | Test manifest and runner | Working: classifies all 4,447 Verilator tests and reports progress by tier |
-| Elaboration to a linear IR | Working for the common subset plus strings, unpacked arrays, interfaces; `paragon --ir` prints the IR |
-| Simulation | Reference interpreter working: 37% of self-checking tests pass |
+| Elaboration to a linear IR | Working for most of the language: modules, interfaces, classes, strings, arrays and queues, randomization; `paragon --ir` prints the IR |
+| Simulation | Reference interpreter working: 48% of self-checking tests pass |
 
 `simulate()` compiles the source and returns a running `Simulation` that
 streams events such as `$display` output from the reference interpreter.
@@ -268,9 +268,9 @@ async fn main() -> Result<(), libparagon::Error> {
 ## Progress against the Verilator test suite
 
 `paragon-runner` runs every Verilator regression test through `libparagon`
-and reports how far each one gets. Today, 801 of the 2,139 self-checking
-simulation tests (37%) pass. Most of the rest stop at classes, assertions or
-other constructs not supported yet. See
+and reports how far each one gets. Today, 1,019 of the 2,139 self-checking
+simulation tests (48%) pass. Most of the rest stop at assertions, virtual
+interfaces or other constructs not supported yet. See
 [`docs/design/01-test-suite-taxonomy.md`](docs/design/01-test-suite-taxonomy.md).
 
 ```console

@@ -16,15 +16,15 @@ smaller items left open along the way. Update it as items land.
 | Async library `libparagon` and `paragon` CLI | Working: `simulate()` streams events from the interpreter | `libparagon/` |
 | Test manifest and runner | Done ([`01`](01-test-suite-taxonomy.md)) | `tools/manifest.py`, `runner/` |
 | Language lexer, parser, AST (`&str` slices) | Common subset done: 65% of T1 tests parse | `src/lex.rs`, `src/parse/`, `src/ast.rs` |
-| Elaboration: AST → linear IR | Done for the common subset, plus strings, unpacked arrays, interfaces, instance arrays, output arguments and `disable` | `src/elab/`, `src/ir/`, `src/bits.rs`, `src/eval.rs` |
-| Reference interpreter | Working: **801 of 2,139 T1 tests (37%) pass** | `src/sim/` |
+| Elaboration: AST → linear IR | Done for the common subset, plus strings, arrays and queues, interfaces, instance arrays, output arguments, `disable`, classes and randomization | `src/elab/`, `src/ir/`, `src/bits.rs`, `src/eval.rs` |
+| Reference interpreter | Working: **1,019 of 2,139 T1 tests (48%) pass** | `src/sim/` |
 
 ## Progress (2026-10-02)
 
-**801 of 2,139 T1 tests (37%) pass**: they simulate, print
+**1,019 of 2,139 T1 tests (48%) pass**: they simulate, print
 `*-* All Finished *-*` or match their golden output, and end cleanly. Of the
-rest, 1,158 stop at a named unsupported construct, 82 hit front-end errors and
-76 simulate but fail. 46 T2 tests match Verilator's first diagnostic location.
+rest, 796 stop at a named unsupported construct, 180 hit front-end errors and
+122 simulate but fail. 46 T2 tests match Verilator's first diagnostic location.
 Full table: [`01`](01-test-suite-taxonomy.md).
 
 ### Simulation (reference interpreter)
@@ -43,8 +43,19 @@ Full table: [`01`](01-test-suite-taxonomy.md).
   errors, and output equal to the golden file where there is one. Run-time
   message text is not compared (decision 1).
 - **Values.** Strings are stored one byte per `char`; unpacked arrays are a
-  flat `Value::Array`, element 0 at the right-hand index; a subroutine with
-  output arguments returns a tuple that the caller unpacks.
+  flat `Value::Array`, element 0 at the right-hand index (a queue's element 0
+  is its leftmost); a subroutine with output arguments returns a tuple that
+  the caller unpacks; a class handle is a shared reference to an object.
+- **Classes** (`elab/class.rs`). A class is a scope searched before its base
+  classes' scopes; properties are indices into the object; methods take
+  `this` first; virtual methods go through a per-class vtable. Each set of
+  parameter values makes a separate class. `process` is built in.
+- **Randomization** (`elab/randomize.rs`). `randomize()` is lowered as a
+  loop: values are drawn from domains read off the simple constraints
+  (bounds, `inside`, `dist`, enum values), properties equal to an expression
+  are computed, and the whole constraint set is checked; soft constraints are
+  dropped earliest-first when they conflict. Exact random sequences are not
+  reproduced (decision 3).
 
 ### Elaboration (done for the common subset)
 
@@ -63,10 +74,10 @@ Full table: [`01`](01-test-suite-taxonomy.md).
   types, then propagation), with explicit `Resize`.
 - **Inspect the result:** `paragon --ir file.sv`.
 
-Biggest gaps by T1 tests blocked: classes (459), concurrent assertions (62),
-unpacked structs (43), virtual classes and interfaces (42), dynamic arrays and
-queues (32), procedural `force` (27), clocking blocks (25), arrays of
-interface ports (23).
+Biggest gaps by T1 tests blocked: concurrent assertions (62), virtual
+interfaces (38), associative arrays (30), procedural `force` (29), unpacked
+structs with non-integral members (29), clocking blocks (25), arrays of
+interface ports (23), covergroups (17).
 
 Known differences kept on purpose: four-state run-time semantics where some
 tests' `ifdef verilator` branches expect Verilator's two-state results (for
