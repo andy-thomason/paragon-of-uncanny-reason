@@ -294,6 +294,14 @@ pub enum Op {
         value: Val,
         nba: bool,
     },
+    /// `len` elements of an unpacked array from linear element `start`, as
+    /// an array value. (`Load` of an array variable gives the whole array; a
+    /// `Store` or `StoreElem` of an array value writes consecutive elements.)
+    LoadRange {
+        var: VarId,
+        start: Val,
+        len: u32,
+    },
     LoadSlot(SlotId),
     StoreSlot {
         slot: SlotId,
@@ -359,6 +367,10 @@ pub enum Op {
     // Strings. `Concat`, `Repl`, `Mux` and the comparisons also work on
     // strings when their operands or result are strings; `Convert` turns
     // integral values into strings and back (LRM 6.16).
+    /// Element `index` (linear) of an array value.
+    ArrayElem { value: Val, index: Val },
+    /// `len` elements of an array value from linear element `start`.
+    ArraySlice { value: Val, start: Val, len: u32 },
     /// A built-in string method; pure.
     StrFunc {
         func: StrFunc,

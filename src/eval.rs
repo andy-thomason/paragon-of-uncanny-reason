@@ -14,6 +14,9 @@ pub enum Value {
     Bits(Bits),
     Real(f64),
     Str(String),
+    /// An unpacked array, by linear element: element 0 is the one at the
+    /// right-hand index (the last one in an assignment pattern).
+    Array(Vec<Value>),
 }
 
 impl Value {
@@ -86,6 +89,17 @@ pub fn eval_pure<'v, 't: 'v>(
             if let (Value::Real(p), Value::Real(q)) = (arg(*x).0, arg(*y).0) {
                 return real_binary(*b, *p, *q, &fix);
             }
+            if let (Value::Array(p), Value::Array(q)) = (arg(*x).0, arg(*y).0) {
+                let case = matches!(b, BinOp::CaseEq | BinOp::CaseNe);
+                let eq = arrays_equal(p, q, case);
+                let r = match (b, eq) {
+                    (BinOp::Eq | BinOp::CaseEq, Some(e)) => Bits::from_bool(e),
+                    (BinOp::Ne | BinOp::CaseNe, Some(e)) => Bits::from_bool(!e),
+                    (BinOp::Eq | BinOp::Ne, None) => Bits::all_x(1),
+                    _ => return None,
+                };
+                return Some(fix(r));
+            }
             if let (Value::Str(p), Value::Str(q)) = (arg(*x).0, arg(*y).0) {
                 let r = match b {
                     BinOp::Eq | BinOp::CaseEq | BinOp::WildEq => p == q,
@@ -144,6 +158,41 @@ pub fn eval_pure<'v, 't: 'v>(
                 None => fix(Bits::all_x(*width)),
             }
         }
+        Op::Concat(parts) if matches!(ty, Type::Unpacked { .. }) => {
+            // Parts are given left to right; element 0 is the rightmost.
+            let mut v = Vec::new();
+            for p in parts.iter().rev() {
+                match arg(*p).0 {
+                    Value::Array(a) => v.extend(a.iter().cloned()),
+                    x => v.push(x.clone()),
+                }
+            }
+            Value::Array(v)
+        }
+        Op::ArrayElem { value, index } => {
+            let i = bits(*index).and_then(|b| b.to_i64(signed(*index)));
+            match (arg(*value).0, i) {
+                (Value::Array(a), Some(i)) if i >= 0 && (i as usize) < a.len() => {
+                    a[i as usize].clone()
+                }
+                _ => default_value(ty),
+            }
+        }
+        Op::ArraySlice { value, start, len } => {
+            let s = bits(*start).and_then(|b| b.to_i64(signed(*start)));
+            let Value::Array(a) = arg(*value).0 else {
+                return None;
+            };
+            let fill = a.first().cloned().unwrap_or(Value::Bits(Bits::all_x(1)));
+            Value::Array(
+                (0..*len as i64)
+                    .map(|k| match s.map(|s| s + k) {
+                        Some(i) if i >= 0 && (i as usize) < a.len() => a[i as usize].clone(),
+                        _ => default_like(&fill),
+                    })
+                    .collect(),
+            )
+        }
         Op::Concat(parts) if *ty == Type::String => {
             Value::Str(parts.iter().map(|p| to_string(arg(*p).0)).collect())
         }
@@ -163,7 +212,7 @@ pub fn eval_pure<'v, 't: 'v>(
                 Value::Real(r) if *extend == Extend::Truncate => fix(Bits::from_f64(w, r.trunc())),
                 Value::Real(r) => fix(Bits::from_f64(w, r.round())),
                 Value::Bits(b) => fix(b.resize(w, *extend == Extend::Sign)),
-                Value::Str(_) => return None,
+                Value::Str(_) | Value::Array(_) => return None,
             }
         }
         Op::Mux { cond, then, els } => match arg(*cond).0.bits()?.truth() {
@@ -268,6 +317,50 @@ pub fn eval_pure<'v, 't: 'v>(
     Some(v)
 }
 
+/// Are two arrays equal element by element? `None` if unknown (X bits
+/// under `==`).
+fn arrays_equal(p: &[Value], q: &[Value], case: bool) -> Option<bool> {
+    if p.len() != q.len() {
+        return Some(false);
+    }
+    let mut unknown = false;
+    for (a, b) in p.iter().zip(q) {
+        match (a, b) {
+            (Value::Bits(x), Value::Bits(y)) if case => {
+                if !x.case_eq(y) {
+                    return Some(false);
+                }
+            }
+            (Value::Bits(x), Value::Bits(y)) => match x.logic_eq(y).truth() {
+                Some(false) => return Some(false),
+                None => unknown = true,
+                Some(true) => {}
+            },
+            (Value::Array(x), Value::Array(y)) => match arrays_equal(x, y, case) {
+                Some(false) => return Some(false),
+                None => unknown = true,
+                Some(true) => {}
+            },
+            (a, b) => {
+                if a != b {
+                    return Some(false);
+                }
+            }
+        }
+    }
+    if unknown { None } else { Some(true) }
+}
+
+/// The default value of something shaped like `v` (for out-of-range elements).
+pub fn default_like(v: &Value) -> Value {
+    match v {
+        Value::Bits(b) => Value::Bits(Bits::all_x(b.width)),
+        Value::Real(_) => Value::Real(0.0),
+        Value::Str(_) => Value::Str(String::new()),
+        Value::Array(a) => Value::Array(a.iter().map(default_like).collect()),
+    }
+}
+
 /// Text as a string value: one `char` per byte (Latin-1), so every byte value
 /// survives conversion to bits and back.
 pub fn latin1(bytes: &[u8]) -> String {
@@ -307,6 +400,7 @@ pub fn to_string(v: &Value) -> String {
         Value::Str(s) => s.clone(),
         Value::Bits(b) => bits_to_string(b),
         Value::Real(r) => r.to_string(),
+        Value::Array(_) => String::new(),
     }
 }
 

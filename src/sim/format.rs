@@ -144,7 +144,7 @@ fn to_real(v: &Value, signed: bool) -> f64 {
     match v {
         Value::Real(r) => *r,
         Value::Bits(b) => crate::eval::bits_to_f64(b, signed),
-        Value::Str(_) => 0.0,
+        Value::Str(_) | Value::Array(_) => 0.0,
     }
 }
 

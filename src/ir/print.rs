@@ -167,6 +167,13 @@ impl BodyFmt<'_, '_> {
             Op::Report { severity, args, .. } => {
                 format!("report.{severity:?}({})", Self::vals(args))
             }
+            Op::LoadRange { var, start, len } => {
+                format!("load {}[%{} +: {len}]", self.var(*var), start.0)
+            }
+            Op::ArrayElem { value, index } => format!("elem %{}[%{}]", value.0, index.0),
+            Op::ArraySlice { value, start, len } => {
+                format!("slice %{}[%{} +: {len}]", value.0, start.0)
+            }
             Op::StrFunc { func, args } => format!("str.{func:?}({})", Self::vals(args)),
             Op::Sformat { format, args } => {
                 format!("sformat fmt#{}({})", format.0, Self::vals(args))

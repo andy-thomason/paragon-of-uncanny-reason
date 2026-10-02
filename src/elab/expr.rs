@@ -161,6 +161,18 @@ fn lookup_op(table: &[(&str, BinOp)], op: &str) -> Option<BinOp> {
     table.iter().find(|(o, _)| *o == op).map(|(_, b)| *b)
 }
 
+/// The number of elements of a fixed-size unpacked array type; `None` if a
+/// dimension is dynamic.
+pub(crate) fn fixed_count(t: &Ty) -> Option<u32> {
+    t.unpacked
+        .iter()
+        .map(|d| match d {
+            UDim::Fixed(l, r) => Some(range_len((*l, *r))),
+            _ => None,
+        })
+        .product()
+}
+
 /// The type of a string method's value; `None` for one that has none.
 fn str_method_type(name: &str) -> Option<STy> {
     let int = STy::Bits {
@@ -291,7 +303,9 @@ impl<'a, 't> Elab<'a, 't> {
                 None => Err(self.error(e.at(), "Expecting a known integer constant")),
             },
             Value::Real(r) => Ok(r.round() as i64),
-            Value::Str(_) => Err(self.error(e.at(), "Expecting an integer constant")),
+            Value::Str(_) | Value::Array(_) => {
+                Err(self.error(e.at(), "Expecting an integer constant"))
+            }
         }
     }
 
@@ -981,7 +995,47 @@ impl<'a, 't> Elab<'a, 't> {
     /// Load a path's value.
     pub(crate) fn load_path(&mut self, cx: &mut Cx<'a>, p: &Path<'a>) -> EResult<(Val, STy)> {
         if !p.ty.unpacked.is_empty() {
-            return Err(self.not_yet(p.at, "whole unpacked arrays as values"));
+            // A whole array, or the sub-array `mem[i]` of a multi-dimensional one.
+            let Some(len) = fixed_count(&p.ty) else {
+                return Err(self.not_yet(p.at, "dynamic arrays, queues and associative arrays"));
+            };
+            let aty = self.ir_type(&p.ty);
+            let v = match (&p.root, p.elem) {
+                (Root::Var(v), None) => cx.b.emit(Op::Load(*v), aty, p.at),
+                (Root::Var(v), Some(start)) => cx.b.emit(
+                    Op::LoadRange {
+                        var: *v,
+                        start,
+                        len,
+                    },
+                    aty,
+                    p.at,
+                ),
+                (Root::Const(c), elem) => {
+                    let whole = self.emit_value(cx, c, &p.ty, p.at);
+                    match elem {
+                        None => whole,
+                        Some(start) => cx.b.emit(
+                            Op::ArraySlice {
+                                value: whole,
+                                start,
+                                len,
+                            },
+                            aty,
+                            p.at,
+                        ),
+                    }
+                }
+                (Root::Slot(_), _) => return Err(self.not_yet(p.at, "local unpacked arrays")),
+            };
+            return Ok((v, sty_of(&p.ty)));
+        }
+        if let (Root::Const(c @ Value::Array(_)), Some(index)) = (&p.root, p.elem) {
+            // An element of a parameter array.
+            let whole = self.emit_value(cx, c, &p.base, p.at);
+            let bty = self.ir_type(&p.base);
+            let v = cx.b.emit(Op::ArrayElem { value: whole, index }, bty, p.at);
+            return Ok(self.select_part(cx, p, v));
         }
         let bty = self.ir_type(&p.base);
         let base = match (&p.root, p.elem) {
@@ -992,12 +1046,17 @@ impl<'a, 't> Elab<'a, 't> {
             (Root::Const(Value::Bits(b)), None) => cx.b.emit(Op::Const(b.clone()), bty, p.at),
             (Root::Const(Value::Real(r)), None) => cx.b.emit(Op::ConstReal(*r), bty, p.at),
             (Root::Const(Value::Str(s)), None) => cx.b.emit(Op::ConstStr(s.clone()), bty, p.at),
-            (Root::Const(_), Some(_)) => {
+            (Root::Const(_), _) => {
                 return Err(self.not_yet(p.at, "indexing parameter arrays"));
             }
         };
+        Ok(self.select_part(cx, p, base))
+    }
+
+    /// The selected part of `base`, the loaded value of `p.base`.
+    fn select_part(&mut self, cx: &mut Cx<'a>, p: &Path<'a>, base: Val) -> (Val, STy) {
         match p.lsb {
-            None => Ok((base, sty_of(&p.ty))),
+            None => (base, sty_of(&p.ty)),
             Some(lsb) => {
                 let f = p.base.four_state();
                 let t = self.bt(p.width, false, f);
@@ -1010,14 +1069,44 @@ impl<'a, 't> Elab<'a, 't> {
                     t,
                     p.at,
                 );
-                Ok((
+                (
                     v,
                     STy::Bits {
                         w: p.width,
                         s: false,
                         f,
                     },
-                ))
+                )
+            }
+        }
+    }
+
+    /// Emit a constant value of type `ty` (an array's element type, for an array).
+    pub(crate) fn emit_value(&mut self, cx: &mut Cx<'a>, v: &Value, ty: &Ty<'a>, at: &'a str) -> Val {
+        let mut elem = ty.clone();
+        elem.unpacked.clear();
+        match v {
+            Value::Array(a) => {
+                let et = self.ir_type(&elem);
+                let parts: Vec<Val> = a.iter().rev().map(|x| self.emit_value(cx, x, &elem, at)).collect();
+                let aty = self.add_type(Type::Unpacked {
+                    elem: et,
+                    left: 0,
+                    right: a.len() as i64 - 1,
+                });
+                cx.b.emit(Op::Concat(parts), aty, at)
+            }
+            Value::Bits(b) => {
+                let t = self.ir_type(&elem);
+                cx.b.emit(Op::Const(b.clone()), t, at)
+            }
+            Value::Real(r) => {
+                let t = self.add_type(Type::Real);
+                cx.b.emit(Op::ConstReal(*r), t, at)
+            }
+            Value::Str(s) => {
+                let t = self.add_type(Type::String);
+                cx.b.emit(Op::ConstStr(s.clone()), t, at)
             }
         }
     }
@@ -1103,7 +1192,10 @@ impl<'a, 't> Elab<'a, 't> {
 
     /// Lower an expression as the right-hand side of an assignment to `ty`.
     pub(crate) fn lower_to(&mut self, cx: &mut Cx<'a>, e: &Expr<'a>, ty: &Ty<'a>) -> EResult<Val> {
-        if ty.base == Base::Str && ty.unpacked.is_empty() {
+        if !ty.unpacked.is_empty() {
+            return self.lower_array(cx, e, ty);
+        }
+        if ty.base == Base::Str {
             return self.lower_str(cx, e);
         }
         if ty.is_real() {
@@ -1156,6 +1248,144 @@ impl<'a, 't> Elab<'a, 't> {
         ))
     }
 
+    /// A value for a fixed-size unpacked array type: a pattern, another
+    /// array, or a conditional choice between them.
+    pub(crate) fn lower_array(&mut self, cx: &mut Cx<'a>, e: &Expr<'a>, ty: &Ty<'a>) -> EResult<Val> {
+        let at = e.at();
+        if fixed_count(ty).is_none() {
+            return Err(self.not_yet(at, "dynamic arrays, queues and associative arrays"));
+        }
+        let UDim::Fixed(l, r) = ty.unpacked[0] else {
+            unreachable!()
+        };
+        let n = range_len((l, r)) as usize;
+        let mut sub = ty.clone();
+        sub.unpacked.remove(0);
+        let aty = self.ir_type(ty);
+        match e {
+            Expr::Pattern { items, .. } => {
+                let exprs = self.pattern_items(items, n, |this, k| {
+                    // A key is an index into the dimension.
+                    let i = this.const_int(k)?;
+                    let pos = if l >= r { l - i } else { i - l };
+                    if pos < 0 || pos as usize >= n {
+                        return Err(this.error(k.at(), format!("Assignment pattern index {i} is out of range")));
+                    }
+                    Ok(pos as usize)
+                }, at)?;
+                let mut parts = Vec::new();
+                for x in &exprs {
+                    parts.push(self.lower_to(cx, x, &sub)?);
+                }
+                Ok(cx.b.emit(Op::Concat(parts), aty, at))
+            }
+            Expr::Concat(items) => {
+                // `{a, b}` of arrays and elements, in unpacked context.
+                let mut parts = Vec::new();
+                for i in items {
+                    match self.array_type(cx, i) {
+                        Some(t) => parts.push(self.lower_array(cx, i, &t)?),
+                        None => parts.push(self.lower_to(cx, i, &sub)?),
+                    }
+                }
+                Ok(cx.b.emit(Op::Concat(parts), aty, at))
+            }
+            Expr::Cond {
+                cond, then, els, ..
+            } => {
+                let c = self.truth(cx, cond)?;
+                let a = self.lower_array(cx, then, ty)?;
+                let b = self.lower_array(cx, els, ty)?;
+                Ok(cx.b.emit(
+                    Op::Mux {
+                        cond: c,
+                        then: a,
+                        els: b,
+                    },
+                    aty,
+                    at,
+                ))
+            }
+            Expr::Call { func, args } => Ok(self.lower_call(cx, func, args)?.0),
+            Expr::Cast { expr, .. } => self.lower_array(cx, expr, ty),
+            Expr::Ident(_) | Expr::Member { .. } | Expr::Index { .. } | Expr::Scoped { .. } => {
+                let Some(p) = self.path(cx, e)? else {
+                    return Err(self.not_yet(at, "this kind of name"));
+                };
+                if p.ty.unpacked.is_empty() {
+                    return Err(self.error(at, "Assigning a non-array value to an unpacked array"));
+                }
+                if fixed_count(&p.ty) != fixed_count(ty) {
+                    return Err(self.error(at, "Unpacked array sizes differ in assignment"));
+                }
+                Ok(self.load_path(cx, &p)?.0)
+            }
+            _ => Err(self.not_yet(at, "this unpacked array expression")),
+        }
+    }
+
+    /// The type of `e` if it names an unpacked array (or a sub-array).
+    pub(crate) fn array_type(&mut self, cx: &Cx<'a>, e: &Expr<'a>) -> Option<Ty<'a>> {
+        let n = self.diags.len();
+        let r = self.path_type(Some(cx), e).ok().flatten();
+        self.diags.truncate(n);
+        r.map(|(t, _)| t).filter(|t| !t.unpacked.is_empty())
+    }
+
+    /// The expressions of an assignment pattern for `n` positions, left to
+    /// right: positional items, `n{...}` replications, and `key: value`
+    /// items with `default:`. `key` maps an index key to a position.
+    pub(crate) fn pattern_items(
+        &mut self,
+        items: &[ast::PatItem<'a>],
+        n: usize,
+        mut key: impl FnMut(&mut Self, &Expr<'a>) -> EResult<usize>,
+        at: &'a str,
+    ) -> EResult<Vec<Expr<'a>>> {
+        let keyed = items.iter().any(|i| matches!(i, ast::PatItem::Keyed(..)));
+        if !keyed {
+            let mut v = Vec::new();
+            for i in items {
+                match i {
+                    ast::PatItem::Value(e) => v.push(e.clone()),
+                    ast::PatItem::Repeat(count, es) => {
+                        let c = self.const_int(count)?;
+                        for _ in 0..c.max(0) {
+                            v.extend(es.iter().cloned());
+                        }
+                    }
+                    ast::PatItem::Keyed(..) => unreachable!(),
+                }
+            }
+            if v.len() != n {
+                return Err(self.error(
+                    at,
+                    format!("Assignment pattern has {} items for {n} positions", v.len()),
+                ));
+            }
+            return Ok(v);
+        }
+        let mut slots: Vec<Option<Expr<'a>>> = vec![None; n];
+        let mut default = None;
+        for i in items {
+            match i {
+                ast::PatItem::Keyed(Expr::Keyword("default"), v) => default = Some(v.clone()),
+                ast::PatItem::Keyed(k, v) => {
+                    let pos = key(self, k)?;
+                    slots[pos] = Some(v.clone());
+                }
+                _ => return Err(self.error(at, "Mixed positional and keyed assignment pattern")),
+            }
+        }
+        slots
+            .into_iter()
+            .map(|s| match s.or_else(|| default.clone()) {
+                Some(e) => Ok(e),
+                None => Err(self.error(at, "Assignment pattern is missing values and has no default")),
+            })
+            .collect()
+    }
+
     /// A positional assignment pattern for a packed type: `'{a, b, c}`.
     fn lower_pattern(
         &mut self,
@@ -1164,36 +1394,45 @@ impl<'a, 't> Elab<'a, 't> {
         ty: &Ty<'a>,
         at: &'a str,
     ) -> EResult<Val> {
-        let parts: Vec<Ty<'a>> = match &ty.base {
+        let (parts, names): (Vec<Ty<'a>>, Vec<&'a str>) = match &ty.base {
             Base::Struct {
                 fields,
                 union: false,
                 ..
-            } if ty.packed.is_empty() => fields.iter().map(|(_, t)| t.clone()).collect(),
-            _ if !ty.packed.is_empty() => {
-                vec![ty.packed_element(); range_len(ty.packed[0]) as usize]
-            }
+            } if ty.packed.is_empty() => (
+                fields.iter().map(|(_, t)| t.clone()).collect(),
+                fields.iter().map(|(n, _)| *n).collect(),
+            ),
+            _ if !ty.packed.is_empty() => (
+                vec![ty.packed_element(); range_len(ty.packed[0]) as usize],
+                Vec::new(),
+            ),
             _ => return Err(self.not_yet(at, "assignment patterns for this type")),
         };
-        if items.len() == 1
-            && let ast::PatItem::Keyed(Expr::Keyword("default"), v) = &items[0]
-        {
-            let mut vals = Vec::new();
-            for t in &parts {
-                vals.push(self.lower_to(cx, v, t)?);
-            }
-            let t = self.ir_type(ty);
-            return Ok(cx.b.emit(Op::Concat(vals), t, at));
-        }
-        if items.len() != parts.len() || items.iter().any(|i| !matches!(i, ast::PatItem::Value(_)))
-        {
-            return Err(self.not_yet(at, "keyed or partial assignment patterns"));
-        }
+        let range = ty.packed.first().copied();
+        let n = parts.len();
+        let exprs = self.pattern_items(
+            items,
+            n,
+            |this, k| match (k, range) {
+                (Expr::Ident(name), None) => match names.iter().position(|f| f == name) {
+                    Some(p) => Ok(p),
+                    None => Err(this.error(name, format!("Unknown member '{name}' in assignment pattern"))),
+                },
+                (_, Some((l, r))) => {
+                    let i = this.const_int(k)?;
+                    let pos = if l >= r { l - i } else { i - l };
+                    if pos < 0 || pos as usize >= n {
+                        return Err(this.error(k.at(), format!("Assignment pattern index {i} is out of range")));
+                    }
+                    Ok(pos as usize)
+                }
+                _ => Err(this.not_yet(k.at(), "type keys in assignment patterns")),
+            },
+            at,
+        )?;
         let mut vals = Vec::new();
-        for (item, t) in items.iter().zip(&parts) {
-            let ast::PatItem::Value(v) = item else {
-                unreachable!()
-            };
+        for (v, t) in exprs.iter().zip(&parts) {
             vals.push(self.lower_to(cx, v, t)?);
         }
         let t = self.ir_type(ty);
@@ -1623,7 +1862,15 @@ impl<'a, 't> Elab<'a, 't> {
                     self.self_type_cx(Some(cx), rhs)?,
                 );
                 let bit = self.bt(1, false, !matches!(b, BinOp::CaseEq | BinOp::CaseNe));
-                let v = if x == STy::Str || y == STy::Str {
+                let array_ty = match self.array_type(cx, lhs) {
+                    Some(t) => Some(t),
+                    None => self.array_type(cx, rhs),
+                };
+                let v = if let Some(t) = array_ty {
+                    let a = self.lower_array(cx, lhs, &t)?;
+                    let c = self.lower_array(cx, rhs, &t)?;
+                    cx.b.emit(Op::Binary(b, a, c), bit, at)
+                } else if x == STy::Str || y == STy::Str {
                     let a = self.lower_str(cx, lhs)?;
                     let c = self.lower_str(cx, rhs)?;
                     cx.b.emit(Op::Binary(b, a, c), bit, at)

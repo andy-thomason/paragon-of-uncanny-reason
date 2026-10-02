@@ -347,9 +347,18 @@ impl<'d, 'a> Simulator<'d, 'a> {
     fn read(&self, var: VarId) -> Value {
         match &self.store[var.0 as usize] {
             Store::Scalar(v) => v.clone(),
-            Store::Array(_) => Value::Bits(Bits::all_x(1)),
+            Store::Array(a) => Value::Array(a.clone()),
             Store::Event => Value::Bits(Bits::zero(1)),
         }
+    }
+
+    /// `len` elements from linear element `start`; out of range ones are the default.
+    fn read_range(&self, var: VarId, start: Option<i64>, len: u32) -> Value {
+        Value::Array(
+            (0..len as i64)
+                .map(|k| self.read_elem(var, start.map(|s| s + k)))
+                .collect(),
+        )
     }
 
     fn read_elem(&self, var: VarId, i: Option<i64>) -> Value {
@@ -369,6 +378,34 @@ impl<'d, 'a> Simulator<'d, 'a> {
 
     /// Write design state, converting to the stored type, and wake waiters if it changed.
     fn write(&mut self, var: VarId, elem: Option<i64>, part: Option<(i64, u32)>, value: Value) {
+        if let Value::Array(vals) = value {
+            // Consecutive elements from `elem` (the whole array from 0).
+            let start = elem.unwrap_or(0);
+            let ety = match &self.d.types[self.d.vars[var.0 as usize].ty.0 as usize] {
+                Type::Unpacked { elem, .. } => *elem,
+                _ => return,
+            };
+            let ety = &self.d.types[ety.0 as usize];
+            let Store::Array(a) = &mut self.store[var.0 as usize] else {
+                return;
+            };
+            let mut changed = false;
+            for (k, v) in vals.into_iter().enumerate() {
+                let i = start + k as i64;
+                if i < 0 || i as usize >= a.len() {
+                    continue;
+                }
+                let new = merge(&a[i as usize], None, v, ety);
+                if a[i as usize] != new {
+                    a[i as usize] = new;
+                    changed = true;
+                }
+            }
+            if changed {
+                self.wake(var, &Value::Bits(Bits::zero(1)), &Value::Bits(Bits::ones(1)));
+            }
+            return;
+        }
         let vty = self.d.vars[var.0 as usize].ty;
         let ety = match &self.d.types[vty.0 as usize] {
             Type::Unpacked { elem, .. } => *elem,
@@ -496,6 +533,10 @@ impl<'d, 'a> Simulator<'d, 'a> {
             Op::LoadElem { var, index } => {
                 let i = self.int(t, *index);
                 Some(self.read_elem(*var, i))
+            }
+            Op::LoadRange { var, start, len } => {
+                let s = self.int(t, *start);
+                Some(self.read_range(*var, s, *len))
             }
             Op::Store { var, part, value } => {
                 if let Some(p) = self.part(t, part) {
