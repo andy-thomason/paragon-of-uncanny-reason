@@ -303,6 +303,14 @@ pub enum Op {
         len: u32,
     },
     LoadSlot(SlotId),
+    /// Store into element `index` of a frame slot holding an unpacked array
+    /// (consecutive elements from `index`, for an array value).
+    StoreSlotElem {
+        slot: SlotId,
+        index: Val,
+        part: Option<Part>,
+        value: Val,
+    },
     StoreSlot {
         slot: SlotId,
         part: Option<Part>,

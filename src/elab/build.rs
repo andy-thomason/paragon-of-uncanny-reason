@@ -70,6 +70,10 @@ impl<'a> Builder<'a> {
         SlotId(self.body.slots.len() as u32 - 1)
     }
 
+    pub(crate) fn slot_type(&self, s: SlotId) -> TypeId {
+        self.body.slots[s.0 as usize]
+    }
+
     pub(crate) fn val_type(&self, v: Val) -> TypeId {
         self.body.vals[v.0 as usize]
     }

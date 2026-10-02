@@ -82,6 +82,12 @@ fn conv(
             let s = format!("{}", r.round() as i128);
             if natural { format!("{s:>20}") } else { s }
         }
+        ('p', Value::Array(a)) => {
+            let items: Vec<String> = a.iter().rev().map(pattern_elem).collect();
+            format!("'{{{}}}", items.join(", "))
+        }
+        ('p', Value::Bits(b)) if natural => decimal(b, signed),
+        ('p', v) => pattern_elem(v),
         ('s', Value::Str(s)) => s.clone(),
         ('s', Value::Real(r)) => format_g(*r),
         ('s', Value::Bits(b)) => {
@@ -137,6 +143,19 @@ fn conv(
         }
         (_, Value::Str(s)) => s.clone(),
         _ => "?".into(),
+    }
+}
+
+/// A value as it appears inside `%p` output.
+fn pattern_elem(v: &Value) -> String {
+    match v {
+        Value::Bits(b) => format!("'h{}", radix(b, 4, false)),
+        Value::Real(r) => format_g(*r),
+        Value::Str(s) => format!("{s:?}"),
+        Value::Array(a) => {
+            let items: Vec<String> = a.iter().rev().map(pattern_elem).collect();
+            format!("'{{{}}}", items.join(", "))
+        }
     }
 }
 

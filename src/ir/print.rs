@@ -141,6 +141,18 @@ impl BodyFmt<'_, '_> {
                 value.0
             ),
             Op::LoadSlot(s) => format!("load $s{}", s.0),
+            Op::StoreSlotElem {
+                slot,
+                index,
+                part,
+                value,
+            } => format!(
+                "store $s{}[%{}]{} = %{}",
+                slot.0,
+                index.0,
+                Self::part(part),
+                value.0
+            ),
             Op::StoreSlot { slot, part, value } => {
                 format!("store $s{}{} = %{}", slot.0, Self::part(part), value.0)
             }

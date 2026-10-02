@@ -1569,8 +1569,11 @@ impl<'a, 't> Elab<'a, 't> {
                 .insert(0, (self.const_int(left)?, self.const_int(right)?));
             return Ok(Override::Type(t));
         }
-        let st = self.self_type(e)?;
-        let ty = st.ty();
+        // An array keeps its own type; anything else its self-determined one.
+        let ty = match self.array_type(&expr::Cx::new(true), e) {
+            Some(t) => t,
+            None => self.self_type(e)?.ty(),
+        };
         let v = self.const_value(e, Some(&ty))?;
         Ok(Override::Value(v, ty))
     }

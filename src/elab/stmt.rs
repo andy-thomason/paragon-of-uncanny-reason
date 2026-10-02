@@ -395,8 +395,8 @@ impl<'a, 't> Elab<'a, 't> {
             }
             let mut ty = base.clone();
             ty.unpacked = self.unpacked_dims(&v.dims)?;
-            if automatic && !ty.unpacked.is_empty() {
-                return Err(self.not_yet(v.name, "automatic unpacked arrays"));
+            if automatic && !ty.unpacked.is_empty() && super::expr::fixed_count(&ty).is_none() {
+                return Err(self.not_yet(v.name, "dynamic arrays, queues and associative arrays"));
             }
             let irt = self.ir_type(&ty);
             if automatic {
@@ -408,6 +408,8 @@ impl<'a, 't> Elab<'a, 't> {
                 // An automatic variable starts at its default value on each entry.
                 let init = match &v.init {
                     Some(e) => self.lower_to(cx, e, &ty)?,
+                    // (An array starts at its default when the frame is made.)
+                    None if !ty.unpacked.is_empty() => continue,
                     None => {
                         let b = if ty.four_state() {
                             Bits::all_x(ty.width().max(1))

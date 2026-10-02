@@ -219,7 +219,7 @@ impl<'d, 'a> Simulator<'d, 'a> {
     fn default_slots(&self, body: &Body<'a>) -> Vec<Value> {
         body.slots
             .iter()
-            .map(|t| default(&self.d.types[t.0 as usize]))
+            .map(|t| crate::eval::default_for(&self.d.types, &self.d.types[t.0 as usize]))
             .collect()
     }
 
@@ -571,6 +571,24 @@ impl<'d, 'a> Simulator<'d, 'a> {
             }
             Op::LoadSlot(s) => {
                 Some(self.threads[t].frames.last().unwrap().slots.borrow()[s.0 as usize].clone())
+            }
+            Op::StoreSlotElem {
+                slot,
+                index,
+                part,
+                value,
+            } => {
+                let v = self.val(t, *value);
+                if let (Some(i), Some(p)) = (self.int(t, *index), self.part(t, part)) {
+                    let f = self.threads[t].frames.last().unwrap();
+                    let elem = match &self.d.types[f.body.slots[slot.0 as usize].0 as usize] {
+                        Type::Unpacked { elem, .. } => &self.d.types[elem.0 as usize],
+                        _ => return None,
+                    };
+                    let mut slots = f.slots.borrow_mut();
+                    crate::eval::store_elem(&mut slots[slot.0 as usize], i, p, v, elem);
+                }
+                None
             }
             Op::StoreSlot { slot, part, value } => {
                 let v = self.val(t, *value);
@@ -975,52 +993,11 @@ enum Flow {
 static X1: Value = Value::Real(0.0);
 
 fn default(t: &Type<'_>) -> Value {
-    match t {
-        Type::Bits {
-            width,
-            four_state: true,
-            ..
-        } => Value::Bits(Bits::all_x(*width)),
-        Type::Bits { width, .. } => Value::Bits(Bits::zero(*width)),
-        Type::Real => Value::Real(0.0),
-        Type::String => Value::Str(String::new()),
-        _ => Value::Bits(Bits::all_x(1)),
-    }
+    crate::eval::default_for(&[], t)
 }
 
-/// The stored value after writing `value` (into `part`, if given) over `old`,
-/// converted to the stored type.
 fn merge(old: &Value, part: Option<(i64, u32)>, value: Value, ty: &Type<'_>) -> Value {
-    match (old, part, value, ty) {
-        (
-            _,
-            None,
-            Value::Bits(b),
-            Type::Bits {
-                width, four_state, ..
-            },
-        ) => {
-            let mut b = if b.width == *width {
-                b
-            } else {
-                b.resize(*width, false)
-            };
-            if !four_state {
-                b.to_two_state();
-            }
-            Value::Bits(b)
-        }
-        (Value::Bits(o), Some((lsb, w)), Value::Bits(b), Type::Bits { four_state, .. }) => {
-            let mut n = o.clone();
-            let mut b = if b.width == w { b } else { b.resize(w, false) };
-            if !four_state {
-                b.to_two_state();
-            }
-            n.insert(lsb, &b);
-            Value::Bits(n)
-        }
-        (_, _, v, _) => v,
-    }
+    crate::eval::convert_into(old, part, value, ty)
 }
 
 /// Did a change from `old` to `new` fire this edge? Edges look at bit 0.

@@ -518,6 +518,85 @@ pub fn eval_const(body: &Body<'_>, design: &Design<'_>) -> Result<Value, NotCons
     eval_body(body, design, Vec::new(), 0)
 }
 
+/// The initial value of a variable of type `ty`: X for 4-state bits, an
+/// array of defaults for an unpacked array.
+pub fn default_for(types: &[Type<'_>], ty: &Type<'_>) -> Value {
+    match ty {
+        Type::Unpacked { elem, left, right } => {
+            let n = (right - left).unsigned_abs() as usize + 1;
+            Value::Array(vec![default_for(types, &types[elem.0 as usize]); n])
+        }
+        t => default_value(t),
+    }
+}
+
+/// Store `value` into element `index` of the array `dst` (or consecutive
+/// elements, for an array value), into bits `part` if given. Element values
+/// are converted to `elem`. Returns whether anything changed.
+pub fn store_elem(
+    dst: &mut Value,
+    index: i64,
+    part: Option<(i64, u32)>,
+    value: Value,
+    elem: &Type<'_>,
+) -> bool {
+    let Value::Array(a) = dst else {
+        return false;
+    };
+    let vals = match value {
+        Value::Array(v) if part.is_none() => v,
+        v => vec![v],
+    };
+    let mut changed = false;
+    for (k, v) in vals.into_iter().enumerate() {
+        let i = index + k as i64;
+        if i < 0 || i as usize >= a.len() {
+            continue;
+        }
+        let new = convert_into(&a[i as usize], part, v, elem);
+        if a[i as usize] != new {
+            a[i as usize] = new;
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// The stored value after writing `value` (into `part`, if given) over `old`,
+/// converted to the stored type.
+pub fn convert_into(old: &Value, part: Option<(i64, u32)>, value: Value, ty: &Type<'_>) -> Value {
+    match (old, part, value, ty) {
+        (
+            _,
+            None,
+            Value::Bits(b),
+            Type::Bits {
+                width, four_state, ..
+            },
+        ) => {
+            let mut b = if b.width == *width {
+                b
+            } else {
+                b.resize(*width, false)
+            };
+            if !four_state {
+                b.to_two_state();
+            }
+            Value::Bits(b)
+        }
+        (Value::Bits(o), Some((lsb, w)), Value::Bits(b), Type::Bits { four_state, .. }) => {
+            let mut n = o.clone();
+            let mut b = if b.width == w { b } else { b.resize(w, false) };
+            if !four_state {
+                b.to_two_state();
+            }
+            n.insert(lsb, &b);
+            Value::Bits(n)
+        }
+        (_, _, v, _) => v,
+    }
+}
+
 fn default_value(ty: &Type<'_>) -> Value {
     match ty {
         Type::Bits {
@@ -545,7 +624,7 @@ fn eval_body(
     let mut slots: Vec<Value> = body
         .slots
         .iter()
-        .map(|t| default_value(&types[t.0 as usize]))
+        .map(|t| default_for(types, &types[t.0 as usize]))
         .collect();
     let mut block = BlockId(0);
     let mut incoming: Vec<Value> = args;
@@ -582,6 +661,35 @@ fn eval_body(
                             }
                         }
                         _ => return Err(NotConst::Impure(inst.at.to_string())),
+                    }
+                    None
+                }
+                Op::StoreSlotElem {
+                    slot,
+                    index,
+                    part,
+                    value,
+                } => {
+                    let int = |v: &Val| {
+                        vals[v.0 as usize]
+                            .as_ref()
+                            .and_then(Value::bits)
+                            .and_then(|b| b.to_i64(true))
+                    };
+                    let v = vals[value.0 as usize].clone().ok_or(NotConst::NoResult)?;
+                    let elem = match &types[body.slots[slot.0 as usize].0 as usize] {
+                        Type::Unpacked { elem, .. } => &types[elem.0 as usize],
+                        _ => return Err(NotConst::Impure(inst.at.to_string())),
+                    };
+                    let p = match part {
+                        Some(p) => match int(&p.lsb) {
+                            Some(l) => Some((l, p.width)),
+                            None => None,
+                        },
+                        None => None,
+                    };
+                    if let Some(i) = int(index) {
+                        store_elem(&mut slots[slot.0 as usize], i, p, v, elem);
                     }
                     None
                 }

@@ -1026,7 +1026,22 @@ impl<'a, 't> Elab<'a, 't> {
                         ),
                     }
                 }
-                (Root::Slot(_), _) => return Err(self.not_yet(p.at, "local unpacked arrays")),
+                (Root::Slot(s), elem) => {
+                    let st = cx.b.slot_type(*s);
+                    let whole = cx.b.emit(Op::LoadSlot(*s), st, p.at);
+                    match elem {
+                        None => whole,
+                        Some(start) => cx.b.emit(
+                            Op::ArraySlice {
+                                value: whole,
+                                start,
+                                len,
+                            },
+                            aty,
+                            p.at,
+                        ),
+                    }
+                }
             };
             return Ok((v, sty_of(&p.ty)));
         }
@@ -1042,7 +1057,11 @@ impl<'a, 't> Elab<'a, 't> {
             (Root::Var(v), None) => cx.b.emit(Op::Load(*v), bty, p.at),
             (Root::Var(v), Some(i)) => cx.b.emit(Op::LoadElem { var: *v, index: i }, bty, p.at),
             (Root::Slot(s), None) => cx.b.emit(Op::LoadSlot(*s), bty, p.at),
-            (Root::Slot(_), Some(_)) => return Err(self.not_yet(p.at, "local unpacked arrays")),
+            (Root::Slot(s), Some(index)) => {
+                let st = cx.b.slot_type(*s);
+                let whole = cx.b.emit(Op::LoadSlot(*s), st, p.at);
+                cx.b.emit(Op::ArrayElem { value: whole, index }, bty, p.at)
+            }
             (Root::Const(Value::Bits(b)), None) => cx.b.emit(Op::Const(b.clone()), bty, p.at),
             (Root::Const(Value::Real(r)), None) => cx.b.emit(Op::ConstReal(*r), bty, p.at),
             (Root::Const(Value::Str(s)), None) => cx.b.emit(Op::ConstStr(s.clone()), bty, p.at),
@@ -1146,7 +1165,12 @@ impl<'a, 't> Elab<'a, 't> {
                 part,
                 value,
             },
-            (Root::Slot(_), Some(_)) => return Err(self.not_yet(p.at, "local unpacked arrays")),
+            (Root::Slot(slot), Some(index)) => Op::StoreSlotElem {
+                slot: *slot,
+                index,
+                part,
+                value,
+            },
             (Root::Const(_), _) => {
                 return Err(self.error(p.at, format!("Cannot assign to a parameter: '{}'", p.at)));
             }
