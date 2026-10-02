@@ -207,6 +207,7 @@ impl<'a, 't> Elab<'a, 't> {
                 t.packed = dims;
                 t
             }
+            D::ClassMember { name, .. } => return Err(self.not_yet(name, "class member types")),
             D::IfaceType {
                 iface,
                 name,

@@ -106,6 +106,12 @@ pub enum DataType<'a> {
         name: &'a str,
         packed: Vec<Dim<'a>>,
     },
+    /// A member type of a (parameterised) class: `C#(8)::t`.
+    ClassMember {
+        class: Box<DataType<'a>>,
+        name: &'a str,
+        packed: Vec<Dim<'a>>,
+    },
     /// A typedef, class or package-scoped name: `my_t`, `pkg::my_t`.
     Named {
         scope: Option<&'a str>,
@@ -210,6 +216,39 @@ pub struct Typedef<'a> {
     pub dims: Vec<Dim<'a>>,
 }
 
+/// `class C #(...) extends B #(...) (args); ... endclass` (LRM 8).
+#[derive(Clone, Debug)]
+pub struct ClassDecl<'a> {
+    pub kw: &'a str,
+    /// `virtual class` (abstract) or `interface class`.
+    pub kind: Option<&'a str>,
+    pub name: &'a str,
+    pub params: Option<Vec<ParamDecl<'a>>>,
+    /// The base class type, and arguments passed to its constructor.
+    pub extends: Option<(DataType<'a>, Vec<Arg<'a>>)>,
+    pub implements: Vec<DataType<'a>>,
+    pub items: Vec<ClassItem<'a>>,
+    pub end: &'a str,
+}
+
+/// A member of a class with its qualifiers (`static`, `local`, `protected`,
+/// `rand`, `randc`, `virtual`, `pure`, `extern`, `const`).
+#[derive(Clone, Debug)]
+pub struct ClassItem<'a> {
+    pub quals: Vec<&'a str>,
+    pub item: ClassMember<'a>,
+}
+
+#[derive(Clone, Debug)]
+pub enum ClassMember<'a> {
+    /// A property, method, typedef, parameter or nested class.
+    Item(ModuleItem<'a>),
+    /// `constraint name { ... }`, kept by name only.
+    Constraint(&'a str),
+    /// A covergroup, kept by name only.
+    Covergroup(&'a str),
+}
+
 #[derive(Clone, Debug)]
 pub enum ModuleItem<'a> {
     Port(PortDecl<'a>),
@@ -218,6 +257,7 @@ pub enum ModuleItem<'a> {
     Typedef(Typedef<'a>),
     /// A forward typedef: `typedef name;` or `typedef enum name;`.
     ForwardTypedef(&'a str),
+    Class(ClassDecl<'a>),
     Import(Vec<Import<'a>>),
     /// `assign [#delay] lhs = rhs, ...;`
     Assign {
@@ -323,6 +363,10 @@ pub struct Gate<'a> {
 #[derive(Clone, Debug)]
 pub struct Subroutine<'a> {
     pub kw: &'a str,
+    /// `C` for an out-of-class definition `function C::f`.
+    pub class: Option<&'a str>,
+    /// A prototype only (`extern`, `pure virtual`): no body.
+    pub proto: bool,
     pub lifetime: Option<&'a str>,
     /// The return type of a function; `None` for a task or an implicit type.
     pub ret: Option<DataType<'a>>,
@@ -617,6 +661,8 @@ pub enum Expr<'a> {
         kw: &'a str,
         args: Vec<Arg<'a>>,
         size: Option<Box<Expr<'a>>>,
+        /// `new obj`: a shallow copy of `obj`.
+        copy: Option<Box<Expr<'a>>>,
     },
 }
 

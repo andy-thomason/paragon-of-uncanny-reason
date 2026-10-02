@@ -214,13 +214,30 @@ impl<'a> Parser<'a> {
                 } else {
                     None
                 };
-                let packed = self.dims()?;
-                Ok(DataType::Named {
+                let mut ty = DataType::Named {
                     scope,
                     name,
                     params,
-                    packed,
-                })
+                    packed: Vec::new(),
+                };
+                // `C#(8)::t` or `pkg::C::t`: a member type of a class.
+                while self.is_op("::") && self.is_ident_at(1) {
+                    self.bump();
+                    let member = self.ident()?;
+                    ty = DataType::ClassMember {
+                        class: Box::new(ty),
+                        name: member,
+                        packed: Vec::new(),
+                    };
+                }
+                let packed = self.dims()?;
+                match &mut ty {
+                    DataType::Named { packed: p, .. } | DataType::ClassMember { packed: p, .. } => {
+                        *p = packed
+                    }
+                    _ => unreachable!(),
+                }
+                Ok(ty)
             }
             _ => Err(self.unexpected("a data type")),
         }
@@ -584,9 +601,7 @@ impl<'a> Parser<'a> {
             self.expect_op(";")?;
             return Ok(ModuleItem::ForwardTypedef(name));
         }
-        if self.is_kw("class") {
-            return Err(self.not_yet(self.here(), "typedef class"));
-        }
+
         let ty = self.data_type()?;
         let name = self.ident()?;
         let dims = self.dims()?;

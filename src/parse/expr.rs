@@ -296,6 +296,22 @@ impl<'a> Parser<'a> {
         if type_kw && !self.is_op_at(1, "'") {
             return Ok(Expr::Type(Box::new(self.data_type()?)));
         }
+        // A parameterised class type: `C#(int)`, `pkg::C#(8)`, but not `C#(8)::x`.
+        let class_at = if self.is_ident_at(0) && self.is_op_at(1, "#") {
+            Some(1)
+        } else if self.is_ident_at(0) && self.is_op_at(1, "::") && self.is_ident_at(2) && self.is_op_at(3, "#") {
+            Some(3)
+        } else {
+            None
+        };
+        if let Some(k) = class_at
+            && self.is_op_at(k + 1, "(")
+        {
+            let end = self.skip_balanced_from(self.pos + k + 1);
+            if !matches!(self.toks.get(end), Some(Token::Op("::"))) {
+                return Ok(Expr::Type(Box::new(self.data_type()?)));
+            }
+        }
         self.expr()
     }
 
@@ -344,7 +360,28 @@ impl<'a> Parser<'a> {
                     return Ok(e);
                 }
                 if self.is_op("#") && self.is_op_at(1, "(") && self.class_scope_follows() {
-                    return Err(self.not_yet(n, "parameterised class scopes"));
+                    // `C#(8)::name`: a member of a parameterised class.
+                    let params = Some(self.param_args()?);
+                    let mut e = Expr::Type(Box::new(DataType::Named {
+                        scope: None,
+                        name: n,
+                        params,
+                        packed: Vec::new(),
+                    }));
+                    while self.eat_op("::").is_some() {
+                        let name = match self.bump() {
+                            Some(Token::Ident(s) | Token::EscapedIdent(s) | Token::Keyword(s)) => s,
+                            _ => {
+                                self.pos -= 1;
+                                return Err(self.unexpected("identifier"));
+                            }
+                        };
+                        e = Expr::Scoped {
+                            scope: Box::new(e),
+                            name,
+                        };
+                    }
+                    return Ok(e);
                 }
                 Ok(Expr::Ident(n))
             }
@@ -420,7 +457,21 @@ impl<'a> Parser<'a> {
                 } else {
                     Vec::new()
                 };
-                Ok(Expr::New { kw, args, size })
+                // `new obj` copies an object.
+                let copy = if size.is_none()
+                    && args.is_empty()
+                    && (self.is_ident_at(0) || self.is_kw("this"))
+                {
+                    Some(Box::new(self.postfix()?))
+                } else {
+                    None
+                };
+                Ok(Expr::New {
+                    kw,
+                    args,
+                    size,
+                    copy,
+                })
             }
             Token::Keyword(k)
                 if TYPE_KWS.contains(&k) || matches!(k, "signed" | "unsigned" | "const") =>

@@ -1167,6 +1167,7 @@ impl<'a, 't> Elab<'a, 't> {
         use ast::ModuleItem as I;
         let cur = self.cur;
         match item {
+            I::Class(c) => return Err(self.not_yet(c.kw, "classes")),
             I::Param(p) => {
                 for a in &p.assigns {
                     self.declare_param(p, a, None)?;

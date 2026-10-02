@@ -24,7 +24,6 @@ const PROCESSES: &[&str] = &[
 
 /// Constructs recognised but not yet implemented, with a description.
 const NOT_YET_ITEMS: &[(&str, &str)] = &[
-    ("class", "classes"),
     ("covergroup", "covergroups"),
     ("property", "properties"),
     ("sequence", "sequences"),
@@ -39,7 +38,6 @@ const NOT_YET_ITEMS: &[(&str, &str)] = &[
     ("primitive", "user-defined primitives"),
     ("config", "configurations"),
     ("extern", "extern declarations"),
-    ("virtual", "virtual classes and interfaces"),
     ("restrict", "restrict"),
     ("global", "global clocking"),
 ];
@@ -486,6 +484,14 @@ impl<'a> Parser<'a> {
                 ModuleItem::TimeUnits { kw, values }
             }
             Token::Keyword("modport") => self.modport()?,
+            Token::Keyword("class") => ModuleItem::Class(self.class_decl(None)?),
+            Token::Keyword(k @ ("virtual" | "interface")) if self.is_kw_at(1, "class") => {
+                self.bump();
+                ModuleItem::Class(self.class_decl(Some(k))?)
+            }
+            Token::Keyword(k @ "virtual") => {
+                return Err(self.not_yet(k, "virtual interfaces"));
+            }
             Token::Keyword("module" | "interface" | "program")
                 if !(t == Token::Keyword("interface") && self.is_kw_at(1, "class")) =>
             {
@@ -785,31 +791,67 @@ impl<'a> Parser<'a> {
     }
 
     fn subroutine(&mut self) -> PResult<ModuleItem<'a>> {
+        self.subroutine_of(false)
+    }
+
+    /// A function or task; with `proto`, only its header (`extern`, `pure`).
+    fn subroutine_of(&mut self, proto: bool) -> PResult<ModuleItem<'a>> {
         let kw = self.bump().unwrap().text();
         let is_fn = kw == "function";
         let end_kw = if is_fn { "endfunction" } else { "endtask" };
         let lifetime = self.eat_kw_of(&["static", "automatic"]);
-        if self.is_kw("new") {
-            return Err(self.not_yet(kw, "class constructors"));
-        }
-        let ret = if is_fn
-            && !(self.is_ident_at(0)
-                && (self.is_op_at(1, "(") || self.is_op_at(1, ";") || self.is_op_at(1, "::")))
-        {
+        // `C::name` and `new` are names, not types.
+        let named_next = |p: &Self, k: usize| {
+            p.is_kw_at(k, "new")
+                || (p.is_ident_at(k)
+                    && (p.is_op_at(k + 1, "(")
+                        || p.is_op_at(k + 1, ";")
+                        || (p.is_op_at(k + 1, "::")
+                            && (p.is_kw_at(k + 2, "new")
+                                || (p.is_ident_at(k + 2)
+                                    && (p.is_op_at(k + 3, "(") || p.is_op_at(k + 3, ";")))))))
+        };
+        let ret = if is_fn && !named_next(self, 0) {
             Some(self.data_type_or_implicit()?)
         } else {
             None
         };
-        if self.is_ident_at(0) && self.is_op_at(1, "::") {
-            return Err(self.not_yet(self.here(), "out-of-class method definitions"));
-        }
-        let name = self.ident()?;
+        let class = if self.is_ident_at(0) && self.is_op_at(1, "::") {
+            let c = self.ident()?;
+            self.expect_op("::")?;
+            Some(c)
+        } else {
+            None
+        };
+        let name = match self.eat_kw("new") {
+            Some(n) => n,
+            None => self.ident()?,
+        };
         let ports = if self.is_op("(") {
             Some(self.tf_ports()?)
         } else {
             None
         };
         self.expect_op(";")?;
+        if proto {
+            let s = Subroutine {
+                kw,
+                class,
+                proto: true,
+                lifetime,
+                ret,
+                name,
+                ports,
+                decls: Vec::new(),
+                stmts: Vec::new(),
+                end: name,
+            };
+            return Ok(if is_fn {
+                ModuleItem::Function(s)
+            } else {
+                ModuleItem::Task(s)
+            });
+        }
         let mut decls = Vec::new();
         loop {
             match self.peek() {
@@ -839,6 +881,8 @@ impl<'a> Parser<'a> {
         self.end_label()?;
         let s = Subroutine {
             kw,
+            class,
+            proto: false,
             lifetime,
             ret,
             name,
@@ -852,6 +896,136 @@ impl<'a> Parser<'a> {
         } else {
             ModuleItem::Task(s)
         })
+    }
+
+    /// A class declaration; `kind` is `virtual` or `interface` if given.
+    fn class_decl(&mut self, kind: Option<&'a str>) -> PResult<ClassDecl<'a>> {
+        let kw = self.expect_kw("class")?;
+        self.eat_kw_of(&["static", "automatic"]);
+        let name = self.ident()?;
+        self.types.insert(name);
+        let params = if self.is_op("#") {
+            Some(self.param_port_list()?)
+        } else {
+            None
+        };
+        let extends = if self.eat_kw("extends").is_some() {
+            let base = self.data_type()?;
+            let args = if self.is_op("(") {
+                self.call_args()?
+            } else {
+                Vec::new()
+            };
+            Some((base, args))
+        } else {
+            None
+        };
+        let mut implements = Vec::new();
+        // `interface class C extends A, B;`
+        while self.eat_op(",").is_some() {
+            implements.push(self.data_type()?);
+        }
+        if self.eat_kw("implements").is_some() {
+            loop {
+                implements.push(self.data_type()?);
+                if self.eat_op(",").is_none() {
+                    break;
+                }
+            }
+        }
+        self.expect_op(";")?;
+        let mut items = Vec::new();
+        let end = loop {
+            if let Some(e) = self.eat_kw("endclass") {
+                break e;
+            }
+            if self.peek().is_none() {
+                return Err(self.unexpected("'endclass'"));
+            }
+            if let Some(i) = self.class_item()? {
+                items.push(i);
+            }
+        };
+        self.end_label()?;
+        Ok(ClassDecl {
+            kw,
+            kind,
+            name,
+            params,
+            extends,
+            implements,
+            items,
+            end,
+        })
+    }
+
+    fn class_item(&mut self) -> PResult<Option<ClassItem<'a>>> {
+        const QUALS: &[&str] = &[
+            "static", "local", "protected", "rand", "randc", "virtual", "pure", "extern", "const",
+            "automatic",
+        ];
+        if self.eat_op(";").is_some() {
+            return Ok(None);
+        }
+        let mut quals = Vec::new();
+        while let Some(q) = self.eat_kw_of(QUALS) {
+            quals.push(q);
+        }
+        let item = match self.peek() {
+            Some(Token::Keyword("function" | "task")) => {
+                let proto = quals.iter().any(|q| matches!(*q, "pure" | "extern"));
+                ClassMember::Item(self.subroutine_of(proto)?)
+            }
+            Some(Token::Keyword("constraint")) => {
+                self.bump();
+                let name = self.ident()?;
+                if self.is_op("{") {
+                    self.skip_braces()?;
+                } else {
+                    self.expect_op(";")?;
+                }
+                ClassMember::Constraint(name)
+            }
+            Some(Token::Keyword("covergroup")) => {
+                self.bump();
+                let name = self.ident()?;
+                self.skip_to_kw("endgroup")?;
+                self.end_label()?;
+                ClassMember::Covergroup(name)
+            }
+            Some(Token::Keyword("class")) => ClassMember::Item(ModuleItem::Class(self.class_decl(None)?)),
+            Some(Token::Keyword("typedef" | "parameter" | "localparam" | "import")) => {
+                match self.module_item()? {
+                    Some(i) => ClassMember::Item(i),
+                    None => return Ok(None),
+                }
+            }
+            _ => {
+                // A property; `const` and `rand` etc. were taken as qualifiers.
+                let var_quals: Vec<&'a str> = quals
+                    .iter()
+                    .copied()
+                    .filter(|q| VAR_QUALIFIERS.contains(q))
+                    .collect();
+                ClassMember::Item(ModuleItem::Var(self.var_decl(var_quals, None)?))
+            }
+        };
+        Ok(Some(ClassItem { quals, item }))
+    }
+
+    /// Skip a `{ ... }` block, nested braces and all.
+    fn skip_braces(&mut self) -> PResult<()> {
+        self.expect_op("{")?;
+        let mut depth = 1;
+        while depth > 0 {
+            match self.bump() {
+                Some(Token::Op("{" | "'{")) => depth += 1,
+                Some(Token::Op("}")) => depth -= 1,
+                Some(_) => {}
+                None => return Err(self.unexpected("'}'")),
+            }
+        }
+        Ok(())
     }
 
     /// `( [dir] [type] name [dims] [= default], ... )`
