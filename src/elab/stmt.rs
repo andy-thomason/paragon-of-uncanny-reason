@@ -567,10 +567,20 @@ impl<'a, 't> Elab<'a, 't> {
             Expr::Concat(parts) => parts.iter().collect(),
             e => vec![e],
         };
-        if targets.len() > 1 && rhs.is_some() {
-            return Err(self.not_yet(kw, "forcing a concatenation"));
+        // For a concatenation, each part takes its bits of the value.
+        let concat = targets.len() > 1;
+        let mut widths = Vec::new();
+        for t in &targets {
+            let w = match self.self_type_cx(Some(cx), t)? {
+                STy::Bits { w, .. } => w,
+                _ => return Err(self.not_yet(t.at(), &format!("{kw} of this target"))),
+            };
+            widths.push(w);
         }
-        for target in targets {
+        let total: u32 = widths.iter().sum();
+        let mut offset = total;
+        for (target, w) in targets.into_iter().zip(widths) {
+            offset -= w;
             let Some(p) = self.path(cx, target)? else {
                 return Err(self.error(target.at(), format!("Illegal {kw} target")));
             };
@@ -597,7 +607,7 @@ impl<'a, 't> Elab<'a, 't> {
             };
             let tt = self.bits_type(64, false, false);
             cx.b.read_scopes.push(BTreeSet::new());
-            let v = self.lower_to(cx, rhs, &p.ty)?;
+            let v = self.force_value(cx, rhs, &p.ty, concat.then_some((total, offset, w)))?;
             let reads = cx.b.read_scopes.pop().unwrap();
             let token = cx.b.emit(
                 Op::Force {
@@ -652,7 +662,7 @@ impl<'a, 't> Elab<'a, 't> {
             cx.b.switch_to(done);
             cx.b.terminate(Terminator::EndThread);
             cx.b.switch_to(renew);
-            let v = self.lower_to(cx, rhs, &p.ty)?;
+            let v = self.force_value(cx, rhs, &p.ty, concat.then_some((total, offset, w)))?;
             cx.b.emit(
                 Op::Force {
                     var,
@@ -668,6 +678,33 @@ impl<'a, 't> Elab<'a, 't> {
             cx.b.switch_to(resume);
         }
         Ok(())
+    }
+
+    /// The value a force gives a target: all of `rhs`, or `width` bits from
+    /// `offset` of it as `total` bits (one part of a concatenation).
+    fn force_value(
+        &mut self,
+        cx: &mut Cx<'a>,
+        rhs: &Expr<'a>,
+        ty: &Ty<'a>,
+        part: Option<(u32, u32, u32)>,
+    ) -> EResult<Val> {
+        let Some((total, offset, width)) = part else {
+            return self.lower_to(cx, rhs, ty);
+        };
+        let whole = self.lower_to(cx, rhs, &Ty::bits(total, false, true))?;
+        let it = self.bits_type(32, true, false);
+        let lsb = cx.b.emit(Op::Const(Bits::from_u64(32, offset as u64)), it, rhs.at());
+        let pt = self.bits_type(width, false, true);
+        Ok(cx.b.emit(
+            Op::Select {
+                value: whole,
+                lsb,
+                width,
+            },
+            pt,
+            rhs.at(),
+        ))
     }
 
     /// Lower `f` inside markers that let `disable tag` leave it.
