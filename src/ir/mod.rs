@@ -491,6 +491,24 @@ pub enum ArrFunc {
     Xor,
     Min,
     Max,
+    // Associative arrays (LRM 7.8). Keys are integral or strings.
+    /// `()`: an empty associative array.
+    MapNew,
+    /// `(map, key)`: the element, or the element type's default.
+    MapGet,
+    /// `(map, key, value)`: the map with the element set.
+    MapPut,
+    /// `(map, key)`: 1 if the key is present.
+    MapExists,
+    /// `(map, key)`: the map without the key.
+    MapDelete,
+    /// `(map)`: the keys in order, as a queue.
+    MapKeys,
+    /// `(map, key, mode)`, mode 0 first, 1 last, 2 next, 3 prev: 1 if there
+    /// is such a key.
+    MapFindOk,
+    /// The same, giving that key (or `key` if none).
+    MapFindKey,
 }
 
 /// Methods of the built-in `process` class. A process handle is an object

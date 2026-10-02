@@ -480,7 +480,7 @@ impl<'a, 't> Elab<'a, 't> {
             if automatic
                 && !ty.unpacked.is_empty()
                 && super::expr::fixed_count(&ty).is_none()
-                && !(matches!(ty.unpacked[0], UDim::Dynamic | UDim::Queue)
+                && !(matches!(ty.unpacked[0], UDim::Dynamic | UDim::Queue | UDim::Assoc(_))
                     && super::expr::fixed_count(&{
                         let mut t = ty.clone();
                         t.unpacked.remove(0);
@@ -1341,6 +1341,96 @@ impl<'a, 't> Elab<'a, 't> {
     }
 
     /// `foreach (a[i, j]) body` over fixed-size dimensions, left index to right.
+    /// `foreach (map[k])`: each key in order (of the keys when it starts).
+    #[allow(clippy::too_many_arguments)]
+    fn foreach_assoc(
+        &mut self,
+        cx: &mut Cx<'a>,
+        kw: &'a str,
+        p: &super::expr::Path<'a>,
+        k: super::types::AssocKey,
+        vars: &'t [Option<&'a str>],
+        body: &'t Stmt<'a>,
+        waits: &mut Vec<PendingWait>,
+    ) -> EResult<()> {
+        let (whole, _) = self.load_path(cx, p)?;
+        let dummy = self.key_dummy(cx, k, kw);
+        let kt = cx.b.val_type(dummy);
+        let key_ty = match &self.d.types[kt.0 as usize] {
+            Type::String => Ty::scalar(Base::Str),
+            Type::Bits { width, signed, .. } => Ty::bits(*width, *signed, false),
+            _ => Ty::bits(64, false, false),
+        };
+        let mut q = key_ty.clone();
+        q.unpacked.insert(0, UDim::Queue);
+        let keys = self.arr_op(cx, ArrFunc::MapKeys, vec![whole, dummy], &q, kw);
+        let int = Ty::bits(32, true, false);
+        let it = self.ir_type(&int);
+        let size = self.arr_op(cx, ArrFunc::Size, vec![keys], &int, kw);
+        let islot = cx.b.new_slot(it);
+        let zero = cx.b.emit(Op::Const(Bits::zero(32)), it, kw);
+        cx.b.effect(
+            Op::StoreSlot {
+                slot: islot,
+                part: None,
+                value: zero,
+            },
+            kw,
+        );
+        cx.locals.push(HashMap::new());
+        let kslot = cx.b.new_slot(kt);
+        if let Some(Some(name)) = vars.first() {
+            cx.locals
+                .last_mut()
+                .unwrap()
+                .insert(name, Sym::Slot(kslot, key_ty.clone()));
+        }
+        let (head, body_b, step, exit) = (
+            cx.b.new_block(),
+            cx.b.new_block(),
+            cx.b.new_block(),
+            cx.b.new_block(),
+        );
+        cx.b.goto(head);
+        let i = cx.b.emit(Op::LoadSlot(islot), it, kw);
+        let bit = self.bits_type(1, false, false);
+        let c = cx.b.emit(Op::Binary(BinOp::Lt, i, size), bit, kw);
+        cx.b.terminate(Terminator::Branch {
+            cond: c,
+            then: (body_b, vec![]),
+            els: (exit, vec![]),
+        });
+        cx.b.switch_to(body_b);
+        let kv = cx.b.emit(Op::ArrayElem { value: keys, index: i }, kt, kw);
+        cx.b.effect(
+            Op::StoreSlot {
+                slot: kslot,
+                part: None,
+                value: kv,
+            },
+            kw,
+        );
+        cx.b.loops.push((step, exit));
+        self.lower_stmt(cx, body, waits)?;
+        cx.b.loops.pop();
+        cx.b.goto(step);
+        let i = cx.b.emit(Op::LoadSlot(islot), it, kw);
+        let one = cx.b.emit(Op::Const(Bits::from_i64(32, 1)), it, kw);
+        let n = cx.b.emit(Op::Binary(BinOp::Add, i, one), it, kw);
+        cx.b.effect(
+            Op::StoreSlot {
+                slot: islot,
+                part: None,
+                value: n,
+            },
+            kw,
+        );
+        cx.b.terminate(Terminator::Jump(head, vec![]));
+        cx.b.switch_to(exit);
+        cx.locals.pop();
+        Ok(())
+    }
+
     fn lower_foreach(
         &mut self,
         cx: &mut Cx<'a>,
@@ -1353,6 +1443,9 @@ impl<'a, 't> Elab<'a, 't> {
         let Some(p) = self.path(cx, array)? else {
             return Err(self.error(array.at(), "foreach needs an array"));
         };
+        if let Some(UDim::Assoc(k)) = p.ty.unpacked.first().cloned() {
+            return self.foreach_assoc(cx, kw, &p, k, vars, body, waits);
+        }
         let mut dims: Vec<(i64, i64)> = Vec::new();
         // A dynamic first dimension runs from 0 to its size less one, at run time.
         let mut dyn_end = None;

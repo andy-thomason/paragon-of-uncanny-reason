@@ -19,6 +19,50 @@ pub enum Value {
     Array(Vec<Value>),
     /// A class handle; `None` is `null`.
     Obj(Option<ObjRef>),
+    /// An associative array, in key order.
+    Map(std::collections::BTreeMap<MapKey, Value>),
+}
+
+/// The key of an associative array element.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum MapKey {
+    Int(i128),
+    Str(String),
+}
+
+impl MapKey {
+    /// The key for a value: strings as text, integral values by number
+    /// (signed if their type is).
+    pub fn of(v: &Value, signed: bool) -> MapKey {
+        match v {
+            Value::Str(s) => MapKey::Str(s.clone()),
+            Value::Bits(b) => {
+                let mut b = b.clone();
+                b.to_two_state();
+                let w = b.width.min(127);
+                let neg = signed && b.msb().0;
+                let mag = b.resize(w, signed);
+                let u = mag.val[0] as u128 | (mag.val.get(1).copied().unwrap_or(0) as u128) << 64;
+                let u = if w < 128 { u & ((1u128 << w) - 1) } else { u };
+                MapKey::Int(if neg { u as i128 - (1i128 << w) } else { u as i128 })
+            }
+            Value::Real(r) => MapKey::Int(*r as i128),
+            _ => MapKey::Int(0),
+        }
+    }
+
+    /// The key as a value of type `ty`.
+    pub fn value(&self, ty: &Type<'_>) -> Value {
+        match (self, ty) {
+            (MapKey::Str(s), _) => Value::Str(s.clone()),
+            (MapKey::Int(i), Type::Bits { width, .. }) => {
+                let lo = Bits::from_u64(64, *i as u64);
+                let hi = Bits::from_u64(64, (*i >> 64) as u64);
+                Value::Bits(Bits::concat(&[hi, lo]).resize(*width, false))
+            }
+            (MapKey::Int(i), _) => Value::Bits(Bits::from_i64(64, *i as i64)),
+        }
+    }
 }
 
 /// A shared object (LRM 8): handles are references to it.
@@ -255,7 +299,7 @@ pub fn eval_pure<'v, 't: 'v>(
                 Value::Real(r) if *extend == Extend::Truncate => fix(Bits::from_f64(w, r.trunc())),
                 Value::Real(r) => fix(Bits::from_f64(w, r.round())),
                 Value::Bits(b) => fix(b.resize(w, *extend == Extend::Sign)),
-                Value::Str(_) | Value::Array(_) | Value::Obj(_) => return None,
+                Value::Str(_) | Value::Array(_) | Value::Obj(_) | Value::Map(_) => return None,
             }
         }
         Op::Mux { cond, then, els } => match arg(*cond).0.bits()?.truth() {
@@ -376,8 +420,55 @@ fn arr_func<'v, 't: 'v>(
         Value::Array(v) => v.clone(),
         _ => Vec::new(),
     };
+    let map = |i: usize| match a(i) {
+        Value::Map(m) => m.clone(),
+        _ => Default::default(),
+    };
+    let key_signed = |i: usize| bits_info(arg(args[i]).1).is_some_and(|(_, s, _)| s);
+    let key = |i: usize| MapKey::of(a(i), key_signed(i));
     let w = bits_info(ty).map_or(32, |(w, _, _)| w);
     Some(match func {
+        ArrFunc::Size if matches!(a(0), Value::Map(_)) => fix(Bits::from_i64(w, map(0).len() as i64)),
+        ArrFunc::Clear if matches!(a(0), Value::Map(_)) => Value::Map(Default::default()),
+        ArrFunc::MapNew => Value::Map(Default::default()),
+        ArrFunc::MapGet => match map(0).get(&key(1)) {
+            Some(v) => v.clone(),
+            None => default_for(&[], ty),
+        },
+        ArrFunc::MapPut => {
+            let mut m = map(0);
+            m.insert(key(1), a(2).clone());
+            Value::Map(m)
+        }
+        ArrFunc::MapExists => fix(Bits::from_u64(w, map(0).contains_key(&key(1)) as u64)),
+        ArrFunc::MapDelete => {
+            let mut m = map(0);
+            m.remove(&key(1));
+            Value::Map(m)
+        }
+        ArrFunc::MapKeys => {
+            let kt = arg(args[1]).1;
+            Value::Array(map(0).keys().map(|k| k.value(kt)).collect())
+        }
+        ArrFunc::MapFindOk | ArrFunc::MapFindKey => {
+            let m = map(0);
+            let k = key(1);
+            let mode = int(2).unwrap_or(0);
+            let found = match mode {
+                0 => m.keys().next(),
+                1 => m.keys().next_back(),
+                2 => m.range((std::ops::Bound::Excluded(&k), std::ops::Bound::Unbounded)).next().map(|(k, _)| k),
+                _ => m.range(..&k).next_back().map(|(k, _)| k),
+            };
+            if func == ArrFunc::MapFindOk {
+                fix(Bits::from_u64(w, found.is_some() as u64))
+            } else {
+                match found {
+                    Some(f) => f.value(arg(args[1]).1),
+                    None => a(1).clone(),
+                }
+            }
+        }
         ArrFunc::Size => fix(Bits::from_i64(w, arr(0).len() as i64)),
         ArrFunc::New => {
             let n = int(0).unwrap_or(0).max(0) as usize;
@@ -560,6 +651,7 @@ pub fn default_like(v: &Value) -> Value {
         Value::Str(_) => Value::Str(String::new()),
         Value::Array(a) => Value::Array(a.iter().map(default_like).collect()),
         Value::Obj(_) => Value::Obj(None),
+        Value::Map(_) => Value::Map(Default::default()),
     }
 }
 
@@ -602,7 +694,7 @@ pub fn to_string(v: &Value) -> String {
         Value::Str(s) => s.clone(),
         Value::Bits(b) => bits_to_string(b),
         Value::Real(r) => r.to_string(),
-        Value::Array(_) | Value::Obj(_) => String::new(),
+        Value::Array(_) | Value::Obj(_) | Value::Map(_) => String::new(),
     }
 }
 
@@ -726,6 +818,7 @@ pub fn default_for(types: &[Type<'_>], ty: &Type<'_>) -> Value {
     match ty {
         Type::Dynamic { .. } | Type::Queue { .. } => Value::Array(Vec::new()),
         Type::Class(_) | Type::Null => Value::Obj(None),
+        Type::Assoc { .. } => Value::Map(Default::default()),
         Type::Unpacked { elem, left, right } => {
             let n = (right - left).unsigned_abs() as usize + 1;
             Value::Array(vec![default_for(types, &types[elem.0 as usize]); n])

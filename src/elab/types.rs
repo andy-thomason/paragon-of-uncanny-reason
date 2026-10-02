@@ -36,7 +36,16 @@ pub(crate) enum UDim {
     Fixed(i64, i64),
     Dynamic,
     Queue,
-    Assoc,
+    Assoc(AssocKey),
+}
+
+/// The index type of an associative array.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum AssocKey {
+    /// `[*]`: any integral value.
+    Wild,
+    Str,
+    Int { w: u32, s: bool },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -365,7 +374,21 @@ impl<'a, 't> Elab<'a, 't> {
                 ast::Dim::Size(n) => UDim::Fixed(0, self.const_int(n)? - 1),
                 ast::Dim::Dynamic => UDim::Dynamic,
                 ast::Dim::Queue(_) => UDim::Queue,
-                ast::Dim::Assoc(_) => UDim::Assoc,
+                ast::Dim::Assoc(None) => UDim::Assoc(AssocKey::Wild),
+                ast::Dim::Assoc(Some(t)) => {
+                    let kt = self.resolve_type(t)?;
+                    UDim::Assoc(if kt.base == Base::Str {
+                        AssocKey::Str
+                    } else if kt.is_integral() {
+                        AssocKey::Int {
+                            w: kt.width(),
+                            s: kt.signed,
+                        }
+                    } else {
+                        // Class handles and the like: by an integral key.
+                        AssocKey::Wild
+                    })
+                }
             });
         }
         Ok(v)
@@ -391,7 +414,7 @@ impl<'a, 't> Elab<'a, 't> {
                 },
                 UDim::Dynamic => ir::Type::Dynamic { elem },
                 UDim::Queue => ir::Type::Queue { elem, max: None },
-                UDim::Assoc => ir::Type::Assoc { elem, key: None },
+                UDim::Assoc(_) => ir::Type::Assoc { elem, key: None },
             };
             return self.add_type(ty);
         }

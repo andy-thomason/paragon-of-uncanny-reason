@@ -141,6 +141,8 @@ pub(crate) struct Path<'a> {
     pub base: Ty<'a>,
     /// The linear element index, for an unpacked array.
     pub elem: Option<Val>,
+    /// The key of an associative array element, and the map's type.
+    pub key: Option<(Val, TypeId)>,
     /// The type of the selected part.
     pub ty: Ty<'a>,
     /// Bit offset of the selected part within `base`, if it is a part.
@@ -196,7 +198,7 @@ fn array_method_type(t: &Ty, name: &str) -> Option<STy> {
     let mut elem = t.clone();
     elem.unpacked.remove(0);
     Some(match name {
-        "size" | "num" => STy::Bits {
+        "size" | "num" | "exists" | "first" | "last" | "next" | "prev" => STy::Bits {
             w: 32,
             s: true,
             f: false,
@@ -351,7 +353,7 @@ impl<'a, 't> Elab<'a, 't> {
                 None => Err(self.error(e.at(), "Expecting a known integer constant")),
             },
             Value::Real(r) => Ok(r.round() as i64),
-            Value::Str(_) | Value::Array(_) | Value::Obj(_) => {
+            Value::Str(_) | Value::Array(_) | Value::Obj(_) | Value::Map(_) => {
                 Err(self.error(e.at(), "Expecting an integer constant"))
             }
         }
@@ -1087,6 +1089,7 @@ impl<'a, 't> Elab<'a, 't> {
                             },
                             base: ty.clone(),
                             elem: None,
+                            key: None,
                             ty,
                             lsb: None,
                             width,
@@ -1122,6 +1125,18 @@ impl<'a, 't> Elab<'a, 't> {
                 let Some(mut p) = self.path(cx, base)? else {
                     return Ok(None);
                 };
+                if let Some(UDim::Assoc(k)) = p.ty.unpacked.first().cloned() {
+                    if p.elem.is_some() || p.key.is_some() || p.lsb.is_some() {
+                        return Err(self.not_yet(at, "arrays of associative arrays"));
+                    }
+                    let mt = self.ir_type(&p.ty);
+                    let kv = self.assoc_key(cx, k, index)?;
+                    p.key = Some((kv, mt));
+                    p.ty.unpacked.remove(0);
+                    p.base = p.ty.clone();
+                    p.width = p.ty.width();
+                    return Ok(Some(p));
+                }
                 if matches!(p.ty.unpacked.first(), Some(UDim::Dynamic | UDim::Queue)) {
                     if p.elem.is_some() || p.ty.unpacked.len() > 1 {
                         return Err(self.not_yet(at, "arrays of arrays with dynamic dimensions"));
@@ -1303,6 +1318,7 @@ impl<'a, 't> Elab<'a, 't> {
             root,
             base: ty.clone(),
             elem: None,
+            key: None,
             ty,
             lsb: None,
             width,
@@ -1312,6 +1328,23 @@ impl<'a, 't> Elab<'a, 't> {
 
     /// Load a path's value.
     pub(crate) fn load_path(&mut self, cx: &mut Cx<'a>, p: &Path<'a>) -> EResult<(Val, STy)> {
+        if let Some((key, mt)) = p.key {
+            // An associative array element: look the key up in the whole map.
+            let whole = self.load_root(cx, &p.root, mt, p.at);
+            let et = self.ir_type(&p.base);
+            let v = cx.b.emit(
+                Op::ArrFunc {
+                    func: ArrFunc::MapGet,
+                    args: vec![whole, key],
+                },
+                et,
+                p.at,
+            );
+            if !p.ty.unpacked.is_empty() {
+                return Ok((v, sty_of(&p.ty)));
+            }
+            return Ok(self.select_part(cx, p, v));
+        }
         if let Root::Field { obj, index, ty } = &p.root {
             // A property: the whole value, then any element and bit select.
             let whole = cx.b.emit(
@@ -1352,7 +1385,7 @@ impl<'a, 't> Elab<'a, 't> {
             };
             return Ok(self.select_part(cx, p, base));
         }
-        if matches!(p.ty.unpacked.first(), Some(UDim::Dynamic | UDim::Queue)) {
+        if matches!(p.ty.unpacked.first(), Some(UDim::Dynamic | UDim::Queue | UDim::Assoc(_))) {
             let aty = self.ir_type(&p.ty);
             let v = match (&p.root, p.elem) {
                 (Root::Var(v), None) => cx.b.emit(Op::Load(*v), aty, p.at),
@@ -1500,6 +1533,104 @@ impl<'a, 't> Elab<'a, 't> {
                 let t = self.add_type(Type::Null);
                 cx.b.emit(Op::Null, t, at)
             }
+            Value::Map(m) => {
+                // An empty map, then each element.
+                let t = self.ir_type(ty);
+                let mut v = cx.b.emit(
+                    Op::ArrFunc {
+                        func: ArrFunc::MapNew,
+                        args: vec![],
+                    },
+                    t,
+                    at,
+                );
+                let kt = self.bits_type(64, true, false);
+                let st = self.add_type(Type::String);
+                for (k, x) in m {
+                    let kv = match k {
+                        crate::eval::MapKey::Int(i) => {
+                            cx.b.emit(Op::Const(Bits::from_i64(64, *i as i64)), kt, at)
+                        }
+                        crate::eval::MapKey::Str(s) => cx.b.emit(Op::ConstStr(s.clone()), st, at),
+                    };
+                    let xv = self.emit_value(cx, x, &elem, at);
+                    v = cx.b.emit(
+                        Op::ArrFunc {
+                            func: ArrFunc::MapPut,
+                            args: vec![v, kv, xv],
+                        },
+                        t,
+                        at,
+                    );
+                }
+                v
+            }
+        }
+    }
+
+    /// The whole value of a path's root, of type `t`.
+    fn load_root(&mut self, cx: &mut Cx<'a>, root: &Root, t: TypeId, at: &'a str) -> Val {
+        match root {
+            Root::Var(v) => cx.b.emit(Op::Load(*v), t, at),
+            Root::Slot(s) => cx.b.emit(Op::LoadSlot(*s), t, at),
+            Root::Field { obj, index, .. } => cx.b.emit(
+                Op::LoadField {
+                    obj: *obj,
+                    field: *index,
+                },
+                t,
+                at,
+            ),
+            Root::Const(_) => cx.b.emit(
+                Op::ArrFunc {
+                    func: ArrFunc::MapNew,
+                    args: vec![],
+                },
+                t,
+                at,
+            ),
+        }
+    }
+
+    /// `old` with `width` bits at `lsb` replaced by `value`.
+    #[allow(clippy::too_many_arguments)]
+    fn insert_bits(
+        &mut self,
+        cx: &mut Cx<'a>,
+        old: Val,
+        lsb: Val,
+        width: u32,
+        value: Val,
+        ty: &Ty<'a>,
+        at: &'a str,
+    ) -> Val {
+        let w = ty.width().max(1);
+        let t = self.bt(w, false, ty.four_state());
+        let ones = cx.b.emit(Op::Const(Bits::ones(width).resize(w, false)), t, at);
+        let mask = cx.b.emit(Op::Binary(BinOp::Shl, ones, lsb), t, at);
+        let keep = cx.b.emit(Op::Unary(UnOp::Not, mask), t, at);
+        let v = cx.b.emit(
+            Op::Resize {
+                value,
+                extend: Extend::Zero,
+            },
+            t,
+            at,
+        );
+        let v = cx.b.emit(Op::Binary(BinOp::Shl, v, lsb), t, at);
+        let v = cx.b.emit(Op::Binary(BinOp::And, v, mask), t, at);
+        let o = cx.b.emit(Op::Binary(BinOp::And, old, keep), t, at);
+        cx.b.emit(Op::Binary(BinOp::Or, o, v), t, at)
+    }
+
+    /// An associative array key, converted to the key type.
+    fn assoc_key(&mut self, cx: &mut Cx<'a>, k: super::types::AssocKey, e: &Expr<'a>) -> EResult<Val> {
+        use super::types::AssocKey;
+        match k {
+            AssocKey::Str => self.lower_str(cx, e),
+            AssocKey::Int { w, s } => self.lower_to(cx, e, &Ty::bits(w, s, false)),
+            // `[*]`: any integral key, as a 64-bit number.
+            AssocKey::Wild => self.lower_to(cx, e, &Ty::bits(64, true, false)),
         }
     }
 
@@ -1511,6 +1642,72 @@ impl<'a, 't> Elab<'a, 't> {
         value: Val,
         nba: bool,
     ) -> EResult<()> {
+        if let Some((key, mt)) = p.key {
+            // Read, change and write back the whole map.
+            let whole = self.load_root(cx, &p.root, mt, p.at);
+            let value = match p.lsb {
+                None => value,
+                Some(lsb) => {
+                    // A part of an element: change just those bits.
+                    let et = self.ir_type(&p.base);
+                    let old = cx.b.emit(
+                        Op::ArrFunc {
+                            func: ArrFunc::MapGet,
+                            args: vec![whole, key],
+                        },
+                        et,
+                        p.at,
+                    );
+                    self.insert_bits(cx, old, lsb, p.width, value, &p.base, p.at)
+                }
+            };
+            let new = cx.b.emit(
+                Op::ArrFunc {
+                    func: ArrFunc::MapPut,
+                    args: vec![whole, key, value],
+                },
+                mt,
+                p.at,
+            );
+            let root = Path {
+                root: p.root.clone(),
+                base: p.base.clone(),
+                elem: None,
+                key: None,
+                ty: p.base.clone(),
+                lsb: None,
+                width: 0,
+                at: p.at,
+            };
+            let op = match &root.root {
+                Root::Var(var) if nba => Op::NbaStore {
+                    var: *var,
+                    part: None,
+                    value: new,
+                },
+                Root::Var(var) => Op::Store {
+                    var: *var,
+                    part: None,
+                    value: new,
+                },
+                Root::Slot(slot) => Op::StoreSlot {
+                    slot: *slot,
+                    part: None,
+                    value: new,
+                },
+                Root::Field { obj, index, .. } => Op::StoreField {
+                    obj: *obj,
+                    field: *index,
+                    part: None,
+                    value: new,
+                },
+                Root::Const(_) => {
+                    return Err(self.error(p.at, format!("Cannot assign to a parameter: '{}'", p.at)));
+                }
+            };
+            cx.b.effect(op, p.at);
+            return Ok(());
+        }
         let part = p.lsb.map(|lsb| Part {
             lsb,
             width: p.width,
@@ -1666,6 +1863,9 @@ impl<'a, 't> Elab<'a, 't> {
     /// array, or a conditional choice between them.
     pub(crate) fn lower_array(&mut self, cx: &mut Cx<'a>, e: &Expr<'a>, ty: &Ty<'a>) -> EResult<Val> {
         let at = e.at();
+        if let UDim::Assoc(k) = ty.unpacked[0] {
+            return self.lower_assoc(cx, e, ty, k);
+        }
         if matches!(ty.unpacked[0], UDim::Dynamic | UDim::Queue)
             && ty.unpacked[1..].iter().all(|d| matches!(d, UDim::Fixed(..)))
         {
@@ -1891,6 +2091,194 @@ impl<'a, 't> Elab<'a, 't> {
         }
     }
 
+    /// A value for an associative array type.
+    fn lower_assoc(
+        &mut self,
+        cx: &mut Cx<'a>,
+        e: &Expr<'a>,
+        ty: &Ty<'a>,
+        k: super::types::AssocKey,
+    ) -> EResult<Val> {
+        let at = e.at();
+        let mt = self.ir_type(ty);
+        let mut elem = ty.clone();
+        elem.unpacked.remove(0);
+        match e {
+            Expr::Pattern { items, .. } => {
+                let mut m = cx.b.emit(
+                    Op::ArrFunc {
+                        func: ArrFunc::MapNew,
+                        args: vec![],
+                    },
+                    mt,
+                    at,
+                );
+                for i in items {
+                    match i {
+                        // The default for missing keys is the element default.
+                        ast::PatItem::Keyed(Expr::Keyword("default"), _) => {}
+                        ast::PatItem::Keyed(key, v) => {
+                            let kv = self.assoc_key(cx, k, key)?;
+                            let vv = self.lower_to(cx, v, &elem)?;
+                            m = cx.b.emit(
+                                Op::ArrFunc {
+                                    func: ArrFunc::MapPut,
+                                    args: vec![m, kv, vv],
+                                },
+                                mt,
+                                at,
+                            );
+                        }
+                        _ => return Err(self.error(at, "An associative array pattern needs keys")),
+                    }
+                }
+                Ok(m)
+            }
+            Expr::Concat(items) if items.is_empty() => Ok(cx.b.emit(
+                Op::ArrFunc {
+                    func: ArrFunc::MapNew,
+                    args: vec![],
+                },
+                mt,
+                at,
+            )),
+            Expr::Call { func, args } => Ok(self.lower_call(cx, func, args)?.0),
+            Expr::Cast { expr, .. } => self.lower_assoc(cx, expr, ty, k),
+            _ => {
+                let Some(p) = self.path(cx, e)? else {
+                    return Err(self.not_yet(at, "this associative array expression"));
+                };
+                Ok(self.load_path(cx, &p)?.0)
+            }
+        }
+    }
+
+    /// A value of the key type of an associative array, for operations that
+    /// need to know it.
+    pub(crate) fn key_dummy(&mut self, cx: &mut Cx<'a>, k: super::types::AssocKey, at: &'a str) -> Val {
+        use super::types::AssocKey;
+        match k {
+            AssocKey::Str => {
+                let t = self.add_type(Type::String);
+                cx.b.emit(Op::ConstStr(String::new()), t, at)
+            }
+            AssocKey::Int { w, s } => {
+                let t = self.bt(w, s, false);
+                cx.b.emit(Op::Const(Bits::zero(w)), t, at)
+            }
+            AssocKey::Wild => {
+                let t = self.bt(64, true, false);
+                cx.b.emit(Op::Const(Bits::zero(64)), t, at)
+            }
+        }
+    }
+
+    /// Methods of associative arrays: `exists`, `first`, `next`...
+    fn assoc_method(
+        &mut self,
+        cx: &mut Cx<'a>,
+        base: &Expr<'a>,
+        t: &Ty<'a>,
+        k: super::types::AssocKey,
+        name: &'a str,
+        args: &[Arg<'a>],
+    ) -> EResult<Option<(Val, STy)>> {
+        let int = STy::Bits {
+            w: 32,
+            s: true,
+            f: false,
+        };
+        let it = self.bt(32, true, false);
+        let arg = |i: usize| match args.get(i) {
+            Some(Arg::Ordered(Some(e))) => Some(e.clone()),
+            _ => None,
+        };
+        let mode = match name {
+            "exists" => -1,
+            "first" => 0,
+            "last" => 1,
+            "next" => 2,
+            "prev" => 3,
+            _ => return Ok(None),
+        };
+        let Some(p) = self.path(cx, base)? else {
+            return Err(self.error(base.at(), "Not an array"));
+        };
+        let (whole, _) = self.load_path(cx, &p)?;
+        let Some(ke) = arg(0) else {
+            return Err(self.error(name, format!("'{name}' needs a key argument")));
+        };
+        if mode < 0 {
+            let kv = self.assoc_key(cx, k, &ke)?;
+            let v = cx.b.emit(
+                Op::ArrFunc {
+                    func: ArrFunc::MapExists,
+                    args: vec![whole, kv],
+                },
+                it,
+                name,
+            );
+            let _ = t;
+            return Ok(Some((v, int)));
+        }
+        // first/last/next/prev(ref key): find, and update the key if found.
+        let kv = self.assoc_key(cx, k, &ke)?;
+        let m = cx.b.emit(Op::Const(Bits::from_i64(32, mode)), it, name);
+        let ok = cx.b.emit(
+            Op::ArrFunc {
+                func: ArrFunc::MapFindOk,
+                args: vec![whole, kv, m],
+            },
+            it,
+            name,
+        );
+        let kt = cx.b.val_type(kv);
+        let nk = cx.b.emit(
+            Op::ArrFunc {
+                func: ArrFunc::MapFindKey,
+                args: vec![whole, kv, m],
+            },
+            kt,
+            name,
+        );
+        let Some(kp) = self.path(cx, &ke)? else {
+            return Err(self.error(ke.at(), "The key argument must be a variable"));
+        };
+        let bit = self.bt(1, false, false);
+        let okb = cx.b.emit(Op::Unary(UnOp::RedOr, ok), bit, name);
+        let chosen = cx.b.emit(
+            Op::Mux {
+                cond: okb,
+                then: nk,
+                els: kv,
+            },
+            kt,
+            name,
+        );
+        let kst = sty_of(&kp.ty);
+        let chosen = match kst {
+            STy::Bits { .. } => {
+                let target = Want {
+                    w: kp.width,
+                    s: kp.ty.signed,
+                    f: kp.ty.four_state(),
+                };
+                let st = match self.d.types[kt.0 as usize] {
+                    Type::Bits { width, signed, four_state, .. } => STy::Bits {
+                        w: width,
+                        s: signed,
+                        f: four_state,
+                    },
+                    _ => kst,
+                };
+                self.resize(cx, chosen, st, target, name)
+            }
+            _ => chosen,
+        };
+        self.store_path(cx, &kp, chosen, false)?;
+        Ok(Some((ok, int)))
+    }
+
     /// An array method with a value: `q.size()`, `a.sum()`, `q.pop_front()`...
     pub(crate) fn array_method(
         &mut self,
@@ -1902,6 +2290,11 @@ impl<'a, 't> Elab<'a, 't> {
         let Some(t) = self.array_type(cx, base) else {
             return Err(self.error(base.at(), "Not an array"));
         };
+        if let UDim::Assoc(k) = t.unpacked[0]
+            && let Some(r) = self.assoc_method(cx, base, &t, k, name, args)?
+        {
+            return Ok(r);
+        }
         if matches!(name, "pop_front" | "pop_back") {
             let v = self.array_pop(cx, base, name)?;
             let mut elem = t.clone();
@@ -2015,6 +2408,11 @@ impl<'a, 't> Elab<'a, 't> {
                 self.arr_op(cx, ArrFunc::Insert, vec![whole, i, x], &t, name)
             }
             "delete" => match arg(0) {
+                Some(i) if matches!(t.unpacked[0], UDim::Assoc(_)) => {
+                    let UDim::Assoc(k) = t.unpacked[0] else { unreachable!() };
+                    let kv = self.assoc_key(cx, k, &i)?;
+                    self.arr_op(cx, ArrFunc::MapDelete, vec![whole, kv], &t, name)
+                }
                 Some(i) => {
                     let i = self.lower_to(cx, &i, &int)?;
                     self.arr_op(cx, ArrFunc::DeleteAt, vec![whole, i], &t, name)

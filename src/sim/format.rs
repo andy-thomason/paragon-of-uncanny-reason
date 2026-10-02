@@ -183,6 +183,19 @@ fn pattern_elem(v: &Value) -> String {
             format!("'{{{}}}", items.join(", "))
         }
         Value::Obj(None) => "null".into(),
+        Value::Map(m) => {
+            let items: Vec<String> = m
+                .iter()
+                .map(|(k, v)| {
+                    let k = match k {
+                        crate::eval::MapKey::Int(i) => format!("{i}"),
+                        crate::eval::MapKey::Str(s) => format!("{s:?}"),
+                    };
+                    format!("{k}:{}", pattern_elem(v))
+                })
+                .collect();
+            format!("'{{{}}}", items.join(", "))
+        }
         Value::Obj(Some(o)) => {
             let o = o.0.borrow();
             let items: Vec<String> = o
@@ -200,7 +213,7 @@ fn to_real(v: &Value, signed: bool) -> f64 {
     match v {
         Value::Real(r) => *r,
         Value::Bits(b) => crate::eval::bits_to_f64(b, signed),
-        Value::Str(_) | Value::Array(_) | Value::Obj(_) => 0.0,
+        Value::Str(_) | Value::Array(_) | Value::Obj(_) | Value::Map(_) => 0.0,
     }
 }
 
