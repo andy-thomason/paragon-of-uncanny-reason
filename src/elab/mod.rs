@@ -1931,10 +1931,16 @@ impl<'a, 't> Elab<'a, 't> {
         if let ast::Expr::Type(t) = e {
             return Ok(Override::Type(self.resolve_type(t)?));
         }
-        if let ast::Expr::Ident(n) = e
-            && let Some(Sym::Type(t)) = self.lookup(n)
-        {
-            return Ok(Override::Type(t));
+        if let ast::Expr::Ident(n) = e {
+            match self.lookup(n) {
+                Some(Sym::Type(t)) => return Ok(Override::Type(t)),
+                // A class name as a type parameter.
+                Some(Sym::ClassDef(d)) => {
+                    let c = self.specialise(d, None, n)?;
+                    return Ok(Override::Type(class::ClassInfo::ty(c)));
+                }
+                _ => {}
+            }
         }
         // `my_t[7:0]` as a type: a typedef with packed dimensions added.
         if let ast::Expr::Slice {
