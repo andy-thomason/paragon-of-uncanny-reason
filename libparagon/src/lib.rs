@@ -80,6 +80,9 @@ pub struct Options {
     /// Top-level inputs to drive as clocks, toggling every time step, like
     /// Verilator's test bench does for `clk`. Other top-level inputs are 0.
     pub clocks: Vec<String>,
+    /// A name for the test bench around the top modules, which prefixes
+    /// hierarchical names: `Some("top")` makes `%m` print `top.t`.
+    pub root_name: Option<String>,
 }
 
 impl Default for Options {
@@ -97,6 +100,7 @@ impl Default for Options {
             lib_exts: vec![".v".into(), ".sv".into()],
             max_steps: None,
             clocks: Vec::new(),
+            root_name: None,
         }
     }
 }
@@ -380,7 +384,8 @@ fn compile_and_run(
     for &var in &design.top_inputs {
         let v = &design.vars[var.0 as usize];
         if opts.clocks.iter().any(|c| c == v.name) {
-            sim.add_clock(var, 1);
+            // Like Verilator's test bench: low until 10, then toggling every 5.
+            sim.add_clock(var, 10, 5);
         } else if let Some((w, _, _)) =
             paragon_of_uncanny_reason::eval::bits_info(&design.types[v.ty.0 as usize])
         {
@@ -609,6 +614,7 @@ fn front_end<'a>(
     if parse {
         let eopts = elab::ElabOptions {
             top: opts.top.clone(),
+            root_name: opts.root_name.clone(),
         };
         let (design, elab_diags) = elab::elaborate(sm, &trees, &eopts);
         diags.extend(elab_diags.iter().map(|d| resolve(sm, d)));

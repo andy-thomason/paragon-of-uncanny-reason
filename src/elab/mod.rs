@@ -34,6 +34,8 @@ pub struct ElabOptions {
     /// The top module (`--top-module`). By default every module that no other
     /// module instantiates is a top.
     pub top: Option<String>,
+    /// See [`Design::root_name`].
+    pub root_name: Option<String>,
 }
 
 /// Elaborate parsed files into a design.
@@ -43,6 +45,7 @@ pub fn elaborate<'a>(
     opts: &ElabOptions,
 ) -> (Design<'a>, Vec<Diag<'a>>) {
     let mut e = Elab::new(sm);
+    e.d.root_name = opts.root_name.clone();
     e.run(files, opts);
     (e.d, e.diags)
 }

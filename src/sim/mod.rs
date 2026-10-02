@@ -171,16 +171,14 @@ impl<'d, 'a> Simulator<'d, 'a> {
         self.write(var, None, None, Value::Bits(value));
     }
 
-    /// Drive `var` as a clock: 0 at time 0, then inverted every `half_period`
-    /// (in the design's precision) for as long as the simulation runs.
-    pub fn add_clock(&mut self, var: VarId, half_period: u64) {
+    /// Drive `var` as a clock: 0 at time 0, inverted at `first`, then every
+    /// `half_period` (in the design's precision) while the simulation runs.
+    pub fn add_clock(&mut self, var: VarId, first: u64, half_period: u64) {
         self.set_input(var, Bits::zero(1));
         self.clocks.push((var, half_period.max(1)));
         self.seq += 1;
-        self.future.insert(
-            (half_period.max(1), self.seq),
-            Wake::Clock(self.clocks.len() - 1),
-        );
+        self.future
+            .insert((first.max(1), self.seq), Wake::Clock(self.clocks.len() - 1));
     }
 
     fn spawn(

@@ -80,6 +80,9 @@ pub struct Design<'a> {
     pub precision: i8,
     /// Input ports of the top modules, which a test bench may drive.
     pub top_inputs: Vec<VarId>,
+    /// The name of the test bench the tops are instantiated in, if any: it
+    /// prefixes hierarchical names (`%m` is `top.t` under Verilator's).
+    pub root_name: Option<String>,
 }
 
 /// An instance, generate block, named block or package. Scopes exist for

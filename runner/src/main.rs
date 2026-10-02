@@ -202,6 +202,9 @@ fn run_test(test: &Value, root: &Path) -> Outcome {
             return Outcome::Waived(why.into());
         }
     }
+    if name.starts_with("t_x_rand") {
+        return Outcome::Waived("depends on Verilator's exact random sequence (decision 3)".into());
+    }
     if tier == "T4" {
         return Outcome::Waived("checks Verilator internals".into());
     }
@@ -230,22 +233,43 @@ fn run_test(test: &Value, root: &Path) -> Outcome {
         Ok(sim) => {
             let r = block_on(sim.wait());
             let finished = r.stdout.contains("*-* All Finished *-*");
-            let bad_end = matches!(
-                r.finish,
-                libparagon::Finish::Stop | libparagon::Finish::Fatal | libparagon::Finish::Aborted
-            );
+            // Verilator's test passes when the model exits cleanly: `$finish`,
+            // or running out of events after printing the finish banner.
+            let clean = r.finish == libparagon::Finish::Finish
+                || (r.finish == libparagon::Finish::Quiescent && finished);
+            let bad_end = !clean;
             let error = r
                 .diagnostics
                 .iter()
                 .find(|d| d.severity == libparagon::Severity::Error);
+            // `execute(fails => 1)`: the run itself should fail, after
+            // printing the golden output.
+            let run_fails = execute_fails(test);
+            let golden = test["golden"]
+                .as_str()
+                .and_then(|g| std::fs::read_to_string(root.join(g)).ok());
+            if run_fails && (bad_end || error.is_some()) {
+                return match golden {
+                    Some(g) if display_lines(&g) != display_lines(&r.stdout) => {
+                        Outcome::WrongOutput(first_difference(&g, &r.stdout))
+                    }
+                    _ => Outcome::Pass,
+                };
+            }
             if expect_fail && (bad_end || error.is_some()) {
                 return Outcome::FailedAsExpected;
             }
-            return if finished && !bad_end && error.is_none() && !expect_fail {
-                Outcome::Pass
-            } else if let Some(e) = error {
+            if !bad_end && error.is_none() && !expect_fail && !run_fails {
+                return match golden {
+                    Some(g) if display_lines(&g) != display_lines(&r.stdout) => {
+                        Outcome::WrongOutput(first_difference(&g, &r.stdout))
+                    }
+                    _ => Outcome::Pass,
+                };
+            }
+            return if let Some(e) = error {
                 Outcome::SimFail(format!("{:?}: {}", r.finish, e.message))
-            } else if expect_fail {
+            } else if expect_fail || run_fails {
                 Outcome::SimFail("expected a failure".into())
             } else {
                 let last = r.stdout.lines().last().unwrap_or("").to_string();
@@ -287,6 +311,67 @@ fn run_test(test: &Value, root: &Path) -> Outcome {
         },
         None => Outcome::FailedAsExpected,
     }
+}
+
+/// Does the driver expect the simulation run itself to fail?
+fn execute_fails(test: &Value) -> bool {
+    test["calls"].as_array().is_some_and(|calls| {
+        calls.iter().any(|c| {
+            c["call"] == "execute"
+                && match &c["kwargs"]["fails"] {
+                    Value::Bool(b) => *b,
+                    Value::Number(n) => n.as_i64() != Some(0),
+                    // `test.vlt_all` and friends: true for Verilator scenarios.
+                    Value::Object(o) => o["dynamic"]
+                        .as_str()
+                        .is_some_and(|d| d.starts_with("test.vlt")),
+                    _ => false,
+                }
+        })
+    })
+}
+
+/// The lines of simulation output that come from the design. Run-time
+/// messages (`%Error:`, `-Info:` and the like) are left out: we match their
+/// codes and places, not their text (decision 1).
+fn display_lines(text: &str) -> Vec<&str> {
+    text.lines()
+        .filter(|l| {
+            let l = match l.strip_prefix('[') {
+                Some(rest) => rest.split_once("] ").map_or(*l, |x| x.1),
+                None => l,
+            };
+            let t = l.trim_start();
+            let continuation = t.starts_with(": ")
+                || t.starts_with("... ")
+                || t.starts_with("| ")
+                || t.starts_with('^')
+                || t.split_once(" | ")
+                    .is_some_and(|(n, _)| n.trim().parse::<u32>().is_ok());
+            !(continuation
+                || l == "Aborting..."
+                || l.starts_with("%Error")
+                || l.starts_with("%Warning")
+                || l.starts_with("%Fatal")
+                || l.starts_with("%Info")
+                || l.starts_with("-Info")
+                || l.starts_with("- "))
+        })
+        .collect()
+}
+
+fn first_difference(golden: &str, ours: &str) -> String {
+    let (g, o) = (display_lines(golden), display_lines(ours));
+    for i in 0..g.len().max(o.len()) {
+        let (a, b) = (
+            g.get(i).copied().unwrap_or("<end>"),
+            o.get(i).copied().unwrap_or("<end>"),
+        );
+        if a != b {
+            return format!("line {}: want {a:?} got {b:?}", i + 1);
+        }
+    }
+    String::new()
 }
 
 /// A `-E` test: preprocess and compare the text with the golden output.
@@ -390,6 +475,7 @@ fn first_golden_location(golden: &str) -> Option<String> {
 
 /// Build options from the driver's flags, as Verilator would interpret them.
 fn options(test: &Value, top: &str, name: &str) -> Result<Options, String> {
+    let binary = flags(test).contains(&"--binary");
     let mut o = Options {
         source_name: top.to_string(),
         include_dirs: vec!["t".into(), ".".into()],
@@ -401,7 +487,14 @@ fn options(test: &Value, top: &str, name: &str) -> Result<Options, String> {
         ],
         // Enough for any test in the suite; stops runaway zero-delay loops.
         max_steps: Some(20_000_000),
-        clocks: vec!["clk".into(), "fastclk".into()],
+        // Verilator's test bench instantiates the model as `top` and toggles
+        // its clocks; `--binary` builds run the model on its own.
+        clocks: if binary {
+            Vec::new()
+        } else {
+            vec!["clk".into(), "fastclk".into()]
+        },
+        root_name: (!binary).then(|| "top".into()),
         ..Options::default()
     };
     let flags = flags(test);

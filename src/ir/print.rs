@@ -10,7 +10,10 @@ impl Design<'_> {
         match sc.parent {
             Some(p) if !sc.name.is_empty() => format!("{}.{}", self.scope_path(p), sc.name),
             Some(p) => self.scope_path(p),
-            None => sc.name.to_string(),
+            None => match &self.root_name {
+                Some(r) if sc.module.is_some() => format!("{r}.{}", sc.name),
+                _ => sc.name.to_string(),
+            },
         }
     }
 
