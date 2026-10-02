@@ -219,8 +219,13 @@ impl<'a> Parser<'a> {
                         arg: Box::new(e),
                     };
                 }
-                Some(Token::Keyword(w @ "with")) if self.is_op_at(1, "{") => {
-                    return Err(self.not_yet(w, "inline constraints"));
+                Some(Token::Keyword("with")) if self.is_op_at(1, "{") => {
+                    self.bump();
+                    let items = self.constraint_block()?;
+                    e = Expr::WithConstraints {
+                        call: Box::new(e),
+                        items,
+                    };
                 }
                 Some(Token::Keyword("with")) if self.is_op_at(1, "(") => {
                     self.bump();
@@ -507,6 +512,106 @@ impl<'a> Parser<'a> {
     fn class_scope_follows(&self) -> bool {
         let end = self.skip_balanced_from(self.pos + 1);
         matches!(self.toks.get(end), Some(Token::Op("::")))
+    }
+
+    /// `{ items }` of a constraint.
+    pub(crate) fn constraint_block(&mut self) -> PResult<Vec<ConstraintItem<'a>>> {
+        self.expect_op("{")?;
+        let mut items = Vec::new();
+        while self.eat_op("}").is_none() {
+            if self.peek().is_none() {
+                return Err(self.unexpected("'}'"));
+            }
+            items.extend(self.constraint_item()?);
+        }
+        Ok(items)
+    }
+
+    /// One item, or a nested `{ ... }` block of them.
+    fn constraint_set(&mut self) -> PResult<Vec<ConstraintItem<'a>>> {
+        if self.is_op("{") {
+            self.constraint_block()
+        } else {
+            self.constraint_item()
+        }
+    }
+
+    fn constraint_item(&mut self) -> PResult<Vec<ConstraintItem<'a>>> {
+        if self.eat_op(";").is_some() {
+            return Ok(Vec::new());
+        }
+        if self.is_op("{") {
+            return self.constraint_block();
+        }
+        if self.eat_kw("if").is_some() {
+            let cond = self.paren_expr()?;
+            let then = self.constraint_set()?;
+            let els = if self.eat_kw("else").is_some() {
+                self.constraint_set()?
+            } else {
+                Vec::new()
+            };
+            return Ok(vec![ConstraintItem::If { cond, then, els }]);
+        }
+        if self.eat_kw("foreach").is_some() {
+            let (array, vars) = self.foreach_header()?;
+            let items = self.constraint_set()?;
+            return Ok(vec![ConstraintItem::Foreach { array, vars, items }]);
+        }
+        if let Some(k) = self.eat_kw("solve") {
+            while self.bump().is_some_and(|t| t != Token::Op(";")) {}
+            return Ok(vec![ConstraintItem::Ignored(k)]);
+        }
+        if self.is_kw("disable") && self.is_kw_at(1, "soft") {
+            let k = self.here();
+            while self.bump().is_some_and(|t| t != Token::Op(";")) {}
+            return Ok(vec![ConstraintItem::Ignored(k)]);
+        }
+        if self.eat_kw("unique").is_some() {
+            let set = self.open_range_list()?;
+            self.expect_op(";")?;
+            return Ok(vec![ConstraintItem::Unique(set)]);
+        }
+        let soft = self.eat_kw("soft").is_some();
+        // `cond -> item` with a block on the right is not an expression.
+        let lhs = self.cond_expr()?;
+        if self.eat_op("->").is_some() {
+            let rhs = self.constraint_set()?;
+            return Ok(vec![ConstraintItem::Implies(lhs, rhs)]);
+        }
+        if self.eat_kw("dist").is_some() {
+            self.expect_op("{")?;
+            let mut items = Vec::new();
+            loop {
+                let v = if self.eat_kw("default").is_some() {
+                    Expr::Keyword("default")
+                } else {
+                    self.open_range()?
+                };
+                let w = if self.eat_op(":=").is_some() || self.eat_op(":/").is_some() {
+                    Some(self.expr()?)
+                } else if self.is_op(":") && (self.is_op_at(1, "=") || self.is_op_at(1, "/")) {
+                    self.bump();
+                    self.bump();
+                    Some(self.expr()?)
+                } else {
+                    None
+                };
+                items.push((v, w));
+                if self.eat_op(",").is_none() {
+                    break;
+                }
+            }
+            self.expect_op("}")?;
+            self.expect_op(";")?;
+            return Ok(vec![ConstraintItem::Dist { expr: lhs, items }]);
+        }
+        self.expect_op(";")?;
+        Ok(vec![if soft {
+            ConstraintItem::Soft(lhs)
+        } else {
+            ConstraintItem::Expr(lhs)
+        }])
     }
 
     /// `{...}`: concatenation, replication, streaming, or the empty queue `{}`.

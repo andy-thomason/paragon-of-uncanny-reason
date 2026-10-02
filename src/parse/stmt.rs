@@ -523,6 +523,18 @@ impl<'a> Parser<'a> {
 
     fn foreach_stmt(&mut self, kw: &'a str) -> PResult<Stmt<'a>> {
         self.bump();
+        let (array, vars) = self.foreach_header()?;
+        let body = self.statement()?;
+        Ok(Stmt::Foreach {
+            kw,
+            array,
+            vars,
+            body: Box::new(body),
+        })
+    }
+
+    /// `( array[i, j] )` after `foreach`.
+    pub(crate) fn foreach_header(&mut self) -> PResult<(Expr<'a>, Vec<Option<&'a str>>)> {
         self.expect_op("(")?;
         // The loop variables are in the last brackets before `)`; everything
         // before them is the array expression: foreach (a[i].b[j]) uses j.
@@ -577,13 +589,7 @@ impl<'a> Parser<'a> {
             self.expect_op("]")?;
         }
         self.expect_op(")")?;
-        let body = self.statement()?;
-        Ok(Stmt::Foreach {
-            kw,
-            array,
-            vars,
-            body: Box::new(body),
-        })
+        Ok((array, vars))
     }
 
     fn immediate_assert(&mut self, kw: &'a str) -> PResult<Stmt<'a>> {

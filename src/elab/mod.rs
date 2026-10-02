@@ -15,6 +15,7 @@
 
 mod build;
 mod class;
+mod randomize;
 mod expr;
 mod stmt;
 #[cfg(test)]
@@ -100,6 +101,9 @@ pub(crate) enum Sym<'a> {
     /// A property of the class whose method is being lowered: its index in
     /// the object, and its type.
     Field(u32, Ty<'a>),
+    /// A property of a given object (the one being randomised, in a
+    /// constraint): the handle, the index and the type.
+    ObjField(Val, u32, Ty<'a>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

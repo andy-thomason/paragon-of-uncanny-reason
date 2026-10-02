@@ -709,6 +709,10 @@ pub enum SysFunc {
     ValuePlusargs,
     RealToBits,
     BitsToReal,
+    /// `(lo0, hi0, lo1, hi1, ...)`: a random value in one of the ranges
+    /// (64-bit bounds, signed), each range as likely as its size; for
+    /// randomization.
+    RandomPick,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -930,7 +930,38 @@ impl<'d, 'a> Simulator<'d, 'a> {
                     }
                     SysFunc::Realtime => Value::Real(self.time_in(frame_scope)),
                     SysFunc::Random | SysFunc::Urandom => {
-                        Value::Bits(Bits::from_u64(w, self.rand()))
+                        // As many random bits as the result needs.
+                        let mut b = Bits::from_u64(w.min(64), self.rand());
+                        while b.width < w {
+                            let more = Bits::from_u64(64, self.rand());
+                            b = Bits::concat(&[more, b]);
+                        }
+                        Value::Bits(b.resize(w, false))
+                    }
+                    SysFunc::UrandomRange => {
+                        let a = self.int(t, args[0]).unwrap_or(0) as u64;
+                        let b = args.get(1).and_then(|v| self.int(t, *v)).unwrap_or(0) as u64;
+                        let (lo, hi) = (a.min(b), a.max(b));
+                        let span = hi.wrapping_sub(lo).wrapping_add(1);
+                        let r = if span == 0 { self.rand() } else { lo + self.rand() % span };
+                        Value::Bits(Bits::from_u64(w, r))
+                    }
+                    SysFunc::RandomPick => {
+                        let bounds: Vec<i64> = args.iter().map(|a| self.int(t, *a).unwrap_or(0)).collect();
+                        let ranges: Vec<(i64, i64)> = bounds.chunks(2).map(|p| (p[0], p[1])).collect();
+                        let total: u128 = ranges.iter().map(|(l, h)| (*h as i128 - *l as i128 + 1) as u128).sum();
+                        let r = ((self.rand() as u128) << 64 | self.rand() as u128) % total.max(1);
+                        let mut acc = 0u128;
+                        let mut v = 0i64;
+                        for (l, h) in &ranges {
+                            let n = (*h as i128 - *l as i128 + 1) as u128;
+                            if r < acc + n {
+                                v = (*l as i128 + (r - acc) as i128) as i64;
+                                break;
+                            }
+                            acc += n;
+                        }
+                        Value::Bits(Bits::from_i64(w, v))
                     }
                     SysFunc::Clog2 => {
                         let v = self.val(t, args[0]);

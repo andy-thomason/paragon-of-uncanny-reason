@@ -62,6 +62,10 @@ pub(crate) struct ClassInfo<'a, 't> {
     pub methods: HashMap<&'a str, Method>,
     pub ctor: Option<FuncId>,
     pub is_virtual: bool,
+    /// `rand` and `randc` properties.
+    pub rand_fields: Vec<u32>,
+    /// Constraint blocks by name, inherited ones included.
+    pub constraints: Vec<(&'a str, &'t [ast::ConstraintItem<'a>])>,
 }
 
 impl<'a, 't> Elab<'a, 't> {
@@ -119,6 +123,8 @@ impl<'a, 't> Elab<'a, 't> {
             methods: HashMap::new(),
             ctor: None,
             is_virtual: ast.kind == Some("virtual"),
+            rand_fields: Vec::new(),
+            constraints: Vec::new(),
         });
         self.class_defs[def].specs.push((key, id));
         let _ = at;
@@ -171,6 +177,9 @@ impl<'a, 't> Elab<'a, 't> {
             self.ensure_class(b)?;
             let base = &self.classes[b.0 as usize];
             let (fields, methods, bscope) = (base.fields.clone(), base.methods.clone(), base.scope);
+            let (rand_fields, constraints) = (base.rand_fields.clone(), base.constraints.clone());
+            self.classes[ci].rand_fields = rand_fields;
+            self.classes[ci].constraints = constraints;
             let vtable = self.d.classes[b.0 as usize].vtable.clone();
             let info = &mut self.classes[ci];
             info.base = Some(b);
@@ -183,9 +192,17 @@ impl<'a, 't> Elab<'a, 't> {
         // Declarations first, then methods, which may use them.
         let mut methods = Vec::new();
         for item in &ast.items {
+            if let ast::ClassMember::Constraint(name, Some(items)) = &item.item {
+                // A constraint of the same name replaces the base class's.
+                let cs = &mut self.classes[ci].constraints;
+                cs.retain(|(n, _)| n != name);
+                cs.push((name, items));
+                continue;
+            }
             let ast::ClassMember::Item(it) = &item.item else {
                 continue;
             };
+            let is_rand = item.quals.iter().any(|q| matches!(*q, "rand" | "randc"));
             let is_static = item.quals.contains(&"static");
             match &**it {
                 ast::ModuleItem::Var(v) if !is_static => {
@@ -194,6 +211,9 @@ impl<'a, 't> Elab<'a, 't> {
                         let mut ty = base.clone();
                         ty.unpacked = self.unpacked_dims(&d.dims)?;
                         let idx = self.classes[ci].fields.len() as u32;
+                        if is_rand {
+                            self.classes[ci].rand_fields.push(idx);
+                        }
                         self.classes[ci].fields.push((d.name, ty.clone()));
                         self.declare(d.name, Sym::Field(idx, ty));
                         if let Some(e) = &d.init {
@@ -353,6 +373,8 @@ impl<'a, 't> Elab<'a, 't> {
             methods: HashMap::new(),
             ctor: None,
             is_virtual: true,
+            rand_fields: Vec::new(),
+            constraints: Vec::new(),
         });
         self.d.process_class = Some(id);
         id
@@ -516,8 +538,19 @@ impl<'a, 't> Elab<'a, 't> {
             self.classes[c.0 as usize].methods.get(name).cloned()
         };
         let Some(m) = m else {
-            if matches!(name, "randomize" | "srandom" | "get_randstate" | "set_randstate") {
-                return Err(self.not_yet(name, "randomization"));
+            if name == "randomize" {
+                if !args.is_empty() {
+                    return Err(self.not_yet(name, "randomize with arguments"));
+                }
+                let obj = match obj {
+                    Some(o) => o,
+                    None => self.this_handle(cx, name)?,
+                };
+                let v = self.lower_randomize(cx, obj, c, &[], name)?;
+                return Ok(Some((v, STy::Bits { w: 32, s: true, f: false })));
+            }
+            if matches!(name, "srandom" | "get_randstate" | "set_randstate" | "rand_mode" | "constraint_mode") {
+                return Err(self.not_yet(name, "randomization state and modes"));
             }
             return Err(self.error(
                 name,

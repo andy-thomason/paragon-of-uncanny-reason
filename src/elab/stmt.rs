@@ -1169,6 +1169,10 @@ impl<'a, 't> Elab<'a, 't> {
                 self.call_expr(cx, func, args)?;
                 Ok(())
             }
+            Expr::WithConstraints { call, items } => {
+                self.lower_with_constraints(cx, call, items)?;
+                Ok(())
+            }
             // `obj.task;` or a method called without parentheses.
             Expr::Member { .. } | Expr::Scoped { .. }
                 if matches!(e, Expr::Member { base, .. } if self.handle_class(Some(cx), base).is_some())

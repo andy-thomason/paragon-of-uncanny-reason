@@ -35,6 +35,9 @@ pub(crate) struct Cx<'a> {
     pub(crate) exit: Option<BlockId>,
     /// While lowering a queue index: the value of `$` (its last index).
     pub(crate) dollar: Option<Val>,
+    /// In a constraint: the object being randomised, whose members names
+    /// stand for first.
+    pub(crate) with_obj: Option<(Val, ClassId)>,
 }
 
 impl<'a> Cx<'a> {
@@ -48,6 +51,7 @@ impl<'a> Cx<'a> {
             block_scope: None,
             exit: None,
             dollar: None,
+            with_obj: None,
         }
     }
 }
@@ -271,6 +275,15 @@ impl<'a, 't> Elab<'a, 't> {
             for scope in cx.locals.iter().rev() {
                 if let Some(s) = scope.get(name) {
                     return Some(s.clone());
+                }
+            }
+            // In a constraint, the randomised object's members come first.
+            if let Some((obj, c)) = cx.with_obj {
+                let scope = self.classes[c.0 as usize].scope;
+                match self.lookup_with_bases(scope, name) {
+                    Some(Sym::Field(i, t)) => return Some(Sym::ObjField(obj, i, t)),
+                    Some(s @ (Sym::Var(..) | Sym::Param(..))) => return Some(s),
+                    _ => {}
                 }
             }
         }
@@ -501,6 +514,16 @@ impl<'a, 't> Elab<'a, 't> {
                     n => return Err(self.error(n, format!("process::{n} has no value"))),
                 }
             }
+            // `obj.randomize()`, `randomize()`: 1 on success.
+            Expr::Call { func, .. }
+                if matches!(&**func, Expr::Member { name: "randomize", .. } | Expr::Ident("randomize")) =>
+            {
+                STy::Bits {
+                    w: 32,
+                    s: true,
+                    f: false,
+                }
+            }
             Expr::Call { func, .. } if self.method_of(cx, func).is_some() => {
                 let f = self.method_of(cx, func).unwrap()?;
                 match self.sig(f)?.ret {
@@ -552,6 +575,11 @@ impl<'a, 't> Elab<'a, 't> {
                 }
             }
             Expr::Keyword("null") => STy::Class(None),
+            Expr::WithConstraints { .. } => STy::Bits {
+                w: 32,
+                s: true,
+                f: false,
+            },
             Expr::New { .. } => STy::Class(None),
             Expr::Keyword("$") if cx.is_some_and(|c| c.dollar.is_some()) => STy::Bits {
                 w: 32,
@@ -657,9 +685,13 @@ impl<'a, 't> Elab<'a, 't> {
                 None => return Err(self.error(e.at(), "'this' used outside a non-static method")),
             },
             Expr::Ident(n) => match self.lookup_cx(cx, n) {
-                Some(Sym::Var(_, t) | Sym::Slot(_, t) | Sym::Param(_, t) | Sym::Field(_, t)) => {
-                    Some((t, false))
-                }
+                Some(
+                    Sym::Var(_, t)
+                    | Sym::Slot(_, t)
+                    | Sym::Param(_, t)
+                    | Sym::Field(_, t)
+                    | Sym::ObjField(_, _, t),
+                ) => Some((t, false)),
                 Some(Sym::Scope(_)) => {
                     return Err(
                         self.error(n, format!("'{n}' is an instance or block, not a value"))
@@ -836,7 +868,8 @@ impl<'a, 't> Elab<'a, 't> {
         };
         match f {
             Some(f) => Some(Ok(f)),
-            None if matches!(name, "randomize" | "srandom") => Some(Err(self.not_yet(name, "randomization"))),
+            None if name == "randomize" => None,
+            None if name == "srandom" => Some(Err(self.not_yet(name, "randomization state"))),
             None => Some(Err(self.error(name, format!("Class method '{name}' not found")))),
         }
     }
@@ -1229,6 +1262,17 @@ impl<'a, 't> Elab<'a, 't> {
                 (Root::Slot(s), t)
             }
             Some(Sym::Param(v, t)) => (Root::Const(v), t),
+            Some(Sym::ObjField(obj, index, t)) => {
+                let fty = self.ir_type(&t);
+                (
+                    Root::Field {
+                        obj,
+                        index,
+                        ty: fty,
+                    },
+                    t,
+                )
+            }
             Some(Sym::Field(index, t)) => {
                 if cx.const_mode {
                     self.nonconst = Some(n);
@@ -2166,6 +2210,15 @@ impl<'a, 't> Elab<'a, 't> {
                 let (v, st) = self.array_method(cx, base, name, &[])?;
                 return Ok(self.resize(cx, v, st, want, at));
             }
+            Expr::WithConstraints { call, items } => {
+                let v = self.lower_with_constraints(cx, call, items)?;
+                let st = STy::Bits {
+                    w: 32,
+                    s: true,
+                    f: false,
+                };
+                return Ok(self.resize(cx, v, st, want, at));
+            }
             Expr::Keyword("$") if cx.dollar.is_some() => {
                 let d = cx.dollar.unwrap();
                 let st = STy::Bits {
@@ -2782,6 +2835,14 @@ impl<'a, 't> Elab<'a, 't> {
             Expr::Scoped { scope, name } if self.scope_class(scope).is_some() => {
                 let c = self.scope_class(scope).unwrap()?;
                 return self.method_call(cx, c, None, name, args, true);
+            }
+            // `randomize()` inside a class: this object.
+            Expr::Ident("randomize")
+                if self.this_class(cx).is_some()
+                    && !matches!(self.lookup_cx(Some(cx), "randomize"), Some(Sym::Func(_))) =>
+            {
+                let c = self.this_class(cx).unwrap();
+                return self.method_call(cx, c, None, "randomize", args, false);
             }
             _ => {}
         }

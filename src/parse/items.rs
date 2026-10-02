@@ -980,11 +980,11 @@ impl<'a> Parser<'a> {
                 self.bump();
                 let name = self.ident()?;
                 if self.is_op("{") {
-                    self.skip_braces()?;
+                    ClassMember::Constraint(name, Some(self.constraint_block()?))
                 } else {
                     self.expect_op(";")?;
+                    ClassMember::Constraint(name, None)
                 }
-                ClassMember::Constraint(name)
             }
             Some(Token::Keyword("covergroup")) => {
                 self.bump();
@@ -1011,21 +1011,6 @@ impl<'a> Parser<'a> {
             }
         };
         Ok(Some(ClassItem { quals, item }))
-    }
-
-    /// Skip a `{ ... }` block, nested braces and all.
-    fn skip_braces(&mut self) -> PResult<()> {
-        self.expect_op("{")?;
-        let mut depth = 1;
-        while depth > 0 {
-            match self.bump() {
-                Some(Token::Op("{" | "'{")) => depth += 1,
-                Some(Token::Op("}")) => depth -= 1,
-                Some(_) => {}
-                None => return Err(self.unexpected("'}'")),
-            }
-        }
-        Ok(())
     }
 
     /// `( [dir] [type] name [dims] [= default], ... )`

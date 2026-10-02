@@ -231,6 +231,36 @@ pub struct ClassDecl<'a> {
     pub end: &'a str,
 }
 
+/// An item of a constraint block (LRM 18.5).
+#[derive(Clone, Debug)]
+pub enum ConstraintItem<'a> {
+    /// A Boolean expression, including `a -> b` and `x inside {...}`.
+    Expr(Expr<'a>),
+    /// `soft expr;`
+    Soft(Expr<'a>),
+    /// `cond -> { items }`
+    Implies(Expr<'a>, Vec<ConstraintItem<'a>>),
+    If {
+        cond: Expr<'a>,
+        then: Vec<ConstraintItem<'a>>,
+        els: Vec<ConstraintItem<'a>>,
+    },
+    Foreach {
+        array: Expr<'a>,
+        vars: Vec<Option<&'a str>>,
+        items: Vec<ConstraintItem<'a>>,
+    },
+    /// `x dist { v := w, [lo:hi] :/ w }`: the values (or `Range`s), with weights.
+    Dist {
+        expr: Expr<'a>,
+        items: Vec<(Expr<'a>, Option<Expr<'a>>)>,
+    },
+    /// `unique { a, b, c }`
+    Unique(Vec<Expr<'a>>),
+    /// `solve ... before ...;` and `disable soft ...;`: no effect here.
+    Ignored(&'a str),
+}
+
 /// A member of a class with its qualifiers (`static`, `local`, `protected`,
 /// `rand`, `randc`, `virtual`, `pure`, `extern`, `const`).
 #[derive(Clone, Debug)]
@@ -243,8 +273,8 @@ pub struct ClassItem<'a> {
 pub enum ClassMember<'a> {
     /// A property, method, typedef, parameter or nested class.
     Item(Box<ModuleItem<'a>>),
-    /// `constraint name { ... }`, kept by name only.
-    Constraint(&'a str),
+    /// `constraint name { ... }`; `None` items for a prototype.
+    Constraint(&'a str, Option<Vec<ConstraintItem<'a>>>),
     /// A covergroup, kept by name only.
     Covergroup(&'a str),
 }
@@ -643,6 +673,11 @@ pub enum Expr<'a> {
         base: Box<Expr<'a>>,
         expr: Box<Expr<'a>>,
     },
+    /// `obj.randomize() with { ... }`: a call with inline constraints.
+    WithConstraints {
+        call: Box<Expr<'a>>,
+        items: Vec<ConstraintItem<'a>>,
+    },
     /// `type'(expr)`, `8'(expr)`, `signed'(expr)`.
     Cast {
         ty: Box<Expr<'a>>,
@@ -676,6 +711,7 @@ impl<'a> Expr<'a> {
                 base.at()
             }
             Expr::With { base, .. } => base.at(),
+            Expr::WithConstraints { call, .. } => call.at(),
             Expr::Unary { op, .. } | Expr::IncDec { op, .. } => op,
             Expr::Binary { lhs, .. } | Expr::Assign { lhs, .. } => lhs.at(),
             Expr::Cond { cond, .. } => cond.at(),
