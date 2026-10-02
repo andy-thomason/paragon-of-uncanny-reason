@@ -11,10 +11,10 @@ fn no_disk() -> Options {
 
 #[test]
 fn simulate_reports_the_first_missing_stage() {
-    let r = block_on(simulate(HELLO));
+    let r = block_on(simulate(HELLO)).err();
     assert_eq!(
         r,
-        Err(Error::NotImplemented {
+        Some(Error::NotImplemented {
             stage: Stage::Parse
         })
     );
@@ -22,8 +22,8 @@ fn simulate_reports_the_first_missing_stage() {
 
 #[test]
 fn simulate_reports_preprocessor_errors_with_positions() {
-    let r = block_on(simulate_with("\n`ifdef X\n", &no_disk()));
-    let Err(Error::Diagnostics(d)) = r else {
+    let r = block_on(simulate_with("\n`ifdef X\n", &no_disk())).err();
+    let Some(Error::Diagnostics(d)) = r else {
         panic!("{r:?}")
     };
     assert_eq!(d.len(), 1);

@@ -19,8 +19,10 @@ the rules, and [`docs/design/`](docs/design/) for the design documents.
 | Elaboration | Not started |
 | Simulation | Not started |
 
-`simulate()` runs the pipeline as far as it exists. Today it preprocesses the
-source and then returns `Error::NotImplemented { stage: Stage::Parse }`. The
+`simulate()` compiles the source and returns a running `Simulation` that
+streams events such as `$display` output. The pipeline exists only as far as
+the preprocessor, so today it returns
+`Error::NotImplemented { stage: Stage::Parse }` after preprocessing. The
 signature will stay the same as later stages arrive.
 
 The preprocessor is tested against Verilator's own CC0 golden files:
@@ -124,8 +126,13 @@ libparagon = { git = "https://github.com/andy-thomason/paragon-of-uncanny-reason
 
 ### Simulate source text
 
+`simulate` compiles the source and returns a `Simulation`. Compile errors are
+returned straight away. Once running, the simulation is on its own thread and
+sends `Event`s: `$display` output as it happens, run-time diagnostics, and
+always a final `Finished`. Dropping the `Simulation` stops it.
+
 ```rust
-use libparagon::{Error, block_on, simulate};
+use libparagon::{Error, Event, block_on, simulate};
 
 let source = r#"
     module t;
@@ -136,12 +143,25 @@ let source = r#"
     endmodule
 "#;
 
-match block_on(simulate(source)) {
-    Ok(result) => print!("{}", result.stdout),
-    Err(Error::Diagnostics(diags)) => diags.iter().for_each(|d| eprintln!("{d}")),
-    Err(e) => eprintln!("{e}"), // today: "Parse is not implemented yet"
-}
+block_on(async {
+    let mut sim = match simulate(source).await {
+        Ok(sim) => sim,
+        Err(Error::Diagnostics(diags)) => return diags.iter().for_each(|d| eprintln!("{d}")),
+        Err(e) => return eprintln!("{e}"), // today: "Parse is not implemented yet"
+    };
+    while let Some(event) = sim.next_event().await {
+        match event {
+            Event::Display { text, time } => print!("[{time}] {text}"),
+            Event::Diagnostic(d) => eprintln!("{d}"),
+            Event::Finished { finish, time } => println!("{finish:?} at {time}"),
+        }
+    }
+});
 ```
+
+If you only want the end result, `Simulation::wait` gathers the events into a
+`SimResult` with `stdout`, `finish`, `time` and `diagnostics`. Without an async
+context, use `Simulation::next_event_blocking` instead of `next_event`.
 
 ### Preprocess with options
 
@@ -184,7 +204,7 @@ assert_eq!(out.warnings[0].code.as_deref(), Some("REDEFMACRO"));
 #[tokio::main]
 async fn main() -> Result<(), libparagon::Error> {
     let source = std::fs::read_to_string("top.sv").unwrap();
-    let result = libparagon::simulate(&source).await?;
+    let result = libparagon::simulate(&source).await?.wait().await;
     print!("{}", result.stdout);
     Ok(())
 }

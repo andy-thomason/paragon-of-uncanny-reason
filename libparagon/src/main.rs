@@ -4,7 +4,8 @@
 //! paragon [-E [-P]] [-DNAME[=VALUE]] [+incdir+DIR] [-IDIR] FILE
 //! ```
 
-use libparagon::{Error, Options, block_on, preprocess_with, simulate_with};
+use libparagon::{Error, Event, Finish, Options, block_on, preprocess_with, simulate_with};
+use std::io::Write;
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
@@ -44,29 +45,43 @@ fn main() -> ExitCode {
     opts.source_name = file;
     opts.line_markers = !no_markers;
 
-    let result = if preprocess_only {
-        block_on(preprocess_with(&source, &opts)).map(|p| {
-            print!("{}", p.text);
-            p.warnings
-        })
-    } else {
-        block_on(simulate_with(&source, &opts)).map(|r| {
-            print!("{}", r.stdout);
-            r.warnings
-        })
+    if preprocess_only {
+        return match block_on(preprocess_with(&source, &opts)) {
+            Ok(p) => {
+                print!("{}", p.text);
+                p.warnings.iter().for_each(|w| eprintln!("{w}"));
+                ExitCode::SUCCESS
+            }
+            Err(e) => report(e),
+        };
+    }
+    let mut sim = match block_on(simulate_with(&source, &opts)) {
+        Ok(sim) => sim,
+        Err(e) => return report(e),
     };
-    match result {
-        Ok(warnings) => {
-            warnings.iter().for_each(|w| eprintln!("{w}"));
-            ExitCode::SUCCESS
-        }
-        Err(e @ Error::NotImplemented { .. }) => {
-            eprintln!("%Error: {e}");
-            ExitCode::FAILURE
-        }
-        Err(e) => {
-            eprintln!("{e}");
-            ExitCode::FAILURE
+    // Print output as it happens.
+    while let Some(event) = sim.next_event_blocking() {
+        match event {
+            Event::Display { text, .. } => {
+                print!("{text}");
+                let _ = std::io::stdout().flush();
+            }
+            Event::Diagnostic(d) => eprintln!("{d}"),
+            Event::Finished { finish, .. } => {
+                return match finish {
+                    Finish::Finish | Finish::Quiescent => ExitCode::SUCCESS,
+                    Finish::Stop | Finish::Fatal | Finish::Aborted => ExitCode::FAILURE,
+                };
+            }
         }
     }
+    ExitCode::FAILURE
+}
+
+fn report(e: Error) -> ExitCode {
+    match e {
+        Error::NotImplemented { .. } => eprintln!("%Error: {e}"),
+        Error::Diagnostics(_) => eprintln!("{e}"),
+    }
+    ExitCode::FAILURE
 }
