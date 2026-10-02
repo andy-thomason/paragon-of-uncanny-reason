@@ -782,6 +782,10 @@ impl<'a, 't> Elab<'a, 't> {
             ));
         }
         let _ = used_named;
+        // Interface ports are bound first: typedefs may use their types.
+        if let Some((parent, conns)) = bind {
+            self.prebind_ifaces(m, parent, conns);
+        }
         // Parameters and typedefs may refer to ones declared later.
         self.resolve_early(early)?;
 
@@ -1225,7 +1229,14 @@ impl<'a, 't> Elab<'a, 't> {
                     self.declare(n, Sym::Genvar);
                 }
             }
-            I::TimeUnits { .. } | I::Modport(_) | I::Directive(_) => {}
+            // A modport stands for its interface in dotted names: `ifc.mp.x`.
+            I::Modport(mps) => {
+                let cur = self.cur;
+                for mp in mps {
+                    self.declare(mp.name, Sym::Scope(cur));
+                }
+            }
+            I::TimeUnits { .. } | I::Directive(_) => {}
             I::Generate(items) => self.declare_items(items)?,
             I::Defparam(v) => {
                 return Err(
@@ -1879,6 +1890,49 @@ impl<'a, 't> Elab<'a, 't> {
         };
         let v = self.const_value(e, Some(&ty))?;
         Ok(Override::Value(v, ty))
+    }
+
+    /// Bind the interface ports of the module being declared (the current
+    /// scope) from the connections in `parent`, straight from its port list.
+    fn prebind_ifaces(
+        &mut self,
+        m: &'t ast::Module<'a>,
+        parent: ScopeId,
+        conns: &'t [ast::PortConn<'a>],
+    ) {
+        let ast::Ports::Ansi(ports) = &m.ports else {
+            return;
+        };
+        let child = self.cur;
+        for (pos, p) in ports.iter().enumerate() {
+            let is_iface = p.interface.is_some()
+                || matches!(&p.ty, ast::DataType::Named { scope: None, name, .. }
+                    if matches!(self.modules.get(name), Some((m, _)) if m.kind == "interface"));
+            if !is_iface {
+                continue;
+            }
+            let conn = conns.iter().enumerate().find_map(|(i, c)| match c {
+                ast::PortConn::Ordered(Some(e)) if i == pos => Some(PortExpr::Expr(e)),
+                ast::PortConn::Named(n, Some(Some(e))) if *n == p.name => Some(PortExpr::Expr(e)),
+                ast::PortConn::Named(n, None) if *n == p.name => Some(PortExpr::Name(n)),
+                ast::PortConn::Wildcard => Some(PortExpr::Name(p.name)),
+                _ => None,
+            });
+            let Some(conn) = conn else { continue };
+            let info = PortInfo {
+                name: p.name,
+                dir: Dir::Interface,
+                var: VarId(u32::MAX),
+                ty: Ty::scalar(Base::Void),
+            };
+            self.cur = parent;
+            let n = self.diags.len();
+            if self.connect_port(child, &info, conn).is_err() {
+                // Reported again, in order, when the port itself is connected.
+                self.diags.truncate(n);
+            }
+            self.cur = child;
+        }
     }
 
     /// Bind just the interface ports of `child`.
