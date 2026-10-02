@@ -88,8 +88,8 @@ pub fn eval_pure<'v, 't: 'v>(
             }
             if let (Value::Str(p), Value::Str(q)) = (arg(*x).0, arg(*y).0) {
                 let r = match b {
-                    BinOp::Eq | BinOp::CaseEq => p == q,
-                    BinOp::Ne | BinOp::CaseNe => p != q,
+                    BinOp::Eq | BinOp::CaseEq | BinOp::WildEq => p == q,
+                    BinOp::Ne | BinOp::CaseNe | BinOp::WildNe => p != q,
                     BinOp::Lt => p < q,
                     BinOp::Le => p <= q,
                     BinOp::Gt => p > q,
@@ -256,6 +256,7 @@ pub fn eval_pure<'v, 't: 'v>(
                         _ => to_radix(&b, 2),
                     })
                 }
+                StrFunc::Repeat => Value::Str(s.repeat(int(1).unwrap_or(0).max(0) as usize)),
                 StrFunc::Realtoa => match a(0) {
                     Value::Real(r) => Value::Str(crate::sim::format_g(*r)),
                     v => Value::Str(to_string(v)),
@@ -396,8 +397,8 @@ fn real_binary(op: BinOp, p: f64, q: f64, fix: &dyn Fn(Bits) -> Value) -> Option
         BinOp::Mul => Some(Value::Real(p * q)),
         BinOp::Div => Some(Value::Real(p / q)),
         BinOp::Pow => Some(Value::Real(p.powf(q))),
-        BinOp::Eq | BinOp::CaseEq => b(p == q),
-        BinOp::Ne | BinOp::CaseNe => b(p != q),
+        BinOp::Eq | BinOp::CaseEq | BinOp::WildEq => b(p == q),
+        BinOp::Ne | BinOp::CaseNe | BinOp::WildNe => b(p != q),
         BinOp::Lt => b(p < q),
         BinOp::Le => b(p <= q),
         BinOp::Gt => b(p > q),

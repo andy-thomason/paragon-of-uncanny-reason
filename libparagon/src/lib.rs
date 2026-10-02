@@ -88,6 +88,8 @@ pub struct Options {
     /// Stop a simulation that runs longer than this (wall-clock time); it
     /// then ends with [`Finish::Aborted`] and a diagnostic.
     pub time_limit: Option<std::time::Duration>,
+    /// The top module's instance name (Verilator's `--l2-name`).
+    pub top_instance: Option<String>,
 }
 
 impl Default for Options {
@@ -108,6 +110,7 @@ impl Default for Options {
             root_name: None,
             params: Vec::new(),
             time_limit: None,
+            top_instance: None,
         }
     }
 }
@@ -654,6 +657,7 @@ fn front_end<'a>(
             top: opts.top.clone(),
             root_name: opts.root_name.clone(),
             params: opts.params.clone(),
+            top_instance: opts.top_instance.clone(),
         };
         let (design, elab_diags) = elab::elaborate(sm, &trees, &eopts);
         diags.extend(elab_diags.iter().map(|d| resolve(sm, d)));

@@ -39,6 +39,8 @@ pub struct ElabOptions {
     /// `-Gname=value`: overrides for the top modules' parameters. A value is
     /// a number or a quoted string.
     pub params: Vec<(String, String)>,
+    /// The instance name of the top module (`--l2-name`); by default its module name.
+    pub top_instance: Option<String>,
 }
 
 /// Elaborate parsed files into a design.
@@ -459,7 +461,11 @@ impl<'a, 't> Elab<'a, 't> {
                 .filter(|(n, _)| module_declares_param(m, n.unwrap()))
                 .cloned()
                 .collect();
-            if let Ok(s) = self.instantiate_begin(m, m.name, None, &ov, m.name) {
+            let inst = match &opts.top_instance {
+                Some(n) => self.sm.add(n.clone(), crate::source::Origin::CommandLine).1,
+                None => m.name,
+            };
+            if let Ok(s) = self.instantiate_begin(m, inst, None, &ov, m.name) {
                 if self.d.top.is_none() {
                     self.d.top = Some(s);
                 }
@@ -1486,7 +1492,7 @@ impl<'a, 't> Elab<'a, 't> {
         let mut text = String::new();
         for a in args {
             if let ast::Arg::Ordered(Some(ast::Expr::Str(s))) = a {
-                text.push_str(&decode_string(&s[1..s.len() - 1]));
+                text.push_str(&decode_string(str_body(s)));
             }
         }
         match *name {
@@ -1847,6 +1853,15 @@ fn apply_timeunit(t: &mut (i8, i8), kw: &str, values: &[&str]) {
 }
 
 /// Decode the escapes in a string literal's contents.
+/// The body of a string literal token: inside `"..."` or `"""..."""`.
+pub(crate) fn str_body(s: &str) -> &str {
+    if s.len() >= 6 && s.starts_with("\"\"\"") && s.ends_with("\"\"\"") {
+        &s[3..s.len() - 3]
+    } else {
+        &s[1..s.len() - 1]
+    }
+}
+
 /// The bytes of a string literal's body, with escapes decoded.
 pub(crate) fn decode_string_bytes(s: &str) -> Vec<u8> {
     let mut out: Vec<u8> = Vec::new();

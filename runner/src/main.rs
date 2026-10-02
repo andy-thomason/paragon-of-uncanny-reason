@@ -537,6 +537,11 @@ fn options(test: &Value, top: &str, name: &str) -> Result<Options, String> {
             o.include_dirs.push(dir.into());
         } else if f == "--top-module" || f == "--top" || f == "-top-module" {
             o.top = it.next().map(String::from);
+        } else if f == "--l2-name" {
+            o.top_instance = it.next().map(String::from);
+        } else if f == "--main-top-name" {
+            // `-` means no test bench level in hierarchical names.
+            o.root_name = it.next().filter(|n| *n != "-").map(String::from);
         } else if f == "--language" || f == "--default-language" || f == "-language" {
             o.language = it.next().map(String::from);
         } else if let Some((l, _suffix)) = f

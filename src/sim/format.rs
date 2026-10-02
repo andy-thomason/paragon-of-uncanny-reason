@@ -83,6 +83,7 @@ fn conv(
             if natural { format!("{s:>20}") } else { s }
         }
         ('s', Value::Str(s)) => s.clone(),
+        ('s', Value::Real(r)) => format_g(*r),
         ('s', Value::Bits(b)) => {
             let mut bytes = Vec::new();
             for i in (0..b.width.div_ceil(8)).rev() {
@@ -94,6 +95,9 @@ fn conv(
             if natural {
                 // Unused leading bytes print as spaces.
                 format!("{text:>width$}", width = b.width.div_ceil(8) as usize)
+            } else if text.is_empty() {
+                // Nothing to print still takes one place.
+                " ".into()
             } else {
                 text
             }

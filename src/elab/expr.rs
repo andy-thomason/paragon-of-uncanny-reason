@@ -316,7 +316,7 @@ impl<'a, 't> Elab<'a, 't> {
                 Err(m) => return Err(self.error(n, m)),
             },
             Expr::Str(s) => STy::Bits {
-                w: (super::decode_string_bytes(&s[1..s.len() - 1]).len() as u32 * 8).max(8),
+                w: (super::decode_string_bytes(super::str_body(s)).len() as u32 * 8).max(8),
                 s: false,
                 f: false,
             },
@@ -407,11 +407,11 @@ impl<'a, 't> Elab<'a, 't> {
                 STy::Bits { w, s: false, f }
             }
             Expr::Repl { count, items } => {
-                let n = self.const_int(count)?;
                 let inner = self.self_type_cx(cx, &Expr::Concat(items.clone()))?;
                 if inner == STy::Str {
                     return Ok(STy::Str);
                 }
+                let n = self.const_int(count)?;
                 STy::Bits {
                     w: inner.width() * n.max(0) as u32,
                     s: false,
@@ -1313,7 +1313,7 @@ impl<'a, 't> Elab<'a, 't> {
                 Err(m) => Err(self.error(n, m)),
             },
             Expr::Str(s) => {
-                let text = super::decode_string_bytes(&s[1..s.len() - 1]);
+                let text = super::decode_string_bytes(super::str_body(s));
                 let w = (text.len() as u32 * 8).max(8);
                 let mut b = Bits::zero(w);
                 for (i, byte) in text.iter().copied().rev().enumerate() {
@@ -1908,6 +1908,12 @@ impl<'a, 't> Elab<'a, 't> {
                         };
                         t.width()
                     }
+                    Some(e) if self.is_str(Some(cx), e) => {
+                        // A string's size is its length in bytes.
+                        let (len, _) = self.str_method(cx, e, "len", &[])?;
+                        let eight = konst(cx, 8);
+                        return Ok((cx.b.emit(Op::Binary(BinOp::Mul, len, eight), int, name), st));
+                    }
                     Some(e) => match self.path_type(Some(cx), e)? {
                         Some((t, _)) => {
                             let n: u32 = t
@@ -2051,10 +2057,18 @@ impl<'a, 't> Elab<'a, 't> {
         let stt = self.add_type(Type::String);
         let at = e.at();
         if let Expr::Str(s) = e {
-            let text = crate::eval::latin1(&super::decode_string_bytes(&s[1..s.len() - 1]));
+            // `\0` characters are left out of a string (LRM 6.16).
+            let mut bytes = super::decode_string_bytes(super::str_body(s));
+            bytes.retain(|&b| b != 0);
+            let text = crate::eval::latin1(&bytes);
             return Ok(cx.b.emit(Op::ConstStr(text), stt, at));
         }
-        let st = self.self_type_cx(Some(cx), e)?;
+        // In a string context, a replication of literals is string replication.
+        let st = if matches!(e, Expr::Repl { .. }) {
+            STy::Str
+        } else {
+            self.self_type_cx(Some(cx), e)?
+        };
         match st {
             STy::Real => return Err(self.error(at, "Real value used as a string")),
             STy::Bits { .. } => {
@@ -2074,8 +2088,21 @@ impl<'a, 't> Elab<'a, 't> {
                 Ok(cx.b.emit(Op::Concat(parts), stt, at))
             }
             Expr::Repl { count, items } => {
-                let n = self.const_int(count)?;
                 let v = self.lower_str(cx, &Expr::Concat(items.clone()))?;
+                let n = self.diags.len();
+                let Ok(n) = self.const_int(count) else {
+                    // A string may be replicated a variable number of times.
+                    self.diags.truncate(n);
+                    let c = self.lower_to(cx, count, &Ty::bits(32, true, false))?;
+                    return Ok(cx.b.emit(
+                        Op::StrFunc {
+                            func: StrFunc::Repeat,
+                            args: vec![v, c],
+                        },
+                        stt,
+                        at,
+                    ));
+                };
                 Ok(cx.b.emit(
                     Op::Repl {
                         value: v,

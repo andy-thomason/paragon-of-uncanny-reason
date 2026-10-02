@@ -397,6 +397,8 @@ pub enum StrFunc {
     Octtoa,
     Bintoa,
     Realtoa,
+    /// `(s, n)`: `{n{s}}` with a count known only at run time.
+    Repeat,
 }
 
 /// A part of a value to write: `width` bits from bit `lsb`.

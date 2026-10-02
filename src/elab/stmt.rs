@@ -1434,7 +1434,7 @@ impl<'a, 't> Elab<'a, 't> {
             match &args[i] {
                 Arg::Ordered(Some(Expr::Str(s))) => {
                     i += 1;
-                    let text = super::decode_string(&s[1..s.len() - 1]);
+                    let text = super::decode_string(super::str_body(s));
                     for piece in parse_format(&text) {
                         match piece {
                             Piece::Text(t) => pieces.push(FormatPiece::Text(self.sm.derive(t, s))),
