@@ -438,6 +438,13 @@ impl<'a, 't> Elab<'a, 't> {
                 if self.d.top.is_none() {
                     self.d.top = Some(s);
                 }
+                let inputs: Vec<VarId> = self.scopes[s.0 as usize]
+                    .ports
+                    .iter()
+                    .filter(|p| p.dir == Dir::Input)
+                    .map(|p| p.var)
+                    .collect();
+                self.d.top_inputs.extend(inputs);
                 let _ = self.expand_scope(s);
             }
         }

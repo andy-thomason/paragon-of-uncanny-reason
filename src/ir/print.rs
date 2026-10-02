@@ -292,8 +292,12 @@ impl Display for Design<'_> {
                         spec,
                         width,
                         zero_pad,
+                        left,
                     } => {
                         write!(f, "%")?;
+                        if *left {
+                            write!(f, "-")?;
+                        }
                         if *zero_pad {
                             write!(f, "0")?;
                         }

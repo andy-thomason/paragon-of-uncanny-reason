@@ -1413,6 +1413,7 @@ impl<'a, 't> Elab<'a, 't> {
                                 spec,
                                 width,
                                 zero_pad,
+                                left,
                             } => {
                                 let Some(Arg::Ordered(Some(e))) = args.get(i) else {
                                     return Err(self.error(
@@ -1426,6 +1427,7 @@ impl<'a, 't> Elab<'a, 't> {
                                     spec,
                                     width,
                                     zero_pad,
+                                    left,
                                 });
                             }
                         }
@@ -1438,6 +1440,7 @@ impl<'a, 't> Elab<'a, 't> {
                         spec: radix,
                         width: None,
                         zero_pad: false,
+                        left: false,
                     });
                 }
                 Arg::Ordered(None) => {
@@ -1495,6 +1498,7 @@ enum Piece {
         spec: char,
         width: Option<u32>,
         zero_pad: bool,
+        left: bool,
     },
 }
 
@@ -1534,7 +1538,12 @@ fn parse_format(s: &str) -> Vec<Piece> {
                 if !text.is_empty() {
                     out.push(Piece::Text(std::mem::take(&mut text)));
                 }
-                let plain: String = digits.chars().take_while(|c| c.is_ascii_digit()).collect();
+                let left = digits.starts_with('-');
+                let plain: String = digits
+                    .trim_start_matches('-')
+                    .chars()
+                    .take_while(|c| c.is_ascii_digit())
+                    .collect();
                 let zero_pad = plain.len() > 1 && plain.starts_with('0');
                 let width = if plain.is_empty() {
                     None
@@ -1546,6 +1555,7 @@ fn parse_format(s: &str) -> Vec<Piece> {
                     spec,
                     width,
                     zero_pad,
+                    left,
                 });
             }
         }

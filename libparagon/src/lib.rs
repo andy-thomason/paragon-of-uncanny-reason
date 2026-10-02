@@ -24,9 +24,9 @@
 //! # Status
 //!
 //! [`simulate`] compiles the source and returns a [`Simulation`] whose events
-//! arrive as it runs. The pipeline exists as far as elaboration: a source
-//! with errors returns [`Error::Diagnostics`], and one that elaborates
-//! cleanly returns [`Error::NotImplemented`] naming the next stage. The signature will
+//! arrive as it runs, from the reference interpreter. A source with errors
+//! returns [`Error::Diagnostics`]; one using a construct Paragon does not
+//! support yet returns them with the code `NOTYET`. The signature will
 //! not change as later stages are added.
 
 mod channel;
@@ -39,11 +39,12 @@ pub struct ReadmeDoctests;
 
 pub use executor::block_on;
 
+use paragon_of_uncanny_reason::ir::ReportSeverity;
 use paragon_of_uncanny_reason::keywords::Lang;
 use paragon_of_uncanny_reason::pp::emit::{EmitOptions, write};
 use paragon_of_uncanny_reason::pp::{self, FileSystem, Preprocessor};
 use paragon_of_uncanny_reason::source::SourceMap;
-use paragon_of_uncanny_reason::{elab, lex, parse};
+use paragon_of_uncanny_reason::{elab, lex, parse, sim};
 use std::fmt;
 
 /// Settings for a run. [`Options::default`] suits a single self-contained source.
@@ -73,6 +74,12 @@ pub struct Options {
     pub lib_dirs: Vec<String>,
     /// Extensions tried in library directories (`+libext+`).
     pub lib_exts: Vec<String>,
+    /// Stop a simulation after this many IR instructions (a guard against
+    /// infinite zero-delay loops). `None` uses the simulator's default.
+    pub max_steps: Option<u64>,
+    /// Top-level inputs to drive as clocks, toggling every time step, like
+    /// Verilator's test bench does for `clk`. Other top-level inputs are 0.
+    pub clocks: Vec<String>,
 }
 
 impl Default for Options {
@@ -88,6 +95,8 @@ impl Default for Options {
             top: None,
             lib_dirs: Vec::new(),
             lib_exts: vec![".v".into(), ".sv".into()],
+            max_steps: None,
+            clocks: Vec::new(),
         }
     }
 }
@@ -221,8 +230,9 @@ pub(crate) type EventSender = channel::Sender<Event>;
 /// and that is sent as the final [`Event::Finished`]. If `run` panics, the
 /// receiver sees [`Finish::Aborted`]. `run` should stop early once
 /// [`channel::Sender::is_closed`] is true, which means the handle was dropped.
-// Used by the simulator once it exists; exercised by the tests until then.
-#[cfg_attr(not(test), allow(dead_code))]
+// The simulation thread is started by `simulate_with`; this simpler form is
+// used by the tests of the event plumbing.
+#[cfg(test)]
 pub(crate) fn start<F>(warnings: Vec<Diagnostic>, run: F) -> Simulation
 where
     F: FnOnce(&EventSender) -> (Finish, u64) + Send + 'static,
@@ -314,16 +324,146 @@ pub async fn simulate(source: &str) -> Result<Simulation, Error> {
 /// own thread and reports through the returned [`Simulation`]. Compile-time
 /// warnings are its first events.
 pub async fn simulate_with(source: &str, opts: &Options) -> Result<Simulation, Error> {
-    let _warnings = on_big_stack(|| front_end(source, opts, Goal::Elaborate))?.1;
-    Err(Error::NotImplemented {
-        stage: Stage::Simulate,
-    })
+    let (compiled_tx, mut compiled_rx) = channel::channel::<Result<(), Error>>();
+    let (events_tx, events_rx) = channel::channel::<Event>();
+    let (source, opts) = (source.to_string(), opts.clone());
+    // One thread owns the source map and the design: it compiles, says how
+    // that went, then simulates and streams events.
+    std::thread::Builder::new()
+        .stack_size(FRONT_END_STACK)
+        .spawn(move || compile_and_run(&source, &opts, &compiled_tx, &events_tx))
+        .expect("spawn simulation thread");
+    match compiled_rx.recv().await {
+        Some(Ok(())) => Ok(Simulation {
+            events: events_rx,
+            done: false,
+        }),
+        Some(Err(e)) => Err(e),
+        None => Err(Error::Diagnostics(vec![Diagnostic {
+            severity: Severity::Error,
+            code: None,
+            file: String::new(),
+            line: 0,
+            col: 0,
+            message: "Internal error: the compiler thread stopped".into(),
+            notes: Vec::new(),
+        }])),
+    }
+}
+
+/// The body of the simulation thread.
+fn compile_and_run(
+    source: &str,
+    opts: &Options,
+    compiled: &channel::Sender<Result<(), Error>>,
+    events: &EventSender,
+) {
+    let sm = SourceMap::new();
+    let (design, warnings) = match front_end(&sm, source, opts, Goal::Elaborate) {
+        Ok((Output::Design(d), w)) => (d, w),
+        Ok((Output::Text(_), _)) => unreachable!("elaboration produces a design"),
+        Err(e) => {
+            let _ = compiled.send(Err(e));
+            return;
+        }
+    };
+    let _ = compiled.send(Ok(()));
+    for w in warnings {
+        if events.send(Event::Diagnostic(w)).is_err() {
+            return;
+        }
+    }
+    let mut sim = sim::Simulator::new(&design);
+    if let Some(n) = opts.max_steps {
+        sim.max_steps = n;
+    }
+    for &var in &design.top_inputs {
+        let v = &design.vars[var.0 as usize];
+        if opts.clocks.iter().any(|c| c == v.name) {
+            sim.add_clock(var, 1);
+        } else if let Some((w, _, _)) =
+            paragon_of_uncanny_reason::eval::bits_info(&design.types[v.ty.0 as usize])
+        {
+            sim.set_input(var, paragon_of_uncanny_reason::ir::Bits::zero(w));
+        }
+    }
+    let mut sink = EventSink { sm: &sm, events };
+    let end = sim.run(&mut sink);
+    let finish = match end {
+        sim::End::Finish => Finish::Finish,
+        sim::End::Stop => Finish::Stop,
+        sim::End::Fatal => Finish::Fatal,
+        sim::End::Quiescent => Finish::Quiescent,
+        sim::End::Hung => {
+            let _ = events.send(Event::Diagnostic(Diagnostic {
+                severity: Severity::Error,
+                code: None,
+                file: String::new(),
+                line: 0,
+                col: 0,
+                message: "Simulation step limit reached (an infinite zero-delay loop?)".into(),
+                notes: Vec::new(),
+            }));
+            Finish::Aborted
+        }
+        sim::End::Cancelled => Finish::Aborted,
+    };
+    let _ = events.send(Event::Finished {
+        finish,
+        time: sim.time,
+    });
+}
+
+/// Turns simulator output into [`Event`]s.
+struct EventSink<'s> {
+    sm: &'s SourceMap,
+    events: &'s EventSender,
+}
+
+impl sim::Sink for EventSink<'_> {
+    fn display(&mut self, text: &str, time: u64) {
+        let _ = self.events.send(Event::Display {
+            text: text.to_string(),
+            time,
+        });
+    }
+
+    fn report(&mut self, severity: ReportSeverity, message: &str, at: &str, _time: u64) {
+        let (file, line, col) = self
+            .sm
+            .locate(at)
+            .map(|l| (l.name, l.line, l.col))
+            .unwrap_or_default();
+        let severity = match severity {
+            ReportSeverity::Error => Severity::Error,
+            _ => Severity::Warning,
+        };
+        let _ = self.events.send(Event::Diagnostic(Diagnostic {
+            severity,
+            code: None,
+            file,
+            line,
+            col,
+            message: message.to_string(),
+            notes: Vec::new(),
+        }));
+    }
+
+    fn cancelled(&self) -> bool {
+        self.events.is_closed()
+    }
 }
 
 /// Compile SystemVerilog source text and return the elaborated IR as text,
 /// with any warnings, for inspection (`paragon --ir`).
 pub async fn lower_with(source: &str, opts: &Options) -> Result<(String, Vec<Diagnostic>), Error> {
-    on_big_stack(|| front_end(source, opts, Goal::Elaborate))
+    on_big_stack(|| {
+        let sm = SourceMap::new();
+        match front_end(&sm, source, opts, Goal::Elaborate)? {
+            (Output::Design(d), w) => Ok((d.to_string(), w)),
+            (Output::Text(t), w) => Ok((t, w)),
+        }
+    })
 }
 
 /// Preprocess SystemVerilog source text with default [`Options`].
@@ -333,7 +473,13 @@ pub async fn preprocess(source: &str) -> Result<Preprocessed, Error> {
 
 /// Preprocess SystemVerilog source text, as `-E` does.
 pub async fn preprocess_with(source: &str, opts: &Options) -> Result<Preprocessed, Error> {
-    let (text, warnings) = on_big_stack(|| front_end(source, opts, Goal::Preprocess))?;
+    let (text, warnings) = on_big_stack(|| {
+        let sm = SourceMap::new();
+        match front_end(&sm, source, opts, Goal::Preprocess)? {
+            (Output::Text(t), w) => Ok((t, w)),
+            (Output::Design(d), w) => Ok((d.to_string(), w)),
+        }
+    })?;
     Ok(Preprocessed { text, warnings })
 }
 
@@ -354,6 +500,13 @@ fn on_big_stack<T: Send>(f: impl FnOnce() -> T + Send) -> T {
     })
 }
 
+/// What [`front_end`] produces.
+enum Output<'a> {
+    /// Preprocessed text.
+    Text(String),
+    Design(paragon_of_uncanny_reason::ir::Design<'a>),
+}
+
 /// How far [`front_end`] goes.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Goal {
@@ -364,9 +517,13 @@ enum Goal {
 /// Preprocess the source text and any extra files, then (for
 /// [`Goal::Elaborate`]) lex, parse and elaborate them. Returns the `-E` text
 /// or the IR text, and the warnings; or every diagnostic if there was an error.
-fn front_end(source: &str, opts: &Options, goal: Goal) -> Result<(String, Vec<Diagnostic>), Error> {
+fn front_end<'a>(
+    sm: &'a SourceMap,
+    source: &str,
+    opts: &Options,
+    goal: Goal,
+) -> Result<(Output<'a>, Vec<Diagnostic>), Error> {
     let parse = goal == Goal::Elaborate;
-    let sm = SourceMap::new();
     let lang = match opts.language.as_deref() {
         None => Lang::Sv2023,
         Some(l) => Lang::parse(l).ok_or_else(|| {
@@ -392,7 +549,7 @@ fn front_end(source: &str, opts: &Options, goal: Goal) -> Result<(String, Vec<Di
         defines: opts.defines.clone(),
         ..pp::Options::default()
     };
-    let mut pp = Preprocessor::new(&sm, &fs, pp_opts);
+    let mut pp = Preprocessor::new(sm, &fs, pp_opts);
     let mut text = String::new();
     let mut diags = Vec::new();
     let mut seen = 0;
@@ -421,10 +578,10 @@ fn front_end(source: &str, opts: &Options, goal: Goal) -> Result<(String, Vec<Di
         let tokens = pp.take_output();
         let new = &pp.diagnostics()[seen..];
         seen = pp.diagnostics().len();
-        diags.extend(new.iter().map(|d| resolve(&sm, d)));
+        diags.extend(new.iter().map(|d| resolve(sm, d)));
         if !parse {
             text.push_str(&write(
-                &sm,
+                sm,
                 &tokens,
                 EmitOptions {
                     line_markers: opts.line_markers,
@@ -435,14 +592,14 @@ fn front_end(source: &str, opts: &Options, goal: Goal) -> Result<(String, Vec<Di
         if new.iter().any(|d| d.severity == pp::Severity::Error) {
             continue;
         }
-        let lexed = lex::lex(&sm, &tokens, lang);
+        let lexed = lex::lex(sm, &tokens, lang);
         let (tree, parse_diags) = parse::parse(&lexed);
         diags.extend(
             lexed
                 .diags
                 .iter()
                 .chain(&parse_diags)
-                .map(|d| resolve(&sm, d)),
+                .map(|d| resolve(sm, d)),
         );
         trees.push(tree);
     }
@@ -453,14 +610,14 @@ fn front_end(source: &str, opts: &Options, goal: Goal) -> Result<(String, Vec<Di
         let eopts = elab::ElabOptions {
             top: opts.top.clone(),
         };
-        let (design, elab_diags) = elab::elaborate(&sm, &trees, &eopts);
-        diags.extend(elab_diags.iter().map(|d| resolve(&sm, d)));
+        let (design, elab_diags) = elab::elaborate(sm, &trees, &eopts);
+        diags.extend(elab_diags.iter().map(|d| resolve(sm, d)));
         if diags.iter().any(|d| d.severity == Severity::Error) {
             return Err(Error::Diagnostics(diags));
         }
-        text = design.to_string();
+        return Ok((Output::Design(design), diags));
     }
-    Ok((text, diags))
+    Ok((Output::Text(text), diags))
 }
 
 /// Library files (`<dir>/<module><ext>`) for modules instantiated but not defined.

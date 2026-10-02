@@ -12,4 +12,5 @@ pub mod keywords;
 pub mod lex;
 pub mod parse;
 pub mod pp;
+pub mod sim;
 pub mod source;

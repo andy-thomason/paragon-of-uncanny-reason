@@ -78,6 +78,8 @@ pub struct Design<'a> {
     pub top: Option<ScopeId>,
     /// Time precision as a power of ten of seconds (-9 is 1 ns).
     pub precision: i8,
+    /// Input ports of the top modules, which a test bench may drive.
+    pub top_inputs: Vec<VarId>,
 }
 
 /// An instance, generate block, named block or package. Scopes exist for
@@ -540,5 +542,7 @@ pub enum FormatPiece<'a> {
         spec: char,
         width: Option<u32>,
         zero_pad: bool,
+        /// `%-5d`: left-justified.
+        left: bool,
     },
 }

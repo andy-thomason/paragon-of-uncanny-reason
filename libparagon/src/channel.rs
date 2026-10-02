@@ -4,9 +4,6 @@
 //! them with an async [`Receiver::recv`] or a blocking [`Receiver::recv_blocking`].
 //! Dropping the receiver closes the channel, which tells the sender to stop.
 
-// Used by the simulator once it exists; exercised by the tests until then.
-#![cfg_attr(not(test), allow(dead_code))]
-
 use std::collections::VecDeque;
 use std::future::poll_fn;
 use std::sync::{Arc, Condvar, Mutex};

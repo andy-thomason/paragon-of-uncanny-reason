@@ -32,6 +32,8 @@ enum Outcome {
     NotYet(String),
     /// Our front end reported an error on a test that should compile.
     FrontEndError(String),
+    /// Simulated, but did not print `*-* All Finished *-*` (or stopped badly).
+    SimFail(String),
     /// Compiled as far as the pipeline goes; stopped at this unimplemented stage.
     Reached(Stage),
     /// Out of scope by decision (see docs/design/00-analysis-plan.md).
@@ -50,6 +52,7 @@ impl Outcome {
             Outcome::WrongOutput(_) => "wrong-output",
             Outcome::NotYet(_) => "not-yet",
             Outcome::FrontEndError(_) => "front-end-error",
+            Outcome::SimFail(_) => "sim-fail",
             Outcome::Reached(Stage::Simulate) => "reached-simulate",
             Outcome::Reached(Stage::Elaborate) => "reached-elaborate",
             Outcome::Reached(_) => "reached-other",
@@ -63,6 +66,7 @@ impl Outcome {
             Outcome::WrongDiagnostic { ours, want } => format!("ours {ours} / want {want}"),
             Outcome::NotYet(s)
             | Outcome::FrontEndError(s)
+            | Outcome::SimFail(s)
             | Outcome::Waived(s)
             | Outcome::Setup(s)
             | Outcome::WrongOutput(s) => s.clone(),
@@ -126,21 +130,45 @@ fn main() -> ExitCode {
     let root = t_dir.parent().unwrap().to_path_buf();
     std::env::set_current_dir(&root).expect("cd to test_regress");
 
-    let mut results: Vec<(String, String, Outcome)> = Vec::new();
-    for test in manifest["tests"].as_array().unwrap() {
-        let name = test["name"].as_str().unwrap().to_string();
-        let tier = test["tier"].as_str().unwrap().to_string();
-        if args.tier.as_ref().is_some_and(|t| *t != tier)
-            || args
-                .filter
-                .as_ref()
-                .is_some_and(|f| !name.contains(f.as_str()))
-        {
-            continue;
+    let selected: Vec<&Value> = manifest["tests"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|test| {
+            let name = test["name"].as_str().unwrap();
+            let tier = test["tier"].as_str().unwrap();
+            !(args.tier.as_ref().is_some_and(|t| t != tier)
+                || args
+                    .filter
+                    .as_ref()
+                    .is_some_and(|f| !name.contains(f.as_str())))
+        })
+        .collect();
+    // Tests are independent: run them on all cores, keeping manifest order.
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let done = std::sync::Mutex::new(vec![None; selected.len()]);
+    let workers = std::thread::available_parallelism().map_or(4, |n| n.get());
+    std::thread::scope(|s| {
+        for _ in 0..workers {
+            s.spawn(|| {
+                loop {
+                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some(test) = selected.get(i) else { break };
+                    let outcome = run_test(test, &root);
+                    done.lock().unwrap()[i] = Some(outcome);
+                }
+            });
         }
-        let outcome = run_test(test, &root);
-        results.push((name, tier, outcome));
-    }
+    });
+    let results: Vec<(String, String, Outcome)> = selected
+        .iter()
+        .zip(done.into_inner().unwrap())
+        .map(|(test, o)| {
+            let name = test["name"].as_str().unwrap().to_string();
+            let tier = test["tier"].as_str().unwrap().to_string();
+            (name, tier, o.unwrap())
+        })
+        .collect();
 
     report(&results, args.list.as_deref());
     if let Some(path) = &args.json {
@@ -202,10 +230,26 @@ fn run_test(test: &Value, root: &Path) -> Outcome {
         Ok(sim) => {
             let r = block_on(sim.wait());
             let finished = r.stdout.contains("*-* All Finished *-*");
-            return if finished && !expect_fail {
+            let bad_end = matches!(
+                r.finish,
+                libparagon::Finish::Stop | libparagon::Finish::Fatal | libparagon::Finish::Aborted
+            );
+            let error = r
+                .diagnostics
+                .iter()
+                .find(|d| d.severity == libparagon::Severity::Error);
+            if expect_fail && (bad_end || error.is_some()) {
+                return Outcome::FailedAsExpected;
+            }
+            return if finished && !bad_end && error.is_none() && !expect_fail {
                 Outcome::Pass
+            } else if let Some(e) = error {
+                Outcome::SimFail(format!("{:?}: {}", r.finish, e.message))
+            } else if expect_fail {
+                Outcome::SimFail("expected a failure".into())
             } else {
-                Outcome::FrontEndError("simulation did not finish".into())
+                let last = r.stdout.lines().last().unwrap_or("").to_string();
+                Outcome::SimFail(format!("{:?} at {}: {last}", r.finish, r.time))
             };
         }
         Err(Error::NotImplemented { stage }) => return Outcome::Reached(stage),
@@ -355,6 +399,9 @@ fn options(test: &Value, top: &str, name: &str) -> Result<Options, String> {
             ("TEST_OBJ_DIR".into(), format!("obj_vlt/{name}")),
             ("TEST_DUMPFILE".into(), format!("obj_vlt/{name}/simx.vcd")),
         ],
+        // Enough for any test in the suite; stops runaway zero-delay loops.
+        max_steps: Some(20_000_000),
+        clocks: vec!["clk".into(), "fastclk".into()],
         ..Options::default()
     };
     let flags = flags(test);
@@ -434,6 +481,7 @@ fn report(results: &[(String, String, Outcome)], list: Option<&str>) {
 
     let mut not_yet: BTreeMap<String, usize> = BTreeMap::new();
     let mut errors: BTreeMap<String, usize> = BTreeMap::new();
+    let mut sim_fails: BTreeMap<String, usize> = BTreeMap::new();
     for (_, _, o) in results {
         match o {
             Outcome::NotYet(w) => *not_yet.entry(w.clone()).or_default() += 1,
@@ -441,12 +489,18 @@ fn report(results: &[(String, String, Outcome)], list: Option<&str>) {
                 let msg = e.split_once(": ").map_or(e.as_str(), |x| x.1);
                 *errors.entry(msg.to_string()).or_default() += 1;
             }
+            Outcome::SimFail(e) => {
+                // Group by the reason, not the time or text.
+                let msg = e.split(" at ").next().unwrap_or(e);
+                *sim_fails.entry(msg.to_string()).or_default() += 1;
+            }
             _ => {}
         }
     }
     for (title, map) in [
         ("Most common unsupported constructs", &not_yet),
         ("Most common front-end errors", &errors),
+        ("Most common simulation failures", &sim_fails),
     ] {
         let mut v: Vec<_> = map.iter().collect();
         v.sort_by(|a, b| b.1.cmp(a.1));
@@ -473,6 +527,7 @@ const ORDER: &[&str] = &[
     "reached-other",
     "wrong-output",
     "wrong-diagnostic",
+    "sim-fail",
     "front-end-error",
     "not-yet",
     "setup",

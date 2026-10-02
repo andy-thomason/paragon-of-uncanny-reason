@@ -10,13 +10,36 @@ fn no_disk() -> Options {
 }
 
 #[test]
-fn simulate_reports_the_first_missing_stage() {
-    let r = block_on(simulate(HELLO)).err();
+fn simulate_runs_hello_world() {
+    let r = block_on(async { simulate(HELLO).await.unwrap().wait().await });
+    assert_eq!(r.stdout, "hello\n");
+    assert_eq!(r.finish, Finish::Finish);
+}
+
+#[test]
+fn simulate_streams_events_with_times() {
+    let src = "module t;\n  initial begin #5 $display(\"a\"); #3 $write(\"b\"); end\nendmodule\n";
+    let mut sim = block_on(simulate_with(src, &no_disk())).unwrap();
+    let mut seen = Vec::new();
+    while let Some(e) = sim.next_event_blocking() {
+        seen.push(e);
+    }
     assert_eq!(
-        r,
-        Some(Error::NotImplemented {
-            stage: Stage::Simulate
-        })
+        seen,
+        vec![
+            Event::Display {
+                text: "a\n".into(),
+                time: 5
+            },
+            Event::Display {
+                text: "b".into(),
+                time: 8
+            },
+            Event::Finished {
+                finish: Finish::Quiescent,
+                time: 8
+            },
+        ]
     );
 }
 
@@ -56,12 +79,7 @@ fn language_option_changes_keywords() {
         language: Some("1364-2005".into()),
         ..no_disk()
     };
-    assert_eq!(
-        block_on(simulate_with(src, &opts)).err(),
-        Some(Error::NotImplemented {
-            stage: Stage::Simulate
-        })
-    );
+    assert!(block_on(simulate_with(src, &opts)).is_ok());
 }
 
 #[test]
