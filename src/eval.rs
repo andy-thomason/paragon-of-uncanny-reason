@@ -682,13 +682,7 @@ fn eval_body(
                         Type::Unpacked { elem, .. } => &types[elem.0 as usize],
                         _ => return Err(NotConst::Impure(inst.at.to_string())),
                     };
-                    let p = match part {
-                        Some(p) => match int(&p.lsb) {
-                            Some(l) => Some((l, p.width)),
-                            None => None,
-                        },
-                        None => None,
-                    };
+                    let p = part.and_then(|p| int(&p.lsb).map(|l| (l, p.width)));
                     if let Some(i) = int(index) {
                         store_elem(&mut slots[slot.0 as usize], i, p, v, elem);
                     }

@@ -2133,10 +2133,7 @@ impl<'a, 't> Elab<'a, 't> {
             let et = this.ir_type(ty);
             cx.b.emit(Op::ArrayElem { value: t, index: i }, et, at)
         };
-        let ret = match &sig.ret {
-            Some(r) => Some((elem(self, cx, r), sty_of(r))),
-            None => None,
-        };
+        let ret = sig.ret.as_ref().map(|r| (elem(self, cx, r), sty_of(r)));
         for i in outs {
             let (name, ty) = &sig.params[i];
             let v = elem(self, cx, ty);
