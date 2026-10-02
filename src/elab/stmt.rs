@@ -1,6 +1,6 @@
 //! Statements, timing controls, processes, functions, gates and `$display` formats.
 
-use super::expr::{Cx, STy, Want, sty_of};
+use super::expr::{Cx, STy, Want};
 use super::types::{Base, Ty, UDim};
 use super::{EResult, Elab, Fixup, Sym};
 use crate::ast::{self, Arg, Expr, Stmt};
@@ -150,7 +150,7 @@ impl<'a, 't> Elab<'a, 't> {
         let mut cx = Cx::new(false);
         let irt = self.ir_type(ty);
         let v = cx.b.emit(Op::Load(var), irt, e.at());
-        self.assign_val(&mut cx, e, v, sty_of(ty), false)?;
+        self.store_value(&mut cx, e, v, ty)?;
         self.push_comb(cx, ProcKind::ContAssign, e.at(), Vec::new());
         Ok(())
     }

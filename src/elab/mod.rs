@@ -52,7 +52,8 @@ pub fn elaborate<'a>(
     files: &[ast::SourceText<'a>],
     opts: &ElabOptions,
 ) -> (Design<'a>, Vec<Diag<'a>>) {
-    let mut e = Elab::new(sm);
+    let made = Arena::default();
+    let mut e = Elab::new(sm, &made);
     e.d.root_name = opts.root_name.clone();
     e.run(files, opts);
     (e.d, e.diags)
@@ -149,8 +150,32 @@ struct Fixup {
     resume: BlockId,
 }
 
+/// Syntax made during elaboration, such as the connections of each instance
+/// of an instance array, kept as long as the parsed files.
+pub(crate) struct Arena<T>(std::cell::RefCell<Vec<Box<T>>>);
+
+impl<T> Default for Arena<T> {
+    fn default() -> Self {
+        Arena(std::cell::RefCell::new(Vec::new()))
+    }
+}
+
+impl<T> Arena<T> {
+    pub(crate) fn alloc(&self, t: T) -> &T {
+        let b = Box::new(t);
+        let p: *const T = &*b;
+        self.0.borrow_mut().push(b);
+        // SAFETY: boxes are never removed or moved out of, and a box's
+        // contents stay put when the vector grows, so the value lives as
+        // long as the arena.
+        unsafe { &*p }
+    }
+}
+
 pub(crate) struct Elab<'a, 't> {
     pub(crate) sm: &'a SourceMap,
+    /// Where made syntax lives.
+    made: &'t Arena<Vec<ast::PortConn<'a>>>,
     pub(crate) d: Design<'a>,
     pub(crate) diags: Vec<Diag<'a>>,
     modules: HashMap<&'a str, (&'t ast::Module<'a>, (i8, i8))>,
@@ -179,9 +204,10 @@ pub(crate) struct Elab<'a, 't> {
 }
 
 impl<'a, 't> Elab<'a, 't> {
-    fn new(sm: &'a SourceMap) -> Self {
+    fn new(sm: &'a SourceMap, made: &'t Arena<Vec<ast::PortConn<'a>>>) -> Self {
         let mut e = Elab {
             sm,
+            made,
             d: Design::default(),
             diags: Vec::new(),
             modules: HashMap::new(),
@@ -1561,7 +1587,8 @@ impl<'a, 't> Elab<'a, 't> {
         }
         for i in &inst.insts {
             if !i.dims.is_empty() {
-                return Err(self.not_yet(i.name, "instance arrays"));
+                self.instance_array(m, i, &overrides)?;
+                continue;
             }
             let parent = self.cur;
             let name = if i.name.is_empty() {
@@ -1577,6 +1604,144 @@ impl<'a, 't> Elab<'a, 't> {
             r?;
         }
         Ok(())
+    }
+
+    /// `sub s[l:r] (...)`: one instance per index, named `s[i]`. A
+    /// connection N times as wide as its port, or an N-element array, is
+    /// shared out from the left; anything else goes to every instance.
+    fn instance_array(
+        &mut self,
+        m: &'t ast::Module<'a>,
+        i: &'t ast::Inst<'a>,
+        overrides: &[(Option<&'a str>, Override<'a>)],
+    ) -> EResult<()> {
+        let dims = self.unpacked_dims(&i.dims)?;
+        let [types::UDim::Fixed(l, r)] = dims[..] else {
+            return Err(self.not_yet(i.name, "multi-dimensional instance arrays"));
+        };
+        let n = types::range_len((l, r)) as i64;
+        let parent = self.cur;
+        for k in 0..n {
+            let idx = if l <= r { l + k } else { l - k };
+            let name = self
+                .sm
+                .add(format!("{}[{idx}]", i.name), crate::source::Origin::CommandLine)
+                .1;
+            let child = self.instantiate_begin(m, name, Some(parent), overrides, i.name)?;
+            let conns = self.array_conns(child, &i.conns, k, n)?;
+            self.connect(child, conns, name)?;
+            self.depth += 1;
+            let r = self.expand_scope(child);
+            self.depth -= 1;
+            r?;
+        }
+        Ok(())
+    }
+
+    /// The connections of instance `k` (from the left) of `n`.
+    fn array_conns(
+        &mut self,
+        child: ScopeId,
+        conns: &'t [ast::PortConn<'a>],
+        k: i64,
+        n: i64,
+    ) -> EResult<&'t [ast::PortConn<'a>]> {
+        let ports = self.scopes[child.0 as usize].ports.clone();
+        let num = |this: &mut Self, v: i64| {
+            ast::Expr::Number(this.sm.add(v.to_string(), crate::source::Origin::CommandLine).1)
+        };
+        let mut out = Vec::new();
+        for (pos, c) in conns.iter().enumerate() {
+            let (port, e) = match c {
+                ast::PortConn::Ordered(Some(e)) => (ports.get(pos), e),
+                ast::PortConn::Named(name, Some(Some(e))) => {
+                    (ports.iter().find(|p| p.name == *name), e)
+                }
+                _ => {
+                    out.push(c.clone());
+                    continue;
+                }
+            };
+            let Some(port) = port else {
+                out.push(c.clone());
+                continue;
+            };
+            let pw = port.ty.width() as i64;
+            let cx = expr::Cx::new(false);
+            let part = if let Some(at) = self.array_type(&cx, e)
+                && port.ty.unpacked.is_empty()
+                && expr::fixed_count(&at) == Some(n as u32)
+            {
+                // An array of connections: element k from the left.
+                let types::UDim::Fixed(al, ar) = at.unpacked[0] else {
+                    unreachable!()
+                };
+                let index = if al <= ar { al + k } else { al - k };
+                Some(ast::Expr::Index {
+                    base: Box::new(e.clone()),
+                    index: Box::new(num(self, index)),
+                })
+            } else {
+                let nd = self.diags.len();
+                let w = self.self_type(e).map(|t| t.ty().width() as i64);
+                self.diags.truncate(nd);
+                match w {
+                    Ok(w) if port.ty.unpacked.is_empty() && w == n * pw && n > 1 => {
+                        // Bits [off +: pw], the leftmost instance taking the top bits.
+                        let off = (n - 1 - k) * pw;
+                        let range = match self.array_type(&cx, e) {
+                            None => self.path_range(e),
+                            Some(_) => None,
+                        };
+                        Some(match range {
+                            Some((hi, lo)) if hi >= lo => ast::Expr::Slice {
+                                base: Box::new(e.clone()),
+                                op: "+:",
+                                left: Box::new(num(self, lo + off)),
+                                right: Box::new(num(self, pw)),
+                            },
+                            Some((_, hi)) => ast::Expr::Slice {
+                                base: Box::new(e.clone()),
+                                op: "-:",
+                                left: Box::new(num(self, hi - off)),
+                                right: Box::new(num(self, pw)),
+                            },
+                            // Not a plain vector: shift (an input only).
+                            None if port.dir == Dir::Input => ast::Expr::Binary {
+                                op: ">>",
+                                lhs: Box::new(e.clone()),
+                                rhs: Box::new(num(self, off)),
+                            },
+                            None => {
+                                return Err(self.not_yet(
+                                    e.at(),
+                                    "this output connection to an instance array",
+                                ));
+                            }
+                        })
+                    }
+                    _ => None,
+                }
+            };
+            out.push(match (c, part) {
+                (_, None) => c.clone(),
+                (ast::PortConn::Ordered(_), Some(p)) => ast::PortConn::Ordered(Some(p)),
+                (ast::PortConn::Named(name, _), Some(p)) => ast::PortConn::Named(name, Some(Some(p))),
+                (_, Some(_)) => c.clone(),
+            });
+        }
+        Ok(self.made.alloc(out))
+    }
+
+    /// The packed range `(left, right)` of a plain vector variable.
+    fn path_range(&mut self, e: &ast::Expr<'a>) -> Option<(i64, i64)> {
+        let ast::Expr::Ident(n) = e else { return None };
+        match self.lookup(n) {
+            Some(Sym::Var(_, t)) if t.unpacked.is_empty() => {
+                Some(t.packed.first().copied().unwrap_or((t.width() as i64 - 1, 0)))
+            }
+            _ => None,
+        }
     }
 
     fn override_value(&mut self, e: &'t ast::Expr<'a>) -> EResult<Override<'a>> {
