@@ -296,7 +296,7 @@ impl<'a, 't> Elab<'a, 't> {
                 Err(m) => return Err(self.error(n, m)),
             },
             Expr::Str(s) => STy::Bits {
-                w: (super::decode_string(&s[1..s.len() - 1]).len() as u32 * 8).max(8),
+                w: (super::decode_string_bytes(&s[1..s.len() - 1]).len() as u32 * 8).max(8),
                 s: false,
                 f: false,
             },
@@ -1231,10 +1231,10 @@ impl<'a, 't> Elab<'a, 't> {
                 Err(m) => Err(self.error(n, m)),
             },
             Expr::Str(s) => {
-                let text = super::decode_string(&s[1..s.len() - 1]);
+                let text = super::decode_string_bytes(&s[1..s.len() - 1]);
                 let w = (text.len() as u32 * 8).max(8);
                 let mut b = Bits::zero(w);
-                for (i, byte) in text.bytes().rev().enumerate() {
+                for (i, byte) in text.iter().copied().rev().enumerate() {
                     b.insert(i as i64 * 8, &Bits::from_u64(8, byte as u64));
                 }
                 let c = cx.b.emit(Op::Const(b), self.bt(w, false, false), at);
@@ -1840,14 +1840,9 @@ impl<'a, 't> Elab<'a, 't> {
                     return Err(self.error(name, "$clog2 needs an argument"));
                 };
                 let n = self.diags.len();
-                match self.const_int(a) {
-                    Ok(n) => {
-                        let mut r = 0i64;
-                        while (1i128 << r) < n as i128 {
-                            r += 1;
-                        }
-                        Ok((konst(cx, r), st))
-                    }
+                match self.const_value(a, None) {
+                    Ok(Value::Bits(b)) => Ok((konst(cx, b.clog2() as i64), st)),
+                    Ok(_) => Err(self.error(a.at(), "$clog2 needs an integral argument")),
                     Err(_) => {
                         self.diags.truncate(n);
                         let (v, _) = self.lower_self(cx, a)?;

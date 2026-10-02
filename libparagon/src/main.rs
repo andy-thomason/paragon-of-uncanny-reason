@@ -1,7 +1,8 @@
 //! `paragon`: command-line front end.
 //!
 //! ```text
-//! paragon [-E [-P] | --ir] [-DNAME[=VALUE]] [+incdir+DIR] [-IDIR] [--top-module NAME] FILE
+//! paragon [-E [-P] | --ir] [-DNAME[=VALUE]] [-GNAME=VALUE] [+incdir+DIR] [-IDIR]
+//!         [--top-module NAME] [--clock NAME] [--root NAME] FILE
 //! ```
 
 use libparagon::{
@@ -19,6 +20,11 @@ fn main() -> ExitCode {
             ir = true;
         } else if arg == "--top-module" || arg == "--top" {
             opts.top = args.next();
+        } else if arg == "--clock" {
+            // Drive a top-level input as a clock, as Verilator's test bench does.
+            opts.clocks.extend(args.next());
+        } else if arg == "--root" {
+            opts.root_name = args.next();
         } else if arg == "-E" {
             preprocess_only = true;
         } else if arg == "-P" {
@@ -43,7 +49,7 @@ fn main() -> ExitCode {
     }
     let Some(file) = file else {
         eprintln!(
-            "usage: paragon [-E [-P] | --ir] [-DNAME[=VALUE]] [+incdir+DIR] [-IDIR] [--top-module NAME] FILE"
+            "usage: paragon [-E [-P] | --ir] [-DNAME[=VALUE]] [-GNAME=VALUE] [+incdir+DIR] [-IDIR] [--top-module NAME] [--clock NAME] [--root NAME] FILE"
         );
         return ExitCode::FAILURE;
     };

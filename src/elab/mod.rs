@@ -1695,10 +1695,10 @@ enum Early<'a, 't> {
 /// A `-G` value: a number (`10`, `8'hff`, `1.5`) or a quoted string.
 fn cmdline_override<'a>(value: &str) -> Result<Override<'a>, String> {
     if value.len() >= 2 && value.starts_with('"') && value.ends_with('"') {
-        let text = decode_string(&value[1..value.len() - 1]);
+        let text = decode_string_bytes(&value[1..value.len() - 1]);
         let w = (text.len() as u32 * 8).max(8);
         let mut b = Bits::zero(w);
-        for (i, byte) in text.bytes().rev().enumerate() {
+        for (i, byte) in text.iter().copied().rev().enumerate() {
             b.insert(i as i64 * 8, &Bits::from_u64(8, byte as u64));
         }
         let mut ty = Ty::scalar(Base::Bit { four: true });
@@ -1847,22 +1847,27 @@ fn apply_timeunit(t: &mut (i8, i8), kw: &str, values: &[&str]) {
 }
 
 /// Decode the escapes in a string literal's contents.
-pub(crate) fn decode_string(s: &str) -> String {
-    let mut out = String::new();
+/// The bytes of a string literal's body, with escapes decoded.
+pub(crate) fn decode_string_bytes(s: &str) -> Vec<u8> {
+    let mut out: Vec<u8> = Vec::new();
+    let push = |out: &mut Vec<u8>, c: char| {
+        let mut buf = [0; 4];
+        out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+    };
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
         if c != '\\' {
-            out.push(c);
+            push(&mut out, c);
             continue;
         }
         match chars.next() {
-            Some('n') => out.push('\n'),
-            Some('t') => out.push('\t'),
-            Some('v') => out.push('\x0b'),
-            Some('f') => out.push('\x0c'),
-            Some('a') => out.push('\x07'),
-            Some('\\') => out.push('\\'),
-            Some('"') => out.push('"'),
+            Some('n') => out.push(b'\n'),
+            Some('t') => out.push(b'\t'),
+            Some('v') => out.push(b'\x0b'),
+            Some('f') => out.push(b'\x0c'),
+            Some('a') => out.push(b'\x07'),
+            Some('\\') => out.push(b'\\'),
+            Some('"') => out.push(b'"'),
             Some('\n') => {}
             Some('x') => {
                 let mut v = 0u32;
@@ -1875,7 +1880,7 @@ pub(crate) fn decode_string(s: &str) -> String {
                         None => break,
                     }
                 }
-                out.push(char::from_u32(v).unwrap_or('?'));
+                out.push(v as u8);
             }
             Some(d @ '0'..='7') => {
                 let mut v = d.to_digit(8).unwrap();
@@ -1888,11 +1893,16 @@ pub(crate) fn decode_string(s: &str) -> String {
                         None => break,
                     }
                 }
-                out.push(char::from_u32(v).unwrap_or('?'));
+                out.push(v as u8);
             }
-            Some(other) => out.push(other),
-            None => out.push('\\'),
+            Some(other) => push(&mut out, other),
+            None => out.push(b'\\'),
         }
     }
     out
+}
+
+/// A string literal's body as text, for messages and format strings.
+pub(crate) fn decode_string(s: &str) -> String {
+    String::from_utf8_lossy(&decode_string_bytes(s)).into_owned()
 }

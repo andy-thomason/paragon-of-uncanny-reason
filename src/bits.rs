@@ -68,6 +68,18 @@ impl Bits {
         m.resize(width, false)
     }
 
+    /// `$clog2`: the bits needed to count to this value (unsigned); X is 0.
+    pub fn clog2(&self) -> u32 {
+        if self.has_unknown() || self.is_zero() {
+            return 0;
+        }
+        let m = self.sub(&Bits::from_u64(self.width, 1));
+        (0..m.width)
+            .rev()
+            .find(|&i| m.bit(i).0)
+            .map_or(0, |i| i + 1)
+    }
+
     pub fn from_bool(v: bool) -> Bits {
         Bits::from_u64(1, v as u64)
     }

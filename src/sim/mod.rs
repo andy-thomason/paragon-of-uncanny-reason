@@ -632,12 +632,7 @@ impl<'d, 'a> Simulator<'d, 'a> {
                     }
                     SysFunc::Clog2 => {
                         let v = self.val(t, args[0]);
-                        let n = v.bits().map_or(0, |b| b.to_u64());
-                        let mut r = 0u64;
-                        while (1u128 << r) < n as u128 {
-                            r += 1;
-                        }
-                        Value::Bits(Bits::from_u64(w, r))
+                        Value::Bits(Bits::from_u64(w, v.bits().map_or(0, |b| b.clog2()) as u64))
                     }
                     SysFunc::Countones => {
                         let v = self.val(t, args[0]);
