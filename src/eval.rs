@@ -17,6 +17,25 @@ pub enum Value {
     /// An unpacked array, by linear element: element 0 is the one at the
     /// right-hand index (the last one in an assignment pattern).
     Array(Vec<Value>),
+    /// A class handle; `None` is `null`.
+    Obj(Option<ObjRef>),
+}
+
+/// A shared object (LRM 8): handles are references to it.
+#[derive(Clone, Debug)]
+pub struct ObjRef(pub std::rc::Rc<std::cell::RefCell<Object>>);
+
+impl PartialEq for ObjRef {
+    /// Handles are equal when they refer to the same object.
+    fn eq(&self, other: &Self) -> bool {
+        std::rc::Rc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Object {
+    pub class: ClassId,
+    pub fields: Vec<Value>,
 }
 
 impl Value {
@@ -88,6 +107,14 @@ pub fn eval_pure<'v, 't: 'v>(
         Op::Binary(b, x, y) => {
             if let (Value::Real(p), Value::Real(q)) = (arg(*x).0, arg(*y).0) {
                 return real_binary(*b, *p, *q, &fix);
+            }
+            if let (Value::Obj(p), Value::Obj(q)) = (arg(*x).0, arg(*y).0) {
+                let r = match b {
+                    BinOp::Eq | BinOp::CaseEq => p == q,
+                    BinOp::Ne | BinOp::CaseNe => p != q,
+                    _ => return None,
+                };
+                return Some(fix(Bits::from_bool(r)));
             }
             if let (Value::Array(p), Value::Array(q)) = (arg(*x).0, arg(*y).0) {
                 let case = matches!(b, BinOp::CaseEq | BinOp::CaseNe);
@@ -169,6 +196,7 @@ pub fn eval_pure<'v, 't: 'v>(
             }
             Value::Array(v)
         }
+        Op::Null => Value::Obj(None),
         Op::Tuple(parts) => Value::Array(parts.iter().map(|p| arg(*p).0.clone()).collect()),
         Op::ArrayElem { value, index } => {
             let i = bits(*index).and_then(|b| b.to_i64(signed(*index)));
@@ -225,7 +253,7 @@ pub fn eval_pure<'v, 't: 'v>(
                 Value::Real(r) if *extend == Extend::Truncate => fix(Bits::from_f64(w, r.trunc())),
                 Value::Real(r) => fix(Bits::from_f64(w, r.round())),
                 Value::Bits(b) => fix(b.resize(w, *extend == Extend::Sign)),
-                Value::Str(_) | Value::Array(_) => return None,
+                Value::Str(_) | Value::Array(_) | Value::Obj(_) => return None,
             }
         }
         Op::Mux { cond, then, els } => match arg(*cond).0.bits()?.truth() {
@@ -529,6 +557,7 @@ pub fn default_like(v: &Value) -> Value {
         Value::Real(_) => Value::Real(0.0),
         Value::Str(_) => Value::Str(String::new()),
         Value::Array(a) => Value::Array(a.iter().map(default_like).collect()),
+        Value::Obj(_) => Value::Obj(None),
     }
 }
 
@@ -571,7 +600,7 @@ pub fn to_string(v: &Value) -> String {
         Value::Str(s) => s.clone(),
         Value::Bits(b) => bits_to_string(b),
         Value::Real(r) => r.to_string(),
-        Value::Array(_) => String::new(),
+        Value::Array(_) | Value::Obj(_) => String::new(),
     }
 }
 
@@ -694,6 +723,7 @@ pub fn eval_const(body: &Body<'_>, design: &Design<'_>) -> Result<Value, NotCons
 pub fn default_for(types: &[Type<'_>], ty: &Type<'_>) -> Value {
     match ty {
         Type::Dynamic { .. } | Type::Queue { .. } => Value::Array(Vec::new()),
+        Type::Class(_) | Type::Null => Value::Obj(None),
         Type::Unpacked { elem, left, right } => {
             let n = (right - left).unsigned_abs() as usize + 1;
             Value::Array(vec![default_for(types, &types[elem.0 as usize]); n])

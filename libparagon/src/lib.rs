@@ -557,7 +557,7 @@ fn on_big_stack<T: Send>(f: impl FnOnce() -> T + Send) -> T {
 enum Output<'a> {
     /// Preprocessed text.
     Text(String),
-    Design(paragon_of_uncanny_reason::ir::Design<'a>),
+    Design(Box<paragon_of_uncanny_reason::ir::Design<'a>>),
 }
 
 /// How far [`front_end`] goes.
@@ -682,7 +682,7 @@ fn front_end<'a>(
         if diags.iter().any(|d| d.severity == Severity::Error) {
             return Err(Error::Diagnostics(diags));
         }
-        return Ok((Output::Design(design), diags));
+        return Ok((Output::Design(Box::new(design)), diags));
     }
     Ok((Output::Text(text), diags))
 }

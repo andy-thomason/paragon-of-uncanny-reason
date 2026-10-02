@@ -48,6 +48,8 @@ impl Design<'_> {
             Type::Queue { elem, .. } => format!("{} [$]", self.type_name(*elem)),
             Type::Assoc { elem, .. } => format!("{} [*]", self.type_name(*elem)),
             Type::Struct { .. } => "struct".into(),
+            Type::Class(c) => format!("class {}", self.classes[c.0 as usize].name),
+            Type::Null => "null".into(),
             Type::Tuple(ts) => format!(
                 "({})",
                 ts.iter().map(|t| self.type_name(*t)).collect::<Vec<_>>().join(", ")
@@ -185,6 +187,33 @@ impl BodyFmt<'_, '_> {
             }
             Op::LoadRange { var, start, len } => {
                 format!("load {}[%{} +: {len}]", self.var(*var), start.0)
+            }
+            Op::New(c) => format!("new {}", d.classes[c.0 as usize].name),
+            Op::CopyObj(v) => format!("new %{}", v.0),
+            Op::Null => "null".into(),
+            Op::LoadField { obj, field } => format!("load %{}.f{field}", obj.0),
+            Op::StoreField {
+                obj,
+                field,
+                part,
+                value,
+            } => format!("store %{}.f{field}{} = %{}", obj.0, Self::part(part), value.0),
+            Op::StoreFieldElem {
+                obj,
+                field,
+                index,
+                part,
+                value,
+            } => format!(
+                "store %{}.f{field}[%{}]{} = %{}",
+                obj.0,
+                index.0,
+                Self::part(part),
+                value.0
+            ),
+            Op::VCall { slot, args } => format!("vcall #{slot}({})", Self::vals(args)),
+            Op::IsA { value, class } => {
+                format!("isa %{} {}", value.0, d.classes[class.0 as usize].name)
             }
             Op::BlockEnter { tag, exit } => format!("enter {tag:?} exit bb{}", exit.0),
             Op::BlockLeave(tag) => format!("leave {tag:?}"),

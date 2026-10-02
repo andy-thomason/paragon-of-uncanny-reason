@@ -14,6 +14,7 @@
 //! lowered into a small body and run by [`crate::eval::eval_const`].
 
 mod build;
+mod class;
 mod expr;
 mod stmt;
 #[cfg(test)]
@@ -53,7 +54,8 @@ pub fn elaborate<'a>(
     opts: &ElabOptions,
 ) -> (Design<'a>, Vec<Diag<'a>>) {
     let made = Arena::default();
-    let mut e = Elab::new(sm, &made);
+    let made_subs = Arena::default();
+    let mut e = Elab::new(sm, &made, &made_subs);
     e.d.root_name = opts.root_name.clone();
     e.run(files, opts);
     (e.d, e.diags)
@@ -92,6 +94,12 @@ pub(crate) enum Sym<'a> {
     Scope(ScopeId),
     /// A declared genvar outside its loop.
     Genvar,
+    /// A class declaration (an index into `Elab::class_defs`); it becomes a
+    /// type once specialised.
+    ClassDef(usize),
+    /// A property of the class whose method is being lowered: its index in
+    /// the object, and its type.
+    Field(u32, Ty<'a>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -142,6 +150,9 @@ struct ScopeInfo<'a, 't> {
     funcs: Vec<(FuncId, &'t ast::Subroutine<'a>)>,
     /// Net and variable initialisers that need code, waiting for pass 2.
     inits: Vec<(VarId, Ty<'a>, &'t ast::Expr<'a>, bool)>,
+    /// For a class scope: the base class's scope, searched before the
+    /// enclosing one (inherited members).
+    base_scope: Option<ScopeId>,
 }
 
 /// An implicit sensitivity list to complete once all functions are lowered.
@@ -179,6 +190,14 @@ pub(crate) struct Elab<'a, 't> {
     pub(crate) sm: &'a SourceMap,
     /// Where made syntax lives.
     made: &'t Arena<Vec<ast::PortConn<'a>>>,
+    made_subs: &'t Arena<ast::Subroutine<'a>>,
+    /// Class declarations, and the classes made from them.
+    pub(crate) class_defs: Vec<class::ClassDef<'a, 't>>,
+    pub(crate) classes: Vec<class::ClassInfo<'a, 't>>,
+    /// Methods: their class, and whether static.
+    pub(crate) func_class: HashMap<FuncId, (ClassId, bool)>,
+    /// Out-of-class method bodies (`function C::f`), by class and name.
+    pub(crate) out_of_class: HashMap<(&'a str, &'a str), &'t ast::Subroutine<'a>>,
     /// Interface instances made early, because a declaration used a type
     /// from them; phase A skips them.
     early_insts: HashSet<usize>,
@@ -210,10 +229,19 @@ pub(crate) struct Elab<'a, 't> {
 }
 
 impl<'a, 't> Elab<'a, 't> {
-    fn new(sm: &'a SourceMap, made: &'t Arena<Vec<ast::PortConn<'a>>>) -> Self {
+    fn new(
+        sm: &'a SourceMap,
+        made: &'t Arena<Vec<ast::PortConn<'a>>>,
+        made_subs: &'t Arena<ast::Subroutine<'a>>,
+    ) -> Self {
         let mut e = Elab {
             sm,
             made,
+            made_subs,
+            class_defs: Vec::new(),
+            classes: Vec::new(),
+            func_class: HashMap::new(),
+            out_of_class: HashMap::new(),
             early_insts: HashSet::new(),
             d: Design::default(),
             diags: Vec::new(),
@@ -293,6 +321,7 @@ impl<'a, 't> Elab<'a, 't> {
             items,
             funcs: Vec::new(),
             inits: Vec::new(),
+            base_scope: None,
         });
         ScopeId(self.d.scopes.len() as u32 - 1)
     }
@@ -321,14 +350,27 @@ impl<'a, 't> Elab<'a, 't> {
             .find_map(|p| self.scopes[p.0 as usize].syms.get(name).cloned())
     }
 
-    /// Look a name up lexically from the current scope out to `$unit`.
+    /// Look a name up lexically from the current scope out to `$unit`. In a
+    /// class, its base classes come before the enclosing scope.
     pub(crate) fn lookup(&self, name: &str) -> Option<Sym<'a>> {
         let mut s = Some(self.cur);
         while let Some(id) = s {
-            if let Some(sym) = self.lookup_in(id, name) {
+            if let Some(sym) = self.lookup_with_bases(id, name) {
                 return Some(sym);
             }
             s = self.scopes[id.0 as usize].lex_parent;
+        }
+        None
+    }
+
+    /// A name in a scope or, for a class scope, its base classes.
+    pub(crate) fn lookup_with_bases(&self, id: ScopeId, name: &str) -> Option<Sym<'a>> {
+        let mut s = Some(id);
+        while let Some(x) = s {
+            if let Some(sym) = self.lookup_in(x, name) {
+                return Some(sym);
+            }
+            s = self.scopes[x.0 as usize].base_scope;
         }
         None
     }
@@ -374,6 +416,8 @@ impl<'a, 't> Elab<'a, 't> {
         };
         Ok(match sym {
             Some(Sym::Type(t)) => Some(t),
+            // A class without parameter values: its default specialisation.
+            Some(Sym::ClassDef(d)) => Some(class::ClassInfo::ty(self.specialise(d, None, name)?)),
             _ => None,
         })
     }
@@ -540,6 +584,20 @@ impl<'a, 't> Elab<'a, 't> {
         while i < self.scopes.len() {
             let _ = self.build_scope(ScopeId(i as u32));
             i += 1;
+        }
+        // Methods of classes completed after their scope was built.
+        loop {
+            let pending: Vec<usize> = (0..self.scopes.len())
+                .filter(|&s| !self.scopes[s].funcs.is_empty())
+                .collect();
+            if pending.is_empty() {
+                break;
+            }
+            for s in pending {
+                let saved = std::mem::replace(&mut self.cur, ScopeId(s as u32));
+                let _ = self.build_funcs(ScopeId(s as u32));
+                self.cur = saved;
+            }
         }
         self.apply_fixups();
         let mut procs = std::mem::take(&mut self.init_procs);
@@ -1125,6 +1183,13 @@ impl<'a, 't> Elab<'a, 't> {
     fn predeclare_funcs(&mut self, items: impl Iterator<Item = &'t ast::ModuleItem<'a>>) {
         let cur = self.cur;
         for item in items {
+            if let ast::ModuleItem::Function(f) | ast::ModuleItem::Task(f) = item
+                && let Some(c) = f.class
+            {
+                // `function C::f`: the body of a method declared `extern` in C.
+                self.out_of_class.insert((c, f.name), f);
+                continue;
+            }
             if let ast::ModuleItem::Function(f) | ast::ModuleItem::Task(f) = item {
                 let id = FuncId(self.d.funcs.len() as u32);
                 self.d.funcs.push(Func {
@@ -1167,7 +1232,7 @@ impl<'a, 't> Elab<'a, 't> {
         use ast::ModuleItem as I;
         let cur = self.cur;
         match item {
-            I::Class(c) => return Err(self.not_yet(c.kw, "classes")),
+            I::Class(c) => self.declare_class(c),
             I::Param(p) => {
                 for a in &p.assigns {
                     self.declare_param(p, a, None)?;
@@ -1219,6 +1284,8 @@ impl<'a, 't> Elab<'a, 't> {
                     }
                 }
             }
+            // `function C::f`: part of class C.
+            I::Function(f) | I::Task(f) if f.class.is_some() => {}
             I::Function(f) | I::Task(f) => {
                 self.last_at = f.name;
                 if let Some(Sym::Func(id)) = self.lookup_in(cur, f.name) {
@@ -1341,7 +1408,8 @@ impl<'a, 't> Elab<'a, 't> {
                     Some(ty)
                 }
             }
-            None if f.kw == "function" => Some(Ty::scalar(Base::Bit { four: true })),
+            // A constructor has no value.
+            None if f.kw == "function" && f.name != "new" => Some(Ty::scalar(Base::Bit { four: true })),
             _ => None,
         };
         let mut params = Vec::new();
@@ -1859,7 +1927,7 @@ impl<'a, 't> Elab<'a, 't> {
         }
     }
 
-    fn override_value(&mut self, e: &'t ast::Expr<'a>) -> EResult<Override<'a>> {
+    pub(crate) fn override_value(&mut self, e: &ast::Expr<'a>) -> EResult<Override<'a>> {
         if let ast::Expr::Type(t) = e {
             return Ok(Override::Type(self.resolve_type(t)?));
         }

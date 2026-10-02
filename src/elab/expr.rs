@@ -58,6 +58,8 @@ pub(crate) enum STy {
     Bits { w: u32, s: bool, f: bool },
     Real,
     Str,
+    /// A class handle; `None` for `null`.
+    Class(Option<ClassId>),
 }
 
 impl STy {
@@ -66,6 +68,8 @@ impl STy {
             STy::Bits { w, s, f } => Ty::bits(w, s, f),
             STy::Real => Ty::scalar(Base::Real),
             STy::Str => Ty::scalar(Base::Str),
+            STy::Class(Some(c)) => Ty::scalar(Base::Class(c)),
+            STy::Class(None) => Ty::scalar(Base::Void),
         }
     }
 
@@ -80,7 +84,7 @@ impl STy {
         match self {
             STy::Bits { s, .. } => *s,
             STy::Real => true,
-            STy::Str => false,
+            STy::Str | STy::Class(_) => false,
         }
     }
 
@@ -98,6 +102,7 @@ pub(crate) fn sty_of(t: &Ty) -> STy {
         },
         Base::Real => STy::Real,
         Base::Str => STy::Str,
+        Base::Class(c) => STy::Class(Some(*c)),
         _ => STy::Bits {
             w: t.width().max(1),
             s: t.signed,
@@ -120,6 +125,8 @@ pub(crate) enum Root {
     Var(VarId),
     Slot(SlotId),
     Const(Value),
+    /// Property `index` (of type `ty`) of the object `obj` refers to.
+    Field { obj: Val, index: u32, ty: TypeId },
 }
 
 /// A (possibly selected) reference to storage: `x`, `mem[i]`, `v[7:4]`, `s.f`.
@@ -330,7 +337,7 @@ impl<'a, 't> Elab<'a, 't> {
                 None => Err(self.error(e.at(), "Expecting a known integer constant")),
             },
             Value::Real(r) => Ok(r.round() as i64),
-            Value::Str(_) | Value::Array(_) => {
+            Value::Str(_) | Value::Array(_) | Value::Obj(_) => {
                 Err(self.error(e.at(), "Expecting an integer constant"))
             }
         }
@@ -481,6 +488,15 @@ impl<'a, 't> Elab<'a, 't> {
                 }
             }
             Expr::MinTypMax(v) => self.self_type_cx(cx, &v[1])?,
+            Expr::Call { func, .. } if self.method_of(cx, func).is_some() => {
+                let f = self.method_of(cx, func).unwrap()?;
+                match self.sig(f)?.ret {
+                    Some(t) => sty_of(&t),
+                    None => {
+                        return Err(self.error(func.at(), "Void function used in an expression"));
+                    }
+                }
+            }
             Expr::Call { func, .. } => {
                 let f = self.resolve_func(cx, func)?;
                 match self.sig(f)?.ret {
@@ -522,6 +538,8 @@ impl<'a, 't> Elab<'a, 't> {
                     }
                 }
             }
+            Expr::Keyword("null") => STy::Class(None),
+            Expr::New { .. } => STy::Class(None),
             Expr::Keyword("$") if cx.is_some_and(|c| c.dollar.is_some()) => STy::Bits {
                 w: 32,
                 s: true,
@@ -562,6 +580,11 @@ impl<'a, 't> Elab<'a, 't> {
                 f: false,
             },
             "$sformatf" | "$psprintf" => STy::Str,
+            "$cast" => STy::Bits {
+                w: 1,
+                s: false,
+                f: false,
+            },
             "$realtobits" => STy::Bits {
                 w: 64,
                 s: false,
@@ -616,8 +639,14 @@ impl<'a, 't> Elab<'a, 't> {
     /// not a name or select. The flag is true when the value is a part select.
     fn path_type(&mut self, cx: Option<&Cx<'a>>, e: &Expr<'a>) -> EResult<Option<(Ty<'a>, bool)>> {
         Ok(match e {
+            Expr::Keyword("this") => match cx.and_then(|c| self.this_class(c)) {
+                Some(c) => Some((Self::class_ty(c), false)),
+                None => return Err(self.error(e.at(), "'this' used outside a non-static method")),
+            },
             Expr::Ident(n) => match self.lookup_cx(cx, n) {
-                Some(Sym::Var(_, t) | Sym::Slot(_, t) | Sym::Param(_, t)) => Some((t, false)),
+                Some(Sym::Var(_, t) | Sym::Slot(_, t) | Sym::Param(_, t) | Sym::Field(_, t)) => {
+                    Some((t, false))
+                }
                 Some(Sym::Scope(_)) => {
                     return Err(
                         self.error(n, format!("'{n}' is an instance or block, not a value"))
@@ -631,6 +660,13 @@ impl<'a, 't> Elab<'a, 't> {
                     return Err(self.error(n, format!("Can't find definition of variable: '{n}'")));
                 }
             },
+            Expr::Scoped { scope, name } if self.scope_class(scope).is_some() => {
+                let c = self.scope_class(scope).unwrap()?;
+                match self.class_member(c, name)? {
+                    Some(Sym::Var(_, t) | Sym::Param(_, t) | Sym::Field(_, t)) => Some((t, false)),
+                    _ => return Err(self.error(name, format!("Can't find definition of '{name}' in class"))),
+                }
+            }
             Expr::Scoped { scope, name } => match &**scope {
                 Expr::Ident(p) | Expr::Keyword(p) => match self.scoped_sym(p, name) {
                     Some(Sym::Var(_, t) | Sym::Param(_, t)) => Some((t, false)),
@@ -642,6 +678,13 @@ impl<'a, 't> Elab<'a, 't> {
                 },
                 _ => return Err(self.not_yet(e.at(), "nested scopes")),
             },
+            Expr::Member { base, name } if self.handle_class(cx, base).is_some() => {
+                let c = self.handle_class(cx, base).unwrap();
+                match self.class_member(c, name)? {
+                    Some(Sym::Var(_, t) | Sym::Param(_, t) | Sym::Field(_, t)) => Some((t, false)),
+                    _ => return Ok(None),
+                }
+            }
             Expr::Member { base, name } => {
                 if let Some(s) = self.hier_scope(cx, base) {
                     return match self.lookup_child(s, name) {
@@ -711,6 +754,84 @@ impl<'a, 't> Elab<'a, 't> {
             }
             _ => None,
         })
+    }
+
+    /// The class named by the scope of `C::x` or `C#(8)::x`, if a class.
+    pub(crate) fn scope_class(&mut self, scope: &Expr<'a>) -> Option<EResult<ClassId>> {
+        match scope {
+            Expr::Ident(p) => match self.lookup(p) {
+                Some(Sym::ClassDef(d)) => Some(self.specialise(d, None, p)),
+                Some(Sym::Type(t)) => Self::class_of(&t).map(Ok),
+                _ => None,
+            },
+            Expr::Type(t) => {
+                let n = self.diags.len();
+                match self.resolve_type(t) {
+                    Ok(t) => Self::class_of(&t).map(Ok),
+                    Err(_) => {
+                        self.diags.truncate(n);
+                        None
+                    }
+                }
+            }
+            Expr::Scoped { scope: s, name } => {
+                // `pkg::C::x`
+                if let Expr::Ident(p) = &**s
+                    && let Some(Sym::ClassDef(d)) = self.lookup_scoped(p, name)
+                {
+                    return Some(self.specialise(d, None, name));
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    /// The method a call names, if it is a method of a class handle or
+    /// class scope: `obj.f`, `super.f`, `C::f`.
+    pub(crate) fn method_of(&mut self, cx: Option<&Cx<'a>>, func: &Expr<'a>) -> Option<EResult<FuncId>> {
+        let (c, name) = match func {
+            Expr::Member { base, name } => (self.handle_class(cx, base)?, *name),
+            Expr::Scoped { scope, name } => match self.scope_class(scope)? {
+                Ok(c) => (c, *name),
+                Err(e) => return Some(Err(e)),
+            },
+            _ => return None,
+        };
+        if let Err(e) = self.ensure_class(c) {
+            return Some(Err(e));
+        }
+        let info = &self.classes[c.0 as usize];
+        let f = if name == "new" {
+            info.ctor
+        } else {
+            info.methods.get(name).map(|m| m.func)
+        };
+        match f {
+            Some(f) => Some(Ok(f)),
+            None if matches!(name, "randomize" | "srandom") => Some(Err(self.not_yet(name, "randomization"))),
+            None => Some(Err(self.error(name, format!("Class method '{name}' not found")))),
+        }
+    }
+
+    /// The class of a handle-valued `e` (`super` and `this` included).
+    pub(crate) fn handle_class(&mut self, cx: Option<&Cx<'a>>, e: &Expr<'a>) -> Option<ClassId> {
+        match e {
+            Expr::Keyword("super") => {
+                let c = self.this_class(cx?)?;
+                self.classes[c.0 as usize].base
+            }
+            Expr::Keyword("this") => self.this_class(cx?),
+            _ => {
+                let n = self.diags.len();
+                let r = self.self_type_cx(cx, e).ok();
+                self.diags.truncate(n);
+                match r {
+                    Some(STy::Class(Some(c))) => Some(c),
+                    _ => None,
+                }
+            }
+        }
     }
 
     /// `{0{x}}`, a zero replication.
@@ -867,6 +988,19 @@ impl<'a, 't> Elab<'a, 't> {
                 let sym = self.lookup_cx(Some(cx), n);
                 self.root_path(cx, sym, n)?
             }
+            Expr::Keyword("this") => {
+                let Some(c) = self.this_class(cx) else {
+                    return Err(self.error(at, "'this' used outside a non-static method"));
+                };
+                let sym = cx.locals.iter().rev().find_map(|l| l.get("this").cloned());
+                let _ = c;
+                self.root_path(cx, sym, at)?
+            }
+            Expr::Scoped { scope, name } if self.scope_class(scope).is_some() => {
+                let c = self.scope_class(scope).unwrap()?;
+                let sym = self.class_member(c, name)?;
+                self.root_path(cx, sym, name)?
+            }
             Expr::Scoped { scope, name } => match &**scope {
                 Expr::Ident(p) | Expr::Keyword(p) => {
                     let sym = self.scoped_sym(p, name);
@@ -874,6 +1008,34 @@ impl<'a, 't> Elab<'a, 't> {
                 }
                 _ => return Err(self.not_yet(at, "nested scopes")),
             },
+            Expr::Member { base, name } if self.handle_class(Some(cx), base).is_some() => {
+                let c = self.handle_class(Some(cx), base).unwrap();
+                // `super.x` is this object's `x` as the base class sees it.
+                let obj = match &**base {
+                    Expr::Keyword("super") => self.this_handle(cx, at)?,
+                    b => self.lower_handle(cx, b, None)?,
+                };
+                match self.class_member(c, name)? {
+                    Some(Sym::Field(index, ty)) => {
+                        let fty = self.ir_type(&ty);
+                        let width = ty.width();
+                        Path {
+                            root: Root::Field {
+                                obj,
+                                index,
+                                ty: fty,
+                            },
+                            base: ty.clone(),
+                            elem: None,
+                            ty,
+                            lsb: None,
+                            width,
+                            at: name,
+                        }
+                    }
+                    sym => self.root_path(cx, sym, name)?,
+                }
+            }
             Expr::Member { base, name } => {
                 if let Some(s) = self.hier_scope(Some(cx), base) {
                     let sym = self.lookup_child(s, name);
@@ -1040,6 +1202,22 @@ impl<'a, 't> Elab<'a, 't> {
                 (Root::Slot(s), t)
             }
             Some(Sym::Param(v, t)) => (Root::Const(v), t),
+            Some(Sym::Field(index, t)) => {
+                if cx.const_mode {
+                    self.nonconst = Some(n);
+                    return Err(Stop);
+                }
+                let obj = self.this_handle(cx, n)?;
+                let fty = self.ir_type(&t);
+                (
+                    Root::Field {
+                        obj,
+                        index,
+                        ty: fty,
+                    },
+                    t,
+                )
+            }
             Some(Sym::Scope(_)) => {
                 return Err(self.error(n, format!("'{n}' is an instance or block, not a value")));
             }
@@ -1063,6 +1241,46 @@ impl<'a, 't> Elab<'a, 't> {
 
     /// Load a path's value.
     pub(crate) fn load_path(&mut self, cx: &mut Cx<'a>, p: &Path<'a>) -> EResult<(Val, STy)> {
+        if let Root::Field { obj, index, ty } = &p.root {
+            // A property: the whole value, then any element and bit select.
+            let whole = cx.b.emit(
+                Op::LoadField {
+                    obj: *obj,
+                    field: *index,
+                },
+                *ty,
+                p.at,
+            );
+            if !p.ty.unpacked.is_empty() {
+                return Ok(match (p.elem, fixed_count(&p.ty)) {
+                    (None, _) => (whole, sty_of(&p.ty)),
+                    (Some(start), Some(len)) => {
+                        let aty = self.ir_type(&p.ty);
+                        (
+                            cx.b.emit(
+                                Op::ArraySlice {
+                                    value: whole,
+                                    start,
+                                    len,
+                                },
+                                aty,
+                                p.at,
+                            ),
+                            sty_of(&p.ty),
+                        )
+                    }
+                    (Some(_), None) => return Err(self.not_yet(p.at, "this array property")),
+                });
+            }
+            let base = match p.elem {
+                Some(index) => {
+                    let bty = self.ir_type(&p.base);
+                    cx.b.emit(Op::ArrayElem { value: whole, index }, bty, p.at)
+                }
+                None => whole,
+            };
+            return Ok(self.select_part(cx, p, base));
+        }
         if matches!(p.ty.unpacked.first(), Some(UDim::Dynamic | UDim::Queue)) {
             let aty = self.ir_type(&p.ty);
             let v = match (&p.root, p.elem) {
@@ -1120,6 +1338,7 @@ impl<'a, 't> Elab<'a, 't> {
                         ),
                     }
                 }
+                (Root::Field { .. }, _) => unreachable!("handled above"),
             };
             return Ok((v, sty_of(&p.ty)));
         }
@@ -1146,6 +1365,7 @@ impl<'a, 't> Elab<'a, 't> {
             (Root::Const(_), _) => {
                 return Err(self.not_yet(p.at, "indexing parameter arrays"));
             }
+            (Root::Field { .. }, _) => unreachable!("handled above"),
         };
         Ok(self.select_part(cx, p, base))
     }
@@ -1205,6 +1425,10 @@ impl<'a, 't> Elab<'a, 't> {
                 let t = self.add_type(Type::String);
                 cx.b.emit(Op::ConstStr(s.clone()), t, at)
             }
+            Value::Obj(_) => {
+                let t = self.add_type(Type::Null);
+                cx.b.emit(Op::Null, t, at)
+            }
         }
     }
 
@@ -1249,6 +1473,19 @@ impl<'a, 't> Elab<'a, 't> {
                 part,
                 value,
             },
+            (Root::Field { obj, index, .. }, None) => Op::StoreField {
+                obj: *obj,
+                field: *index,
+                part,
+                value,
+            },
+            (Root::Field { obj, index, .. }, Some(elem)) => Op::StoreFieldElem {
+                obj: *obj,
+                field: *index,
+                index: elem,
+                part,
+                value,
+            },
             (Root::Const(_), _) => {
                 return Err(self.error(p.at, format!("Cannot assign to a parameter: '{}'", p.at)));
             }
@@ -1289,6 +1526,7 @@ impl<'a, 't> Elab<'a, 't> {
             STy::Bits { w, s, f } => Ok((self.lower(cx, e, Want { w, s, f })?, st)),
             STy::Real => Ok((self.lower_real(cx, e)?, st)),
             STy::Str => Ok((self.lower_str(cx, e)?, st)),
+            STy::Class(c) => Ok((self.lower_handle(cx, e, c)?, st)),
         }
     }
 
@@ -1296,6 +1534,9 @@ impl<'a, 't> Elab<'a, 't> {
     pub(crate) fn lower_to(&mut self, cx: &mut Cx<'a>, e: &Expr<'a>, ty: &Ty<'a>) -> EResult<Val> {
         if !ty.unpacked.is_empty() {
             return self.lower_array(cx, e, ty);
+        }
+        if let Base::Class(c) = ty.base {
+            return self.lower_handle(cx, e, Some(c));
         }
         if ty.base == Base::Str {
             return self.lower_str(cx, e);
@@ -1852,6 +2093,13 @@ impl<'a, 't> Elab<'a, 't> {
                 let t = self.bt(1, false, f);
                 cx.b.emit(Op::Unary(UnOp::RedOr, v), t, at)
             }
+            STy::Class(_) => {
+                // A handle is true when it is not null.
+                let t = self.bt(1, false, false);
+                let nt = self.add_type(Type::Null);
+                let null = cx.b.emit(Op::Null, nt, at);
+                cx.b.emit(Op::Binary(BinOp::Ne, v, null), t, at)
+            }
             _ => {
                 let t = self.bt(1, false, false);
                 let rt = self.add_type(Type::Real);
@@ -2279,7 +2527,11 @@ impl<'a, 't> Elab<'a, 't> {
                     Some(t) => Some(t),
                     None => self.array_type(cx, rhs),
                 };
-                let v = if let Some(t) = array_ty {
+                let v = if matches!(x, STy::Class(_)) || matches!(y, STy::Class(_)) {
+                    let a = self.lower_handle(cx, lhs, None)?;
+                    let c = self.lower_handle(cx, rhs, None)?;
+                    cx.b.emit(Op::Binary(b, a, c), bit, at)
+                } else if let Some(t) = array_ty {
                     let a = self.lower_array(cx, lhs, &t)?;
                     let c = self.lower_array(cx, rhs, &t)?;
                     cx.b.emit(Op::Binary(b, a, c), bit, at)
@@ -2472,15 +2724,53 @@ impl<'a, 't> Elab<'a, 't> {
         {
             return self.array_method(cx, base, name, args);
         }
+        match self.call_expr(cx, func, args)? {
+            Some(r) => Ok(r),
+            None => Err(self.error(func.at(), "Void function used in an expression")),
+        }
+    }
+
+    /// A call of a function, task or method; its value if it has one.
+    pub(crate) fn call_expr(
+        &mut self,
+        cx: &mut Cx<'a>,
+        func: &Expr<'a>,
+        args: &[Arg<'a>],
+    ) -> EResult<Option<(Val, STy)>> {
+        match func {
+            // `super.f()`: the base class's implementation, on this object.
+            Expr::Member { base, name } if matches!(&**base, Expr::Keyword("super")) => {
+                let Some(c) = self.handle_class(Some(cx), base) else {
+                    return Err(self.error(name, "'super' used outside a derived class"));
+                };
+                let this = self.this_handle(cx, name)?;
+                return self.method_call(cx, c, Some(this), name, args, true);
+            }
+            Expr::Member { base, name } if self.handle_class(Some(cx), base).is_some() => {
+                let c = self.handle_class(Some(cx), base).unwrap();
+                let obj = self.lower_handle(cx, base, None)?;
+                return self.method_call(cx, c, Some(obj), name, args, false);
+            }
+            // `C::f()`: a static method, or a base class's on this object.
+            Expr::Scoped { scope, name } if self.scope_class(scope).is_some() => {
+                let c = self.scope_class(scope).unwrap()?;
+                return self.method_call(cx, c, None, name, args, true);
+            }
+            _ => {}
+        }
         let f = self.resolve_func(Some(cx), func)?;
+        if let Some(&(c, _)) = self.func_class.get(&f) {
+            // A method called by name inside its class: on this object,
+            // through the vtable if virtual.
+            let name = self.d.funcs[f.0 as usize].name;
+            let c = self.this_class(cx).unwrap_or(c);
+            return self.method_call(cx, c, None, name, args, false);
+        }
         if cx.const_mode {
             // A constant function: make sure its body exists to be evaluated.
             self.ensure_lowered(f)?;
         }
-        match self.emit_call(cx, f, args, func.at())? {
-            Some(r) => Ok(r),
-            None => Err(self.error(func.at(), "Void function used in an expression")),
-        }
+        self.emit_call(cx, f, args, func.at())
     }
 
     /// Call `f`, then copy its output arguments back to the caller's
@@ -2492,14 +2782,32 @@ impl<'a, 't> Elab<'a, 't> {
         args: &[Arg<'a>],
         at: &'a str,
     ) -> EResult<Option<(Val, STy)>> {
+        self.emit_call_on(cx, f, None, None, args, at)
+    }
+
+    /// Call `f`, with `this` as the first argument of a method, through
+    /// vtable `slot` if given.
+    pub(crate) fn emit_call_on(
+        &mut self,
+        cx: &mut Cx<'a>,
+        f: FuncId,
+        this: Option<Val>,
+        slot: Option<u32>,
+        args: &[Arg<'a>],
+        at: &'a str,
+    ) -> EResult<Option<(Val, STy)>> {
         let sig = self.sig(f)?;
-        let vals = self.call_args(cx, f, args, at)?;
+        let mut vals: Vec<Val> = this.into_iter().collect();
+        vals.extend(self.call_args(cx, f, args, at)?);
         let outs: Vec<usize> = (0..sig.params.len())
             .filter(|&i| sig.dirs[i] != super::Dir::Input)
             .collect();
-        let call = Op::Call {
-            func: f,
-            args: vals,
+        let call = match slot {
+            Some(slot) => Op::VCall { slot, args: vals },
+            None => Op::Call {
+                func: f,
+                args: vals,
+            },
         };
         if outs.is_empty() {
             return Ok(match &sig.ret {
@@ -2806,7 +3114,7 @@ impl<'a, 't> Elab<'a, 't> {
                 let ty = match st {
                     STy::Real => self.add_type(Type::Real),
                     STy::Bits { w, s, f } => self.bt(w, s, f),
-                    STy::Str => unreachable!(),
+                    STy::Str | STy::Class(_) => unreachable!(),
                 };
                 if arg(0).is_some() && name == "$random" {
                     return Err(self.not_yet(name, "$random with a seed"));
@@ -2839,6 +3147,12 @@ impl<'a, 't> Elab<'a, 't> {
                     ),
                     st,
                 ))
+            }
+            "$cast" => {
+                let (Some(dst), Some(src)) = (arg(0), arg(1)) else {
+                    return Err(self.error(name, "$cast needs two arguments"));
+                };
+                Ok((self.lower_cast(cx, dst, src, name)?, st))
             }
             "$sformatf" | "$psprintf" => {
                 let (format, vals) = self.build_format(cx, args, 'd', name)?;
@@ -2905,6 +3219,7 @@ impl<'a, 't> Elab<'a, 't> {
         };
         match st {
             STy::Real => return Err(self.error(at, "Real value used as a string")),
+            STy::Class(_) => return Err(self.error(at, "Class handle used as a string")),
             STy::Bits { .. } => {
                 let (v, _) = self.lower_self(cx, e)?;
                 return Ok(cx.b.emit(Op::Convert(v), stt, at));
@@ -3030,6 +3345,7 @@ impl<'a, 't> Elab<'a, 't> {
             STy::Str => self.add_type(Type::String),
             STy::Real => self.add_type(Type::Real),
             STy::Bits { w, s, f } => self.bt(w, s, f),
+            STy::Class(_) => unreachable!(),
         };
         Ok((cx.b.emit(Op::StrFunc { func, args: all }, t, name), st))
     }

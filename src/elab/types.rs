@@ -26,6 +26,8 @@ pub(crate) enum Base<'a> {
     Str,
     Event,
     Void,
+    /// A handle to an object of a class.
+    Class(ir::ClassId),
 }
 
 /// An unpacked dimension.
@@ -189,8 +191,19 @@ impl<'a, 't> Elab<'a, 't> {
                 params,
                 packed,
             } => {
+                // A parameterised class: the specialisation for these values.
+                let class_def = match scope {
+                    Some(p) => self.lookup_scoped(p, name),
+                    None => self.lookup(name),
+                };
+                if let (Some(super::Sym::ClassDef(d)), Some(ps)) = (&class_def, params) {
+                    let c = self.specialise(*d, Some(ps), name)?;
+                    let mut t = super::class::ClassInfo::ty(c);
+                    t.packed = self.packed_dims(packed)?;
+                    return Ok(t);
+                }
                 if params.is_some() {
-                    return Err(self.not_yet(name, "parameterised types (classes)"));
+                    return Err(self.not_yet(name, "parameterised types"));
                 }
                 let mut t = match self.lookup_type(*scope, name)? {
                     Some(t) => t,
@@ -207,7 +220,25 @@ impl<'a, 't> Elab<'a, 't> {
                 t.packed = dims;
                 t
             }
-            D::ClassMember { name, .. } => return Err(self.not_yet(name, "class member types")),
+            D::ClassMember {
+                class,
+                name,
+                packed,
+            } => {
+                // `C#(8)::t`, or a type in a package's class.
+                let ct = self.resolve_type(class)?;
+                let Base::Class(c) = ct.base else {
+                    return Err(self.error(name, format!("'{name}' is not a member of a class")));
+                };
+                let mut t = match self.class_member(c, name)? {
+                    Some(super::Sym::Type(t)) => t,
+                    _ => return Err(self.error(name, format!("Can't find typedef: '{name}'"))),
+                };
+                let mut dims = self.packed_dims(packed)?;
+                dims.extend(t.packed);
+                t.packed = dims;
+                t
+            }
             D::IfaceType {
                 iface,
                 name,
@@ -400,6 +431,7 @@ impl<'a, 't> Elab<'a, 't> {
             Base::Real => self.add_type(ir::Type::Real),
             Base::Str => self.add_type(ir::Type::String),
             Base::Event => self.add_type(ir::Type::Event),
+            Base::Class(c) => self.add_type(ir::Type::Class(*c)),
             Base::Void | Base::Struct { .. } => {
                 self.add_type(ir::Type::Struct { fields: Vec::new() })
             }

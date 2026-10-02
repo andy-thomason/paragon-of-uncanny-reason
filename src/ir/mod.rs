@@ -59,6 +59,8 @@ id!(
     Val,
     /// A frame slot (automatic local) within a [`Body`].
     SlotId,
+    /// A class (one specialisation of a parameterised class) in [`Design::classes`].
+    ClassId,
     /// A display format in [`Design::formats`].
     FormatId
 );
@@ -80,9 +82,21 @@ pub struct Design<'a> {
     pub precision: i8,
     /// Input ports of the top modules, which a test bench may drive.
     pub top_inputs: Vec<VarId>,
+    pub classes: Vec<Class<'a>>,
     /// The name of the test bench the tops are instantiated in, if any: it
     /// prefixes hierarchical names (`%m` is `top.t` under Verilator's).
     pub root_name: Option<String>,
+}
+
+/// A class: the layout of its objects and its virtual methods.
+#[derive(Clone, Debug)]
+pub struct Class<'a> {
+    pub name: &'a str,
+    pub base: Option<ClassId>,
+    /// Every property of an object, inherited ones first.
+    pub fields: Vec<(&'a str, TypeId)>,
+    /// The implementation of each virtual method slot.
+    pub vtable: Vec<FuncId>,
 }
 
 /// An instance, generate block, named block or package. Scopes exist for
@@ -166,6 +180,10 @@ pub enum Type<'a> {
     Struct {
         fields: Vec<Field<'a>>,
     },
+    /// A handle to an object of the class or one derived from it.
+    Class(ClassId),
+    /// The type of `null`.
+    Null,
     /// The result of a subroutine with `output` or `inout` arguments: its
     /// value (if any) then the final value of each such argument, as an
     /// array value.
@@ -379,6 +397,32 @@ pub enum Op {
     // Strings. `Concat`, `Repl`, `Mux` and the comparisons also work on
     // strings when their operands or result are strings; `Convert` turns
     // integral values into strings and back (LRM 6.16).
+    // Classes (LRM 8).
+    /// A new object with every property at its default.
+    New(ClassId),
+    /// `new obj`: a shallow copy.
+    CopyObj(Val),
+    Null,
+    LoadField { obj: Val, field: u32 },
+    StoreField {
+        obj: Val,
+        field: u32,
+        part: Option<Part>,
+        value: Val,
+    },
+    /// Element `index` of an array property.
+    StoreFieldElem {
+        obj: Val,
+        field: u32,
+        index: Val,
+        part: Option<Part>,
+        value: Val,
+    },
+    /// A virtual method call: `args[0]` is the object, whose class's
+    /// vtable gives the function for `slot`.
+    VCall { slot: u32, args: Vec<Val> },
+    /// Is the handle not null and its object of `class` or derived from it?
+    IsA { value: Val, class: ClassId },
     /// Entering a named block or task body that `disable` can name; `exit`
     /// is where a disabled execution continues (it starts with the matching
     /// `BlockLeave`).

@@ -286,6 +286,23 @@ impl<'a, 't> Elab<'a, 't> {
         let sig = self.sig(id)?;
         let mut cx = Cx::new(false);
         cx.is_func = true;
+        // A method's first argument is the object.
+        let method = self.func_class.get(&id).copied();
+        if let Some((c, false)) = method {
+            let ty = Self::class_ty(c);
+            let irt = self.ir_type(&ty);
+            let v = cx.b.block_param(BlockId(0), irt);
+            let slot = cx.b.new_slot(irt);
+            cx.b.effect(
+                Op::StoreSlot {
+                    slot,
+                    part: None,
+                    value: v,
+                },
+                f.name,
+            );
+            cx.locals[0].insert("this", Sym::Slot(slot, ty));
+        }
         let mut out_slots = Vec::new();
         for (i, (name, ty)) in sig.params.iter().enumerate() {
             let irt = self.ir_type(ty);
@@ -320,15 +337,34 @@ impl<'a, 't> Elab<'a, 't> {
             }
             self.block_decl(&mut cx, d, true)?;
         }
+        let mut stmts = &f.stmts[..];
+        if let Some((c, false)) = method
+            && f.name == "new"
+        {
+            // A constructor: the base class's constructor (here, unless the
+            // body starts with `super.new`), then the property initialisers.
+            let explicit = matches!(
+                stmts.first(),
+                Some(Stmt::Expr(Expr::Call { func, .. }))
+                    if matches!(&**func, Expr::Member { base, name: "new" } if matches!(&**base, Expr::Keyword("super")))
+            );
+            if explicit {
+                self.lower_stmt(&mut cx, &stmts[0], &mut waits)?;
+                stmts = &stmts[1..];
+                self.field_inits(&mut cx, c, f.name)?;
+            } else {
+                self.ctor_prologue(&mut cx, c, false, f.name)?;
+            }
+        }
         if f.kw == "task" {
             self.tagged(&mut cx, DisableTag::Task(id), |this, cx| {
-                for s in &f.stmts {
+                for s in stmts {
                     this.lower_stmt(cx, s, &mut waits)?;
                 }
                 Ok(())
             })?;
         } else {
-            for s in &f.stmts {
+            for s in stmts {
                 self.lower_stmt(&mut cx, s, &mut waits)?;
             }
         }
@@ -1130,8 +1166,19 @@ impl<'a, 't> Elab<'a, 't> {
                 Ok(())
             }
             Expr::Call { func, args } => {
-                let f = self.resolve_func(Some(cx), func)?;
-                self.emit_call(cx, f, args, func.at())?;
+                self.call_expr(cx, func, args)?;
+                Ok(())
+            }
+            // `obj.task;` or a method called without parentheses.
+            Expr::Member { .. } | Expr::Scoped { .. }
+                if matches!(e, Expr::Member { base, .. } if self.handle_class(Some(cx), base).is_some())
+                    || matches!(e, Expr::Scoped { scope, .. } if self.scope_class(scope).is_some()) =>
+            {
+                self.call_expr(cx, e, &[])?;
+                Ok(())
+            }
+            Expr::Ident(n) if matches!(self.lookup_cx(Some(cx), n), Some(Sym::Func(f)) if self.func_class.contains_key(&f)) => {
+                self.call_expr(cx, e, &[])?;
                 Ok(())
             }
             Expr::Ident(n) | Expr::Scoped { name: n, .. } => match self.lookup_cx(Some(cx), n) {
@@ -1585,6 +1632,33 @@ impl<'a, 't> Elab<'a, 't> {
                     },
                     name,
                 );
+                Ok(())
+            }
+            "$cast" => {
+                let (Some(Arg::Ordered(Some(dst))), Some(Arg::Ordered(Some(src)))) =
+                    (args.first(), args.get(1))
+                else {
+                    return Err(self.error(name, "$cast needs two arguments"));
+                };
+                let ok = self.lower_cast(cx, dst, src, name)?;
+                // As a task, a failed cast is an error.
+                let (bad, join) = (cx.b.new_block(), cx.b.new_block());
+                cx.b.terminate(Terminator::Branch {
+                    cond: ok,
+                    then: (join, vec![]),
+                    els: (bad, vec![]),
+                });
+                cx.b.switch_to(bad);
+                cx.b.effect(
+                    Op::Report {
+                        severity: ReportSeverity::Error,
+                        format: None,
+                        args: vec![],
+                    },
+                    name,
+                );
+                cx.b.terminate(Terminator::Jump(join, vec![]));
+                cx.b.switch_to(join);
                 Ok(())
             }
             "$sformat" | "$swrite" | "$swriteb" | "$swriteh" | "$swriteo" => {

@@ -161,6 +161,11 @@ fn pattern_elem(v: &Value) -> String {
             let items: Vec<String> = a.iter().rev().map(pattern_elem).collect();
             format!("'{{{}}}", items.join(", "))
         }
+        Value::Obj(None) => "null".into(),
+        Value::Obj(Some(o)) => {
+            let items: Vec<String> = o.0.borrow().fields.iter().map(pattern_elem).collect();
+            format!("'{{{}}}", items.join(", "))
+        }
     }
 }
 
@@ -168,7 +173,7 @@ fn to_real(v: &Value, signed: bool) -> f64 {
     match v {
         Value::Real(r) => *r,
         Value::Bits(b) => crate::eval::bits_to_f64(b, signed),
-        Value::Str(_) | Value::Array(_) => 0.0,
+        Value::Str(_) | Value::Array(_) | Value::Obj(_) => 0.0,
     }
 }
 

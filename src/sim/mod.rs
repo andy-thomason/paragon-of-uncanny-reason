@@ -656,23 +656,105 @@ impl<'d, 'a> Simulator<'d, 'a> {
                 None
             }
             Op::Call { func, args } => {
-                let f = &self.d.funcs[func.0 as usize];
-                let vals: Vec<Value> = args.iter().map(|a| self.val(t, *a)).collect();
-                let mut frame_vals = vec![None; f.body.vals.len()];
-                for (p, v) in f.body.blocks[0].params.iter().zip(vals) {
-                    frame_vals[p.0 as usize] = Some(v);
+                if self.d.funcs[func.0 as usize].body.blocks.is_empty() {
+                    return Some(self.no_body(*func, inst.at, sink));
                 }
-                let slots = Rc::new(RefCell::new(self.default_slots(&f.body)));
-                self.threads[t].frames.push(Frame {
-                    body: &f.body,
-                    scope: f.scope,
-                    vals: frame_vals,
-                    slots,
-                    block: BlockId(0),
-                    ip: 0,
-                    ret_to: inst.dst,
-                });
+                let vals: Vec<Value> = args.iter().map(|a| self.val(t, *a)).collect();
+                self.push_call(t, *func, vals, inst.dst);
                 return None;
+            }
+            Op::VCall { slot, args } => {
+                let vals: Vec<Value> = args.iter().map(|a| self.val(t, *a)).collect();
+                let Some(Value::Obj(Some(o))) = vals.first() else {
+                    return Some(self.null_error(inst.at, sink));
+                };
+                let class = o.0.borrow().class;
+                let func = self.d.classes[class.0 as usize].vtable[*slot as usize];
+                if self.d.funcs[func.0 as usize].body.blocks.is_empty() {
+                    return Some(self.no_body(func, inst.at, sink));
+                }
+                self.push_call(t, func, vals, inst.dst);
+                return None;
+            }
+            Op::New(c) => {
+                let fields = self.d.classes[c.0 as usize]
+                    .fields
+                    .iter()
+                    .map(|(_, ty)| crate::eval::default_for(&self.d.types, &self.d.types[ty.0 as usize]))
+                    .collect();
+                Some(Value::Obj(Some(crate::eval::ObjRef(Rc::new(RefCell::new(
+                    crate::eval::Object { class: *c, fields },
+                ))))))
+            }
+            Op::CopyObj(v) => match self.val(t, *v) {
+                Value::Obj(Some(o)) => {
+                    let copy = o.0.borrow().clone();
+                    Some(Value::Obj(Some(crate::eval::ObjRef(Rc::new(RefCell::new(copy))))))
+                }
+                _ => return Some(self.null_error(inst.at, sink)),
+            },
+            Op::LoadField { obj, field } => match self.val(t, *obj) {
+                Value::Obj(Some(o)) => Some(o.0.borrow().fields[*field as usize].clone()),
+                _ => return Some(self.null_error(inst.at, sink)),
+            },
+            Op::StoreField {
+                obj,
+                field,
+                part,
+                value,
+            } => {
+                let Value::Obj(Some(o)) = self.val(t, *obj) else {
+                    return Some(self.null_error(inst.at, sink));
+                };
+                if let Some(p) = self.part(t, part) {
+                    let v = self.val(t, *value);
+                    let class = o.0.borrow().class;
+                    let fty = self.d.classes[class.0 as usize].fields[*field as usize].1;
+                    let fty = &self.d.types[fty.0 as usize];
+                    let mut ob = o.0.borrow_mut();
+                    let new = merge(&ob.fields[*field as usize], p, v, fty);
+                    ob.fields[*field as usize] = new;
+                }
+                None
+            }
+            Op::StoreFieldElem {
+                obj,
+                field,
+                index,
+                part,
+                value,
+            } => {
+                let Value::Obj(Some(o)) = self.val(t, *obj) else {
+                    return Some(self.null_error(inst.at, sink));
+                };
+                if let (Some(i), Some(p)) = (self.int(t, *index), self.part(t, part)) {
+                    let v = self.val(t, *value);
+                    let class = o.0.borrow().class;
+                    let fty = self.d.classes[class.0 as usize].fields[*field as usize].1;
+                    let elem = match &self.d.types[fty.0 as usize] {
+                        Type::Unpacked { elem, .. } | Type::Dynamic { elem } | Type::Queue { elem, .. } => {
+                            &self.d.types[elem.0 as usize]
+                        }
+                        _ => return None,
+                    };
+                    let mut ob = o.0.borrow_mut();
+                    crate::eval::store_elem(&mut ob.fields[*field as usize], i, p, v, elem);
+                }
+                None
+            }
+            Op::IsA { value, class } => {
+                let mut ok = false;
+                if let Value::Obj(Some(o)) = self.val(t, *value) {
+                    let mut c = Some(o.0.borrow().class);
+                    while let Some(x) = c {
+                        if x == *class {
+                            ok = true;
+                            break;
+                        }
+                        c = self.d.classes[x.0 as usize].base;
+                    }
+                }
+                Some(Value::Bits(Bits::from_bool(ok)))
             }
             Op::Display { kind, format, args } => {
                 let vals: Vec<(Value, &Type)> = args
@@ -805,9 +887,10 @@ impl<'d, 'a> Simulator<'d, 'a> {
             op => {
                 let ty = inst.dst.map_or(&Type::Real, |d| self.val_ty(t, d));
                 let f = self.threads[t].frames.last().unwrap();
+                let x1 = Value::Real(0.0);
                 let get = |v: Val| {
                     (
-                        f.vals[v.0 as usize].as_ref().unwrap_or(&X1),
+                        f.vals[v.0 as usize].as_ref().unwrap_or(&x1),
                         &self.d.types[f.body.vals[v.0 as usize].0 as usize],
                     )
                 };
@@ -818,6 +901,43 @@ impl<'d, 'a> Simulator<'d, 'a> {
             self.set(t, d, r);
         }
         None
+    }
+
+    /// Call `func` with `vals` as its arguments; the result goes to `dst`.
+    fn push_call(&mut self, t: ThreadId, func: FuncId, vals: Vec<Value>, dst: Option<Val>) {
+        let f = &self.d.funcs[func.0 as usize];
+        let mut frame_vals = vec![None; f.body.vals.len()];
+        for (p, v) in f.body.blocks[0].params.iter().zip(vals) {
+            frame_vals[p.0 as usize] = Some(v);
+        }
+        let slots = Rc::new(RefCell::new(self.default_slots(&f.body)));
+        self.threads[t].frames.push(Frame {
+            body: &f.body,
+            scope: f.scope,
+            vals: frame_vals,
+            slots,
+            block: BlockId(0),
+            ip: 0,
+            ret_to: dst,
+        });
+    }
+
+    /// Calling a pure virtual method (or one never lowered) is an error.
+    fn no_body(&mut self, func: FuncId, at: &str, sink: &mut dyn Sink) -> End {
+        let name = self.d.funcs[func.0 as usize].name;
+        sink.report(
+            ReportSeverity::Error,
+            &format!("Call of '{name}', which has no implementation"),
+            at,
+            self.time,
+        );
+        End::Fatal
+    }
+
+    /// Using a null handle ends the simulation, as in Verilator.
+    fn null_error(&mut self, at: &str, sink: &mut dyn Sink) -> End {
+        sink.report(ReportSeverity::Error, "Null pointer dereferenced", at, self.time);
+        End::Fatal
     }
 
     fn jump(&mut self, t: ThreadId, (b, args): &(BlockId, Vec<Val>)) {
@@ -1123,7 +1243,6 @@ enum Flow {
     End(End),
 }
 
-static X1: Value = Value::Real(0.0);
 
 fn default(t: &Type<'_>) -> Value {
     crate::eval::default_for(&[], t)
