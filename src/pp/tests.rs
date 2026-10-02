@@ -419,6 +419,19 @@ fn error_takes_one_string() {
 }
 
 #[test]
+fn line_markers_start_with_top_file_when_output_begins_in_include() {
+    let sm = SourceMap::new();
+    let fs = MemFs(vec![("top.v", "`include \"i.vh\"\nb\n"), ("i.vh", "inc\n")]);
+    let mut pp = Preprocessor::new(&sm, &fs, Options::default());
+    pp.process_file("top.v");
+    let out = write(&sm, pp.output(), EmitOptions { line_markers: true });
+    assert_eq!(
+        out,
+        "`line 1 \"top.v\" 1\n`line 1 \"i.vh\" 1\ninc\n`line 1 \"top.v\" 2\n\nb\n"
+    );
+}
+
+#[test]
 fn line_markers() {
     let sm = SourceMap::new();
     let fs = MemFs(vec![

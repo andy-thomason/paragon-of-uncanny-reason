@@ -24,6 +24,11 @@
 
 mod executor;
 
+/// Compiles and runs the Rust examples in the repository README.
+#[doc = include_str!("../../README.md")]
+#[cfg(doctest)]
+pub struct ReadmeDoctests;
+
 pub use executor::block_on;
 
 use paragon_of_uncanny_reason::pp::emit::{EmitOptions, write};

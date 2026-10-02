@@ -44,6 +44,19 @@ fn write_with_markers(sm: &SourceMap, toks: &[Token<'_>]) -> String {
         let text = t.text();
         if line_start {
             if let Some(loc) = sm.locate(text) {
+                if cur.is_none() {
+                    // Output that starts inside an include still begins with
+                    // the top-level file.
+                    let mut root = loc.file;
+                    while let Some(p) = parent(root) {
+                        root = p;
+                    }
+                    if root != loc.file
+                        && let Origin::File { name, .. } = sm.origin(root)
+                    {
+                        out.push_str(&format!("`line 1 \"{name}\" 1\n"));
+                    }
+                }
                 let level = match &cur {
                     None => Some(1),
                     Some((f, name, line)) if *f == loc.file => {
