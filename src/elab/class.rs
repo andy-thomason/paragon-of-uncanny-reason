@@ -278,6 +278,46 @@ impl<'a, 't> Elab<'a, 't> {
                 );
             }
         }
+        // The built-in `randomize`, virtual so a base handle randomizes the
+        // whole object.
+        {
+            let sub = self.made_subs.alloc(ast::Subroutine {
+                kw: "function",
+                class: None,
+                proto: false,
+                lifetime: None,
+                ret: Some(ast::DataType::Builtin {
+                    kw: "int",
+                    signing: None,
+                    packed: Vec::new(),
+                }),
+                name: "randomize",
+                ports: Some(Vec::new()),
+                decls: Vec::new(),
+                stmts: Vec::new(),
+                end: ast.name,
+            });
+            let id = self.new_method(scope, sub, c, false, true);
+            self.rand_funcs.insert(id);
+            let slot = match self.classes[ci].methods.get("randomize").and_then(|m| m.slot) {
+                Some(s) => {
+                    self.d.classes[ci].vtable[s as usize] = id;
+                    s
+                }
+                None => {
+                    self.d.classes[ci].vtable.push(id);
+                    self.d.classes[ci].vtable.len() as u32 - 1
+                }
+            };
+            self.classes[ci].methods.insert(
+                "randomize",
+                Method {
+                    func: id,
+                    is_static: false,
+                    slot: Some(slot),
+                },
+            );
+        }
         if self.classes[ci].ctor.is_none() {
             // An empty constructor, which still calls the base one and runs
             // the initialisers.

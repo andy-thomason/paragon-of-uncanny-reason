@@ -200,6 +200,8 @@ pub(crate) struct Elab<'a, 't> {
     pub(crate) classes: Vec<class::ClassInfo<'a, 't>>,
     /// Methods: their class, and whether static.
     pub(crate) func_class: HashMap<FuncId, (ClassId, bool)>,
+    /// The built-in `randomize` method of each class.
+    pub(crate) rand_funcs: HashSet<FuncId>,
     /// Out-of-class method bodies (`function C::f`), by class and name.
     pub(crate) out_of_class: HashMap<(&'a str, &'a str), &'t ast::Subroutine<'a>>,
     /// Interface instances made early, because a declaration used a type
@@ -245,6 +247,7 @@ impl<'a, 't> Elab<'a, 't> {
             class_defs: Vec::new(),
             classes: Vec::new(),
             func_class: HashMap::new(),
+            rand_funcs: HashSet::new(),
             out_of_class: HashMap::new(),
             early_insts: HashSet::new(),
             d: Design::default(),

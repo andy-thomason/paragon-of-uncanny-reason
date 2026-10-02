@@ -337,6 +337,18 @@ impl<'a, 't> Elab<'a, 't> {
             }
             self.block_decl(&mut cx, d, true)?;
         }
+        if self.rand_funcs.contains(&id)
+            && let Some((c, _)) = method
+        {
+            // The built-in `randomize`.
+            let this = self.this_handle(&mut cx, f.name)?;
+            let v = self.lower_randomize(&mut cx, this, c, &[], f.name)?;
+            cx.b.terminate(Terminator::Return(Some(v)));
+            let (body, calls) = cx.b.finish(Terminator::Unreachable);
+            self.func_calls.insert(id, calls);
+            self.d.funcs[id.0 as usize].body = body;
+            return Ok(());
+        }
         let mut stmts = &f.stmts[..];
         if let Some((c, false)) = method
             && f.name == "new"
