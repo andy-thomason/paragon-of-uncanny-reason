@@ -12,7 +12,7 @@
 
 use super::expr::{Cx, STy};
 use super::types::Ty;
-use super::{EResult, Elab};
+use super::{EResult, Elab, Sym};
 use crate::ast::{ConstraintItem, Expr};
 use crate::eval::Value;
 use crate::ir::*;
@@ -157,11 +157,20 @@ impl<'a, 't> Elab<'a, 't> {
         at: &'a str,
     ) -> EResult<()> {
         let mut plan = Vec::new();
+        let mut arrays = Vec::new();
         for (idx, name, ty) in rand {
+            if ty.unpacked.len() == 1 {
+                let mut elem = ty.clone();
+                elem.unpacked.clear();
+                if elem.is_integral() {
+                    arrays.push((*idx, *name, ty.clone(), elem));
+                }
+                continue;
+            }
             if !ty.is_integral() || !ty.unpacked.is_empty() {
                 continue;
             }
-            let d = self.domain(name, ty, items);
+            let d = self.domain(&Subject::Name(name), ty, items);
             if d.equal.is_none() && d.ranges.is_empty() && ty.width() <= 64 {
                 return Ok(());
             }
@@ -216,6 +225,9 @@ impl<'a, 't> Elab<'a, 't> {
             let v = self.lower_to(cx, &e, &ty)?;
             self.store_field(cx, obj, idx, v, at);
         }
+        for (idx, name, ty, elem) in arrays {
+            self.randomize_array(cx, obj, idx, name, &ty, &elem, items, at)?;
+        }
         let holds = self.constraints_hold(cx, items)?;
         cx.b.terminate(Terminator::Branch {
             cond: holds,
@@ -223,6 +235,163 @@ impl<'a, 't> Elab<'a, 't> {
             els: (head, vec![]),
         });
         cx.b.switch_to(done);
+        Ok(())
+    }
+
+    /// New random elements (and, for a dynamic array or queue with a size
+    /// constraint, a new size) for an array property.
+    #[allow(clippy::too_many_arguments)]
+    fn randomize_array(
+        &mut self,
+        cx: &mut Cx<'a>,
+        obj: Val,
+        idx: u32,
+        name: &'a str,
+        ty: &Ty<'a>,
+        elem: &Ty<'a>,
+        items: &[&ConstraintItem<'a>],
+        at: &'a str,
+    ) -> EResult<()> {
+        use super::types::UDim;
+        let int = Ty::bits(32, true, false);
+        let it = self.ir_type(&int);
+        let at_ = self.ir_type(ty);
+        let et = self.ir_type(elem);
+        // The element domain, from `foreach (a[i]) ...` constraints.
+        let mut elem_items: Vec<(&'a str, Vec<&ConstraintItem<'a>>)> = Vec::new();
+        let flat: Vec<ConstraintItem<'a>> = items.iter().map(|i| (*i).clone()).collect();
+        for it_ in &flat {
+            if let ConstraintItem::Foreach { array: Expr::Ident(a), vars, items } = it_
+                && *a == name
+                && let Some(Some(v)) = vars.first()
+            {
+                elem_items.push((v, items.iter().collect()));
+            }
+        }
+        let (var, inner): (Option<&'a str>, Vec<&ConstraintItem<'a>>) = match elem_items.first() {
+            Some((v, i)) => (Some(*v), i.clone()),
+            None => (None, Vec::new()),
+        };
+        let d = match var {
+            Some(v) => self.domain(&Subject::Elem(name, v), elem, &inner),
+            None => Domain {
+                ranges: self.domain(&Subject::Elem(name, ""), elem, &[]).ranges,
+                equal: None,
+            },
+        };
+        // The size.
+        let whole = cx.b.emit(Op::LoadField { obj, field: idx }, at_, at);
+        let n = match ty.unpacked[0] {
+            UDim::Fixed(l, r) => cx.b.emit(
+                Op::Const(Bits::from_u64(32, super::types::range_len((l, r)) as u64)),
+                it,
+                at,
+            ),
+            UDim::Dynamic | UDim::Queue => {
+                let sd = self.domain(&Subject::Size(name), &int, items);
+                let constrained = items.iter().any(|i| constrains_size(i, name));
+                if constrained {
+                    let ranges: Vec<(i64, i64)> =
+                        sd.ranges.iter().map(|(a, b)| ((*a).max(0), (*b).min(4096))).filter(|(a, b)| a <= b).collect();
+                    let n = self.random_in(cx, &int, &ranges, at);
+                    let dflt = crate::eval::default_for(&self.d.types, &self.d.types[et.0 as usize]);
+                    let dv = self.emit_value(cx, &dflt, elem, at);
+                    let new = cx.b.emit(
+                        Op::ArrFunc {
+                            func: ArrFunc::New,
+                            args: vec![n, dv],
+                        },
+                        at_,
+                        at,
+                    );
+                    self.store_field(cx, obj, idx, new, at);
+                    n
+                } else {
+                    cx.b.emit(
+                        Op::ArrFunc {
+                            func: ArrFunc::Size,
+                            args: vec![whole],
+                        },
+                        it,
+                        at,
+                    )
+                }
+            }
+            UDim::Assoc(_) => return Ok(()),
+        };
+        // Each element.
+        let islot = cx.b.new_slot(it);
+        let zero = cx.b.emit(Op::Const(Bits::zero(32)), it, at);
+        cx.b.effect(
+            Op::StoreSlot {
+                slot: islot,
+                part: None,
+                value: zero,
+            },
+            at,
+        );
+        let bit = self.bits_type(1, false, false);
+        let (head, body, exit) = (cx.b.new_block(), cx.b.new_block(), cx.b.new_block());
+        cx.b.goto(head);
+        let i = cx.b.emit(Op::LoadSlot(islot), it, at);
+        let more = cx.b.emit(Op::Binary(BinOp::Lt, i, n), bit, at);
+        cx.b.terminate(Terminator::Branch {
+            cond: more,
+            then: (body, vec![]),
+            els: (exit, vec![]),
+        });
+        cx.b.switch_to(body);
+        let v = match &d.equal {
+            Some(e) => {
+                // `a[i] == expr`: with the loop variable bound to the index.
+                let fixed = matches!(ty.unpacked[0], UDim::Fixed(..));
+                let index = match (fixed, ty.unpacked[0].clone()) {
+                    (true, UDim::Fixed(l, r)) => {
+                        // Element offset k is index r + k (or r - k).
+                        let rv = cx.b.emit(Op::Const(Bits::from_i64(32, r)), it, at);
+                        let op = if l >= r { BinOp::Add } else { BinOp::Sub };
+                        cx.b.emit(Op::Binary(op, rv, i), it, at)
+                    }
+                    _ => i,
+                };
+                let vslot = cx.b.new_slot(it);
+                cx.b.effect(
+                    Op::StoreSlot {
+                        slot: vslot,
+                        part: None,
+                        value: index,
+                    },
+                    at,
+                );
+                cx.locals.push(std::collections::HashMap::from([(var.unwrap(), Sym::Slot(vslot, int.clone()))]));
+                let r = self.lower_to(cx, e, elem);
+                cx.locals.pop();
+                r?
+            }
+            None => self.random_in(cx, elem, &d.ranges, at),
+        };
+        cx.b.effect(
+            Op::StoreFieldElem {
+                obj,
+                field: idx,
+                index: i,
+                part: None,
+                value: v,
+            },
+            at,
+        );
+        let one = cx.b.emit(Op::Const(Bits::from_u64(32, 1)), it, at);
+        let i1 = cx.b.emit(Op::Binary(BinOp::Add, i, one), it, at);
+        cx.b.effect(
+            Op::StoreSlot {
+                slot: islot,
+                part: None,
+                value: i1,
+            },
+            at,
+        );
+        cx.b.terminate(Terminator::Jump(head, vec![]));
+        cx.b.switch_to(exit);
         Ok(())
     }
 
@@ -269,7 +438,8 @@ impl<'a, 't> Elab<'a, 't> {
 
     /// The domain of property `name` from the constraints that are plain
     /// conjuncts. Anything else is left to the check.
-    fn domain(&mut self, name: &str, ty: &Ty<'a>, items: &[&ConstraintItem<'a>]) -> Domain<'a> {
+    fn domain(&mut self, subj: &Subject, ty: &Ty<'a>, items: &[&ConstraintItem<'a>]) -> Domain<'a> {
+        let name = subj.name();
         let w = ty.width();
         let (mut lo, mut hi): (i128, i128) = if w >= 64 {
             (i64::MIN as i128, i64::MAX as i128)
@@ -291,7 +461,7 @@ impl<'a, 't> Elab<'a, 't> {
         for it in items {
             match it {
                 ConstraintItem::Expr(e) | ConstraintItem::Soft(e) => conj.push(e.clone()),
-                ConstraintItem::Dist { expr, items } if is_name(expr, name) => {
+                ConstraintItem::Dist { expr, items } if subj.is(expr) => {
                     let set: Vec<Expr<'a>> = items
                         .iter()
                         .filter(|(v, _)| !matches!(v, Expr::Keyword("default")))
@@ -310,15 +480,15 @@ impl<'a, 't> Elab<'a, 't> {
                     conj.push((**lhs).clone());
                     conj.push((**rhs).clone());
                 }
-                Expr::Inside { expr, set } if is_name(expr, name) => {
+                Expr::Inside { expr, set } if subj.is(expr) => {
                     if let Some(r) = self.const_set(set) {
                         sets = Some(intersect_sets(sets, r));
                     }
                 }
                 Expr::Binary { op, lhs, rhs } if matches!(*op, "<" | "<=" | ">" | ">=" | "==") => {
-                    let (op, other) = if is_name(lhs, name) {
+                    let (op, other) = if subj.is(lhs) {
                         (*op, &**rhs)
-                    } else if is_name(rhs, name) {
+                    } else if subj.is(rhs) {
                         // Mirror `c < x` to `x > c`.
                         let m = match *op {
                             "<" => ">",
@@ -485,11 +655,108 @@ impl<'a, 't> Elab<'a, 't> {
                 }
                 acc
             }
-            ConstraintItem::Foreach { array, .. } => {
-                return Err(self.not_yet(array.at(), "foreach constraints"));
+            ConstraintItem::Foreach { array, vars, items } => {
+                return self.foreach_holds(cx, array, vars, items);
             }
             ConstraintItem::Ignored(_) => cx.b.emit(Op::Const(Bits::ones(1)), bit, ""),
         })
+    }
+
+    /// `foreach (a[i]) items`: all hold for every element.
+    fn foreach_holds(
+        &mut self,
+        cx: &mut Cx<'a>,
+        array: &Expr<'a>,
+        vars: &[Option<&'a str>],
+        items: &[ConstraintItem<'a>],
+    ) -> EResult<Val> {
+        use super::types::UDim;
+        let Some(t) = self.array_type(cx, array) else {
+            return Err(self.error(array.at(), "foreach needs an array"));
+        };
+        if vars.len() > 1 {
+            return Err(self.not_yet(array.at(), "multi-dimensional foreach constraints"));
+        }
+        let at = array.at();
+        let int = Ty::bits(32, true, false);
+        let it = self.ir_type(&int);
+        let bit = self.bits_type(1, false, false);
+        let (start, end_incl, step): (Val, Val, i64) = match t.unpacked[0] {
+            UDim::Fixed(l, r) => (
+                cx.b.emit(Op::Const(Bits::from_i64(32, l)), it, at),
+                cx.b.emit(Op::Const(Bits::from_i64(32, r)), it, at),
+                if l <= r { 1 } else { -1 },
+            ),
+            UDim::Dynamic | UDim::Queue => {
+                let (n, _) = self.array_method(cx, array, "size", &[])?;
+                let one = cx.b.emit(Op::Const(Bits::from_u64(32, 1)), it, at);
+                let last = cx.b.emit(Op::Binary(BinOp::Sub, n, one), it, at);
+                (cx.b.emit(Op::Const(Bits::zero(32)), it, at), last, 1)
+            }
+            UDim::Assoc(_) => return Err(self.not_yet(at, "foreach constraints on associative arrays")),
+        };
+        let acc = cx.b.new_slot(bit);
+        let t1 = cx.b.emit(Op::Const(Bits::ones(1)), bit, at);
+        cx.b.effect(
+            Op::StoreSlot {
+                slot: acc,
+                part: None,
+                value: t1,
+            },
+            at,
+        );
+        let islot = cx.b.new_slot(it);
+        cx.b.effect(
+            Op::StoreSlot {
+                slot: islot,
+                part: None,
+                value: start,
+            },
+            at,
+        );
+        let (head, body, exit) = (cx.b.new_block(), cx.b.new_block(), cx.b.new_block());
+        cx.b.goto(head);
+        let i = cx.b.emit(Op::LoadSlot(islot), it, at);
+        let cmp = if step > 0 { BinOp::Le } else { BinOp::Ge };
+        let more = cx.b.emit(Op::Binary(cmp, i, end_incl), bit, at);
+        cx.b.terminate(Terminator::Branch {
+            cond: more,
+            then: (body, vec![]),
+            els: (exit, vec![]),
+        });
+        cx.b.switch_to(body);
+        let mut scope = std::collections::HashMap::new();
+        if let Some(Some(v)) = vars.first() {
+            scope.insert(*v, Sym::Slot(islot, int.clone()));
+        }
+        cx.locals.push(scope);
+        let refs: Vec<&ConstraintItem<'a>> = items.iter().collect();
+        let r = self.constraints_hold(cx, &refs);
+        cx.locals.pop();
+        let v = r?;
+        let a = cx.b.emit(Op::LoadSlot(acc), bit, at);
+        let a = cx.b.emit(Op::Binary(BinOp::And, a, v), bit, at);
+        cx.b.effect(
+            Op::StoreSlot {
+                slot: acc,
+                part: None,
+                value: a,
+            },
+            at,
+        );
+        let s = cx.b.emit(Op::Const(Bits::from_i64(32, step)), it, at);
+        let i1 = cx.b.emit(Op::Binary(BinOp::Add, i, s), it, at);
+        cx.b.effect(
+            Op::StoreSlot {
+                slot: islot,
+                part: None,
+                value: i1,
+            },
+            at,
+        );
+        cx.b.terminate(Terminator::Jump(head, vec![]));
+        cx.b.switch_to(exit);
+        Ok(cx.b.emit(Op::LoadSlot(acc), bit, at))
     }
 
     /// `x.randomize() with { ... }`.
@@ -528,8 +795,65 @@ impl<'a, 't> Elab<'a, 't> {
     }
 }
 
-fn is_name(e: &Expr, name: &str) -> bool {
-    matches!(e, Expr::Ident(n) if *n == name)
+/// What a domain is for: a property, an element of an array property in a
+/// `foreach`, or an array's size.
+enum Subject<'s> {
+    Name(&'s str),
+    Elem(&'s str, &'s str),
+    Size(&'s str),
+}
+
+impl Subject<'_> {
+    /// The property it belongs to.
+    fn name(&self) -> &str {
+        match self {
+            Subject::Name(n) | Subject::Elem(n, _) | Subject::Size(n) => n,
+        }
+    }
+
+    fn is(&self, e: &Expr) -> bool {
+        match (self, e) {
+            (Subject::Name(n), Expr::Ident(x)) => x == n,
+            (Subject::Elem(a, v), Expr::Index { base, index }) => {
+                matches!(&**base, Expr::Ident(x) if x == a) && matches!(&**index, Expr::Ident(x) if x == v)
+            }
+            (Subject::Size(a), Expr::Call { func, args }) if args.is_empty() => {
+                matches!(&**func, Expr::Member { base, name: "size" } if matches!(&**base, Expr::Ident(x) if x == a))
+            }
+            (Subject::Size(a), Expr::Member { base, name: "size" }) => {
+                matches!(&**base, Expr::Ident(x) if x == a)
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Does a constraint (at the top level, or in a conjunction) mention
+/// `a.size()`?
+fn constrains_size(it: &ConstraintItem, a: &str) -> bool {
+    let subj = Subject::Size(a);
+    fn walk(e: &Expr, subj: &Subject) -> bool {
+        if subj.is(e) {
+            return true;
+        }
+        match e {
+            Expr::Binary { lhs, rhs, .. } => walk(lhs, subj) || walk(rhs, subj),
+            Expr::Inside { expr, .. } => walk(expr, subj),
+            Expr::Unary { arg, .. } => walk(arg, subj),
+            _ => false,
+        }
+    }
+    match it {
+        ConstraintItem::Expr(e) | ConstraintItem::Soft(e) => walk(e, &subj),
+        ConstraintItem::Dist { expr, .. } => walk(expr, &subj),
+        ConstraintItem::Implies(_, items) | ConstraintItem::Foreach { items, .. } => {
+            items.iter().any(|i| constrains_size(i, a))
+        }
+        ConstraintItem::If { then, els, .. } => {
+            then.iter().chain(els).any(|i| constrains_size(i, a))
+        }
+        _ => false,
+    }
 }
 
 /// Does `e` mention the name?

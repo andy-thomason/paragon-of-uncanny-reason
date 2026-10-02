@@ -79,8 +79,9 @@ impl<'a> Parser<'a> {
                 };
                 continue;
             }
+            // `x dist {...}` is a constraint item, parsed by the caller.
             if self.is_kw("dist") {
-                return Err(self.not_yet(self.here(), "dist"));
+                break;
             }
             let Some(Token::Op(op)) = self.peek() else {
                 break;
