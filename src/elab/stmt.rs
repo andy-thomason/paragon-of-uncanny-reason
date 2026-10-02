@@ -21,6 +21,7 @@ impl<'a, 't> Elab<'a, 't> {
 
     pub(crate) fn lower_process(&mut self, kw: &'a str, stmt: &'t Stmt<'a>) -> EResult<()> {
         self.last_at = kw;
+        self.predeclare_blocks(self.cur, stmt);
         let mut cx = Cx::new(false);
         let mut waits = Vec::new();
         match kw {
@@ -319,8 +320,17 @@ impl<'a, 't> Elab<'a, 't> {
             }
             self.block_decl(&mut cx, d, true)?;
         }
-        for s in &f.stmts {
-            self.lower_stmt(&mut cx, s, &mut waits)?;
+        if f.kw == "task" {
+            self.tagged(&mut cx, DisableTag::Task(id), |this, cx| {
+                for s in &f.stmts {
+                    this.lower_stmt(cx, s, &mut waits)?;
+                }
+                Ok(())
+            })?;
+        } else {
+            for s in &f.stmts {
+                self.lower_stmt(&mut cx, s, &mut waits)?;
+            }
         }
         if let Some(exit) = cx.exit {
             // Every return comes here: the value, then the outputs.
@@ -488,9 +498,125 @@ impl<'a, 't> Elab<'a, 't> {
         Ok(())
     }
 
+    /// Lower `f` inside markers that let `disable tag` leave it.
+    fn tagged(
+        &mut self,
+        cx: &mut Cx<'a>,
+        tag: DisableTag,
+        f: impl FnOnce(&mut Self, &mut Cx<'a>) -> EResult<()>,
+    ) -> EResult<()> {
+        let exit = cx.b.new_block();
+        cx.b.effect(Op::BlockEnter { tag, exit }, "");
+        f(self, cx)?;
+        cx.b.terminate(Terminator::Jump(exit, vec![]));
+        cx.b.switch_to(exit);
+        cx.b.effect(Op::BlockLeave(tag), "");
+        Ok(())
+    }
+
+    /// What `disable name` names: a named block (searched from the current
+    /// block outwards, or hierarchically) or a task.
+    fn disable_target(&mut self, cx: &Cx<'a>, e: &Expr<'a>) -> EResult<DisableTag> {
+        if let Expr::Ident(n) = e {
+            let mut s = cx.block_scope;
+            while let Some(id) = s {
+                if let Some(Sym::Scope(b)) = self.scopes[id.0 as usize].syms.get(n) {
+                    return Ok(DisableTag::Block(*b));
+                }
+                s = self.d.scopes[id.0 as usize].parent;
+            }
+            match self.lookup_cx(Some(cx), n) {
+                Some(Sym::Func(f)) => return Ok(DisableTag::Task(f)),
+                Some(Sym::Scope(b)) => return Ok(DisableTag::Block(b)),
+                _ => {}
+            }
+        }
+        if let Expr::Member { base, name } = e {
+            let parent = match &**base {
+                Expr::Ident(_) => self.disable_target(cx, base).ok().and_then(|t| match t {
+                    DisableTag::Block(b) => Some(b),
+                    _ => None,
+                }),
+                _ => None,
+            }
+            .or_else(|| self.hier_scope(Some(cx), base));
+            if let Some(p) = parent {
+                match self.lookup_child(p, name) {
+                    Some(Sym::Scope(b)) => return Ok(DisableTag::Block(b)),
+                    Some(Sym::Func(f)) => return Ok(DisableTag::Task(f)),
+                    _ => {}
+                }
+            }
+        }
+        if let Some(s) = self.hier_scope(Some(cx), e) {
+            return Ok(DisableTag::Block(s));
+        }
+        Err(self.error(
+            e.at(),
+            format!("Can't find definition of block or task: '{}'", e.at()),
+        ))
+    }
+
+    /// Make the scopes of the named blocks in `s` ahead of lowering it, so
+    /// `disable` can name a block that comes later.
+    fn predeclare_blocks(&mut self, parent: ScopeId, s: &Stmt<'a>) {
+        let inner = |this: &mut Self, label: &'a str| {
+            let unit = this.d.scopes[this.cur.0 as usize].unit;
+            if let Some(Sym::Scope(b)) = this.scopes[parent.0 as usize].syms.get(label) {
+                return *b;
+            }
+            let b = this.new_scope(label, Some(parent), None, Some(parent), unit, &[]);
+            this.scopes[parent.0 as usize].syms.insert(label, Sym::Scope(b));
+            b
+        };
+        match s {
+            Stmt::Block {
+                label: Some(l),
+                stmts,
+                ..
+            } => {
+                let b = inner(self, l);
+                stmts.iter().for_each(|x| self.predeclare_blocks(b, x));
+            }
+            Stmt::Labeled { label, stmt } => {
+                let b = inner(self, label);
+                match &**stmt {
+                    Stmt::Block { stmts, .. } => {
+                        stmts.iter().for_each(|x| self.predeclare_blocks(b, x));
+                    }
+                    other => self.predeclare_blocks(b, other),
+                }
+            }
+            Stmt::Block { stmts, .. } => stmts.iter().for_each(|x| self.predeclare_blocks(parent, x)),
+            Stmt::If { then, els, .. } => {
+                self.predeclare_blocks(parent, then);
+                if let Some(e) = els {
+                    self.predeclare_blocks(parent, e);
+                }
+            }
+            Stmt::Case { items, .. } => items.iter().for_each(|i| self.predeclare_blocks(parent, &i.stmt)),
+            Stmt::For { body, .. }
+            | Stmt::Foreach { body, .. }
+            | Stmt::While { body, .. }
+            | Stmt::DoWhile { body, .. }
+            | Stmt::Repeat { body, .. }
+            | Stmt::Forever { body, .. }
+            | Stmt::Timed { stmt: body, .. }
+            | Stmt::Wait { stmt: body, .. } => self.predeclare_blocks(parent, body),
+            _ => {}
+        }
+    }
+
     /// A scope for a named block, inside the enclosing named block or the module.
     fn block_scope(&mut self, cx: &Cx<'a>, label: &'a str) -> ScopeId {
         let parent = cx.block_scope.unwrap_or(self.cur);
+        // Made ahead by `predeclare_blocks`?
+        if let Some(Sym::Scope(s)) = self.scopes[parent.0 as usize].syms.get(label)
+            && self.d.scopes[s.0 as usize].module.is_none()
+            && self.d.scopes[s.0 as usize].parent == Some(parent)
+        {
+            return *s;
+        }
         let unit = self.d.scopes[self.cur.0 as usize].unit;
         let s = self.new_scope(label, Some(parent), None, Some(parent), unit, &[]);
         self.scopes[parent.0 as usize]
@@ -560,16 +686,15 @@ impl<'a, 't> Elab<'a, 't> {
         match s {
             Stmt::Null(_) => Ok(()),
             // `name: begin ... end` is the same as `begin : name ... end`.
-            Stmt::Labeled { label, stmt } => match &**stmt {
-                Stmt::Block { label: None, .. } => {
-                    let scope = self.block_scope(cx, label);
-                    let saved = cx.block_scope.replace(scope);
-                    let r = self.lower_stmt(cx, stmt, waits);
-                    cx.block_scope = saved;
-                    r
-                }
-                _ => self.lower_stmt(cx, stmt, waits),
-            },
+            Stmt::Labeled { label, stmt } => {
+                let scope = self.block_scope(cx, label);
+                let saved = cx.block_scope.replace(scope);
+                let r = self.tagged(cx, DisableTag::Block(scope), |this, cx| {
+                    this.lower_stmt(cx, stmt, waits)
+                });
+                cx.block_scope = saved;
+                r
+            }
             Stmt::Block {
                 label,
                 kw,
@@ -578,11 +703,16 @@ impl<'a, 't> Elab<'a, 't> {
                 end,
             } => {
                 let saved = cx.block_scope;
-                if let Some(l) = label {
-                    let scope = self.block_scope(cx, l);
-                    cx.block_scope = Some(scope);
-                }
-                let r = self.lower_block(cx, kw, decls, stmts, end, waits);
+                let r = match label {
+                    Some(l) => {
+                        let scope = self.block_scope(cx, l);
+                        cx.block_scope = Some(scope);
+                        self.tagged(cx, DisableTag::Block(scope), |this, cx| {
+                            this.lower_block(cx, kw, decls, stmts, end, waits)
+                        })
+                    }
+                    None => self.lower_block(cx, kw, decls, stmts, end, waits),
+                };
                 cx.block_scope = saved;
                 r
             }
@@ -834,7 +964,18 @@ impl<'a, 't> Elab<'a, 't> {
                 Ok(())
             }
             Stmt::Trigger { op, .. } => Err(self.not_yet(op, "non-blocking event triggers")),
-            Stmt::Disable { kw, .. } => Err(self.not_yet(kw, "disable")),
+            Stmt::Disable { kw, target: None } => {
+                cx.b.effect(Op::DisableFork, kw);
+                Ok(())
+            }
+            Stmt::Disable { kw, target: Some(t) } => {
+                let tag = self.disable_target(cx, t)?;
+                let resume = cx.b.new_block();
+                cx.b.terminate(Terminator::Disable { tag, resume });
+                cx.b.switch_to(resume);
+                let _ = kw;
+                Ok(())
+            }
             Stmt::Return { kw, value } => {
                 if !cx.is_func {
                     return Err(self.error(kw, "return outside a function or task"));

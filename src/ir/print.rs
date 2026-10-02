@@ -186,6 +186,9 @@ impl BodyFmt<'_, '_> {
             Op::LoadRange { var, start, len } => {
                 format!("load {}[%{} +: {len}]", self.var(*var), start.0)
             }
+            Op::BlockEnter { tag, exit } => format!("enter {tag:?} exit bb{}", exit.0),
+            Op::BlockLeave(tag) => format!("leave {tag:?}"),
+            Op::DisableFork => "disable fork".into(),
             Op::Tuple(v) => format!("tuple ({})", Self::vals(v)),
             Op::ArrayElem { value, index } => format!("elem %{}[%{}]", value.0, index.0),
             Op::ArraySlice { value, start, len } => {
@@ -239,6 +242,7 @@ impl BodyFmt<'_, '_> {
                 format!("fork [{}] join.{join:?} -> bb{}", c.join(", "), resume.0)
             }
             Terminator::EndThread => "end_thread".into(),
+            Terminator::Disable { tag, resume } => format!("disable {tag:?} -> bb{}", resume.0),
             Terminator::Finish(k) => format!("finish {k:?}"),
             Terminator::Unreachable => "unreachable".into(),
         }

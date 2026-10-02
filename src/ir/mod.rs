@@ -379,6 +379,13 @@ pub enum Op {
     // Strings. `Concat`, `Repl`, `Mux` and the comparisons also work on
     // strings when their operands or result are strings; `Convert` turns
     // integral values into strings and back (LRM 6.16).
+    /// Entering a named block or task body that `disable` can name; `exit`
+    /// is where a disabled execution continues (it starts with the matching
+    /// `BlockLeave`).
+    BlockEnter { tag: DisableTag, exit: BlockId },
+    BlockLeave(DisableTag),
+    /// `disable fork`: end every process this one started, and theirs.
+    DisableFork,
     /// The values, in order, as an array value (a [`Type::Tuple`]).
     Tuple(Vec<Val>),
     /// Element `index` (linear) of an array value.
@@ -395,6 +402,13 @@ pub enum Op {
         format: FormatId,
         args: Vec<Val>,
     },
+}
+
+/// What `disable` names: a named block (by its scope) or a task.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DisableTag {
+    Block(ScopeId),
+    Task(FuncId),
 }
 
 /// The built-in string methods (LRM 6.16). Those that change the string
@@ -464,6 +478,10 @@ pub enum Terminator {
     },
     /// End of a forked child thread.
     EndThread,
+    /// `disable` (LRM 9.6.2): processes started inside `tag` end; ones
+    /// executing inside it continue after it. If this one is not inside
+    /// it, it continues at `resume`.
+    Disable { tag: DisableTag, resume: BlockId },
     /// `$finish`, `$stop` or `$fatal`: end the simulation.
     Finish(FinishKind),
     Unreachable,

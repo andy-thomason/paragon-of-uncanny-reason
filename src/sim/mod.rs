@@ -87,6 +87,12 @@ struct Thread<'d, 'a> {
     live_children: usize,
     /// How this thread is waiting for its children.
     join: Option<Join>,
+    /// The named blocks and task bodies it is executing: what, the frame
+    /// depth it was entered at, and where a `disable` continues.
+    blocks: Vec<(DisableTag, usize, BlockId)>,
+    /// Blocks its ancestors were executing when they started it: disabling
+    /// one ends this thread.
+    inherited: Vec<DisableTag>,
 }
 
 /// A thread waiting on design state.
@@ -103,7 +109,8 @@ type NbaWrite = (VarId, Option<i64>, Option<(i64, u32)>, Value);
 /// Something due at a future time.
 #[derive(Clone, Copy)]
 enum Wake {
-    Thread(ThreadId),
+    /// A delayed thread, with its epoch when it was delayed.
+    Thread(ThreadId, u64),
     /// Toggle clock `n` of [`Simulator::clocks`].
     Clock(usize),
 }
@@ -114,7 +121,7 @@ pub struct Simulator<'d, 'a> {
     threads: Vec<Thread<'d, 'a>>,
     epochs: Vec<u64>,
     active: VecDeque<ThreadId>,
-    inactive: VecDeque<ThreadId>,
+    inactive: VecDeque<(ThreadId, u64)>,
     future: BTreeMap<(u64, u64), Wake>,
     /// Clocks driven from outside the design: the variable and its half period.
     clocks: Vec<(VarId, u64)>,
@@ -211,6 +218,8 @@ impl<'d, 'a> Simulator<'d, 'a> {
             parent,
             live_children: 0,
             join: None,
+            blocks: Vec::new(),
+            inherited: Vec::new(),
         });
         self.epochs.push(0);
         self.threads.len() - 1
@@ -288,7 +297,10 @@ impl<'d, 'a> Simulator<'d, 'a> {
                 }
             }
             if !self.inactive.is_empty() {
-                self.active.extend(self.inactive.drain(..));
+                let ready: Vec<(ThreadId, u64)> = self.inactive.drain(..).collect();
+                for (t, e) in ready {
+                    self.resume_delayed(t, e);
+                }
                 continue;
             }
             if !self.nba.is_empty() {
@@ -316,7 +328,7 @@ impl<'d, 'a> Simulator<'d, 'a> {
                 }
                 self.future.remove(&(w, s));
                 match wake {
-                    Wake::Thread(t) => self.active.push_back(t),
+                    Wake::Thread(t, e) => self.resume_delayed(t, e),
                     Wake::Clock(n) => {
                         self.steps += 1;
                         if self.steps > self.max_steps {
@@ -333,6 +345,15 @@ impl<'d, 'a> Simulator<'d, 'a> {
                     }
                 }
             }
+        }
+    }
+
+    /// Run a thread whose delay is over, unless it was disabled meanwhile.
+    fn resume_delayed(&mut self, t: ThreadId, epoch: u64) {
+        if self.epochs[t] == epoch && self.threads[t].state == State::Waiting {
+            self.epochs[t] += 1;
+            self.threads[t].state = State::Ready;
+            self.active.push_back(t);
         }
     }
 
@@ -671,6 +692,24 @@ impl<'d, 'a> Simulator<'d, 'a> {
                 sink.report(*severity, &msg, inst.at, self.time);
                 None
             }
+            Op::BlockEnter { tag, exit } => {
+                let depth = self.threads[t].frames.len();
+                self.threads[t].blocks.push((*tag, depth, *exit));
+                None
+            }
+            Op::BlockLeave(tag) => {
+                let b = &mut self.threads[t].blocks;
+                if let Some(k) = b.iter().rposition(|x| x.0 == *tag) {
+                    b.truncate(k);
+                }
+                None
+            }
+            Op::DisableFork => {
+                for d in self.descendants(t) {
+                    self.finish_thread(d);
+                }
+                None
+            }
             Op::Sformat { format, args } => {
                 let vals: Vec<(Value, &Type)> = args
                     .iter()
@@ -791,6 +830,8 @@ impl<'d, 'a> Simulator<'d, 'a> {
             Terminator::Return(v) => {
                 let value = v.map(|v| self.val(t, v));
                 let frame = self.threads[t].frames.pop().unwrap();
+                let depth = self.threads[t].frames.len();
+                self.threads[t].blocks.retain(|b| b.1 <= depth);
                 if self.threads[t].frames.is_empty() {
                     self.finish_thread(t);
                     return Flow::Suspend;
@@ -813,9 +854,12 @@ impl<'d, 'a> Simulator<'d, 'a> {
             } => {
                 let f = self.threads[t].frames.last().unwrap();
                 let (body, scope, slots, vals) = (f.body, f.scope, f.slots.clone(), f.vals.clone());
+                let mut inherited = self.threads[t].inherited.clone();
+                inherited.extend(self.threads[t].blocks.iter().map(|b| b.0));
                 for c in children {
                     let ct =
                         self.spawn(body, scope, *c, Some(slots.clone()), vals.clone(), Some(t));
+                    self.threads[ct].inherited = inherited.clone();
                     self.active.push_back(ct);
                 }
                 self.threads[t].live_children += children.len();
@@ -833,6 +877,15 @@ impl<'d, 'a> Simulator<'d, 'a> {
             Terminator::EndThread => {
                 self.finish_thread(t);
                 Flow::Suspend
+            }
+            Terminator::Disable { tag, resume } => {
+                self.jump(t, &(*resume, vec![]));
+                self.disable(*tag, t);
+                if self.threads[t].state == State::Done {
+                    Flow::Suspend
+                } else {
+                    Flow::Continue
+                }
             }
             Terminator::Finish(k) => Flow::End(match k {
                 FinishKind::Finish => End::Finish,
@@ -854,14 +907,14 @@ impl<'d, 'a> Simulator<'d, 'a> {
             Wait::Delay(v) => {
                 let n = self.val(t, *v).bits().map_or(0, |b| b.to_u64());
                 if n == 0 {
-                    self.inactive.push_back(t);
+                    self.inactive.push_back((t, epoch));
                 } else {
                     self.seq += 1;
                     self.future
-                        .insert((self.time + n, self.seq), Wake::Thread(t));
+                        .insert((self.time + n, self.seq), Wake::Thread(t, epoch));
                 }
             }
-            Wait::Inactive => self.inactive.push_back(t),
+            Wait::Inactive => self.inactive.push_back((t, epoch)),
             Wait::AnyChange(vars) => {
                 for v in vars {
                     self.waiters[v.0 as usize].push(Waiter {
@@ -900,6 +953,53 @@ impl<'d, 'a> Simulator<'d, 'a> {
             // Delayed threads are woken by the scheduler, not by waiters.
             self.threads[t].state = State::Waiting;
         }
+    }
+
+    /// `disable tag`, executed by thread `me`.
+    fn disable(&mut self, tag: DisableTag, me: ThreadId) {
+        for u in 0..self.threads.len() {
+            if self.threads[u].state == State::Done {
+                continue;
+            }
+            if self.threads[u].inherited.contains(&tag) {
+                self.finish_thread(u);
+                continue;
+            }
+            let Some(k) = self.threads[u].blocks.iter().position(|b| b.0 == tag) else {
+                continue;
+            };
+            // Unwind to the block's exit, which leaves it.
+            let (_, depth, exit) = self.threads[u].blocks[k];
+            let th = &mut self.threads[u];
+            th.blocks.truncate(k + 1);
+            th.frames.truncate(depth);
+            th.join = None;
+            if let Some(f) = th.frames.last_mut() {
+                f.block = exit;
+                f.ip = 0;
+            }
+            if u != me && th.state == State::Waiting {
+                self.epochs[u] += 1;
+                self.threads[u].state = State::Ready;
+                self.active.push_back(u);
+            }
+        }
+    }
+
+    /// Every thread started by `t`, and by those, still running.
+    fn descendants(&self, t: ThreadId) -> Vec<ThreadId> {
+        (0..self.threads.len())
+            .filter(|&u| {
+                let mut p = self.threads[u].parent;
+                while let Some(x) = p {
+                    if x == t {
+                        return self.threads[u].state != State::Done;
+                    }
+                    p = self.threads[x].parent;
+                }
+                false
+            })
+            .collect()
     }
 
     fn finish_thread(&mut self, t: ThreadId) {

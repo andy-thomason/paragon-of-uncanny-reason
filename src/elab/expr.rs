@@ -679,7 +679,7 @@ impl<'a, 't> Elab<'a, 't> {
     }
 
     /// If `e` names an instance or generate block, that scope.
-    fn hier_scope(&mut self, cx: Option<&Cx<'a>>, e: &Expr<'a>) -> Option<ScopeId> {
+    pub(crate) fn hier_scope(&mut self, cx: Option<&Cx<'a>>, e: &Expr<'a>) -> Option<ScopeId> {
         match e {
             Expr::Ident(n) => match self.lookup_cx(cx, n) {
                 Some(Sym::Scope(s)) => Some(s),

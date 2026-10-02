@@ -629,6 +629,8 @@ fn eval_body(
         .collect();
     let mut block = BlockId(0);
     let mut incoming: Vec<Value> = args;
+    // Named blocks being executed, for `disable`.
+    let mut blocks: Vec<(DisableTag, BlockId)> = Vec::new();
     for _ in 0..10_000_000 {
         let b = &body.blocks[block.0 as usize];
         for (p, v) in b.params.iter().zip(incoming.drain(..)) {
@@ -647,6 +649,16 @@ fn eval_body(
                 )
             };
             let r = match &inst.op {
+                Op::BlockEnter { tag, exit } => {
+                    blocks.push((*tag, *exit));
+                    None
+                }
+                Op::BlockLeave(tag) => {
+                    if let Some(k) = blocks.iter().rposition(|b| b.0 == *tag) {
+                        blocks.truncate(k);
+                    }
+                    None
+                }
                 Op::LoadSlot(s) => Some(slots[s.0 as usize].clone()),
                 Op::StoreSlot { slot, part, value } => {
                     let v = vals[value.0 as usize].clone().ok_or(NotConst::NoResult)?;
@@ -741,6 +753,16 @@ fn eval_body(
                 let (t, args) = if c { then } else { els };
                 incoming = args.iter().map(take).collect::<Result<_, _>>()?;
                 block = *t;
+            }
+            Terminator::Disable { tag, resume } => {
+                block = match blocks.iter().rposition(|b| b.0 == *tag) {
+                    Some(k) => {
+                        let exit = blocks[k].1;
+                        blocks.truncate(k + 1);
+                        exit
+                    }
+                    None => *resume,
+                };
             }
             _ => return Err(NotConst::NoResult),
         }
