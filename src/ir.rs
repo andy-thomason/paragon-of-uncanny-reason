@@ -1,24 +1,36 @@
-//! Elaborated intermediate representation. See `docs/design/20-architecture.md`.
+//! Linear intermediate representation. See `docs/design/20-architecture.md` §2.
 //!
-//! Elaboration lowers the syntax tree ([`crate::ast`]) into this IR. Where the
-//! AST records what was written, the IR records what it means:
+//! Elaboration lowers the syntax tree ([`crate::ast`]) straight into this IR.
+//! The IR is linear:
 //!
-//! - **Resolved.** Names are IDs ([`VarId`], [`ScopeId`], [`FuncId`]);
-//!   parameters, generate blocks and the hierarchy are evaluated.
-//! - **Typed.** Every expression has a [`TypeId`]. The IEEE 1800 width and
-//!   signedness rules (11.6–11.8) are applied once, during elaboration, and
-//!   every extension or truncation is an explicit node. Back ends then never
-//!   need context-determined width logic.
-//! - **Normalised.** Fewer forms: `for` and `foreach` become `while`, a select
-//!   is always "offset and width", packed structs are bit vectors, and a
-//!   continuous assignment is a process.
+//! - Each process and function body is a control-flow graph of basic
+//!   [`Block`]s. A block is a list of three-address [`Inst`]s ending in one
+//!   [`Terminator`].
+//! - Instructions compute SSA [`Val`]ues: each value is defined once, and
+//!   every value has a type. Values flowing between blocks are passed as
+//!   block parameters (no phi nodes).
+//! - A process can suspend: a delay, an event control or `wait` is a
+//!   [`Terminator::Suspend`] that names the block to resume at. Every resume
+//!   point is therefore an explicit block, which both the interpreter and the
+//!   code generator (a state machine over blocks) need.
 //!
-//! The IR is shared by the reference interpreter and the code generator, so
-//! the two can be checked against each other.
+//! There are three kinds of storage:
+//!
+//! | Storage | Lives | Accessed by |
+//! |---|---|---|
+//! | [`VarId`]: design state (nets, static variables) | the whole simulation | `Load`/`Store`/`NbaStore`; the scheduler watches these |
+//! | [`SlotId`]: a frame slot (automatic locals, loop counters) | one activation of a body | `LoadSlot`/`StoreSlot` |
+//! | [`Val`]: an SSA temporary | one block, or passed on as a block parameter | operands |
+//!
+//! Locals start as slots so lowering stays simple; a later pass can promote
+//! them to SSA values.
+//!
+//! The IEEE 1800 width and signedness rules (11.6–11.8) are applied during
+//! lowering: every extension and truncation is an explicit `Resize`, and every
+//! select is "offset and width". Back ends never repeat that logic.
 //!
 //! As in the AST, names and diagnostic sites are `&'a str` slices of source
-//! text, so positions still come from [`SourceMap::locate`](crate::source::SourceMap::locate).
-//! Everything else lives in index-addressed tables on [`Design`].
+//! text, so positions come from [`SourceMap::locate`](crate::source::SourceMap::locate).
 
 // ---------------------------------------------------------------- ids
 
@@ -31,21 +43,27 @@ macro_rules! id {
 }
 
 id!(
-    /// A variable, net or parameter in [`Design::vars`].
+    /// Design state: a net or static variable in [`Design::vars`].
     VarId,
     /// A type in [`Design::types`].
     TypeId,
-    /// An instance or named block in [`Design::scopes`].
+    /// An instance, generate block or named block in [`Design::scopes`].
     ScopeId,
-    /// A process in [`Design::procs`].
-    ProcId,
     /// A function or task in [`Design::funcs`].
-    FuncId
+    FuncId,
+    /// A block within a [`Body`].
+    BlockId,
+    /// An SSA value within a [`Body`].
+    Val,
+    /// A frame slot (automatic local) within a [`Body`].
+    SlotId,
+    /// A display format in [`Design::formats`].
+    FormatId
 );
 
 // ---------------------------------------------------------------- design
 
-/// An elaborated design: the whole instance tree under one top module.
+/// An elaborated, flattened design.
 #[derive(Clone, Debug, Default)]
 pub struct Design<'a> {
     pub scopes: Vec<Scope<'a>>,
@@ -53,70 +71,48 @@ pub struct Design<'a> {
     pub types: Vec<Type<'a>>,
     pub procs: Vec<Process<'a>>,
     pub funcs: Vec<Func<'a>>,
+    /// Parsed `$display`-style format strings.
+    pub formats: Vec<Format<'a>>,
     pub top: Option<ScopeId>,
     /// Time precision as a power of ten of seconds (-9 is 1 ns).
     pub precision: i8,
 }
 
-/// An instance, generate block or named block. Scopes give hierarchical
-/// names (for `%m`, tracing and hierarchical references) and own variables.
+/// An instance, generate block, named block or package. Scopes exist for
+/// names (`%m`, tracing, hierarchical references); they do not own code.
 #[derive(Clone, Debug)]
 pub struct Scope<'a> {
-    /// The instance or block name, or `""` for an unnamed block.
     pub name: &'a str,
     pub parent: Option<ScopeId>,
-    pub kind: ScopeKind<'a>,
-    /// Time unit of the scope, as a power of ten of seconds.
+    /// The module name, for an instance.
+    pub module: Option<&'a str>,
+    /// Time unit as a power of ten of seconds.
     pub unit: i8,
 }
 
-#[derive(Clone, Debug)]
-pub enum ScopeKind<'a> {
-    /// An instance of this module (the module name).
-    Instance(&'a str),
-    /// A generate block; `index` is set for a block inside a generate loop.
-    Generate {
-        index: Option<i64>,
-    },
-    /// A named `begin`/`fork` block.
-    Block,
-    Package,
-}
-
-/// Storage: a variable, net, or elaborated parameter.
+/// A net or static variable. Ports are not separate: a port connection makes
+/// the port and the connected net the same `VarId`, or adds a continuous
+/// assignment process between them.
 #[derive(Clone, Debug)]
 pub struct Var<'a> {
     pub name: &'a str,
     pub scope: ScopeId,
     pub ty: TypeId,
     pub kind: VarKind,
-    /// Initial value, for declarations with `= value`.
-    pub init: Option<Expr>,
-    /// Where it was declared.
+    /// Value at time 0, before any process runs.
+    pub init: Option<Bits>,
     pub at: &'a str,
 }
 
-#[derive(Clone, Debug)]
-pub enum VarKind {
-    /// A variable: `logic`, `int`, `reg`, a class handle, ...
-    Variable { lifetime: Lifetime },
-    /// A net. Multiple drivers are combined by `resolution`.
-    Net { resolution: NetResolution },
-    /// A parameter or localparam, already evaluated.
-    Param(Value),
-    /// A module port. It aliases the variable or net connected to it.
-    Port { dir: PortDir },
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Lifetime {
-    Static,
-    Automatic,
+pub enum VarKind {
+    Variable,
+    /// A net. When it has several drivers they are combined by the resolution.
+    Net(NetResolution),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NetResolution {
-    /// `wire`, `tri`, `uwire`.
     Wire,
     WiredAnd,
     WiredOr,
@@ -126,189 +122,321 @@ pub enum NetResolution {
     Supply1,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PortDir {
-    Input,
-    Output,
-    Inout,
-    Ref,
-}
-
 // ---------------------------------------------------------------- types
 
-/// A resolved type. Packed types are always flattened to [`Type::Bits`].
+/// A resolved type. Every packed type is [`Type::Bits`].
 #[derive(Clone, Debug, PartialEq)]
 pub enum Type<'a> {
-    /// Any packed integral type: `logic [7:0]`, `int`, `bit`, a packed struct
-    /// or enum. Bit 0 is the least significant bit.
     Bits {
         width: u32,
         signed: bool,
-        /// 4-state (`logic`, `reg`, `integer`) or 2-state (`bit`, `int`).
         four_state: bool,
-        /// Member layout, if the type came from a packed struct or union.
+        /// Member layout, for packed structs (for `%p` and tracing).
         fields: Option<Vec<Field<'a>>>,
-        /// Value names, if the type came from an enum.
-        names: Option<Vec<(&'a str, Value)>>,
+        /// Value names, for enums (for `%p`, `.name()` and tracing).
+        names: Option<Vec<(&'a str, Bits)>>,
     },
     Real,
-    ShortReal,
     String,
     Event,
-    Chandle,
-    /// `elem name [left:right]`.
+    /// `[left:right]` unpacked array.
     Unpacked {
         elem: TypeId,
         left: i64,
         right: i64,
     },
-    /// `elem name []`.
     Dynamic {
         elem: TypeId,
     },
-    /// `elem name [$]` or `[$:max]`.
     Queue {
         elem: TypeId,
         max: Option<u32>,
     },
-    /// `elem name [key]`; `key` is `None` for `[*]`.
     Assoc {
         elem: TypeId,
         key: Option<TypeId>,
     },
-    /// An unpacked struct.
     Struct {
         fields: Vec<Field<'a>>,
     },
-    Void,
 }
 
-/// A struct or union member. For packed types `offset` is the bit offset of
-/// the member's least significant bit.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Field<'a> {
     pub name: &'a str,
     pub ty: TypeId,
+    /// Bit offset of the least significant bit, for packed members.
     pub offset: u32,
 }
 
-// ---------------------------------------------------------------- values
-
-/// A constant value.
-#[derive(Clone, Debug, PartialEq)]
-pub enum Value {
-    Bits(Bits),
-    Real(f64),
-    Str(String),
-}
-
-/// A bit vector of any width, stored as 64-bit words, least significant first.
+/// A constant bit vector, least significant 64-bit word first.
 ///
-/// 4-state bits use a second plane: where an `unknown` bit is 0, `val` holds
-/// 0 or 1; where it is 1, `val` 0 means X and `val` 1 means Z. A 2-state
-/// value has no `unknown` plane.
+/// 4-state values carry an `unknown` plane: where it is 0, `val` is the bit;
+/// where it is 1, `val` 0 means X and 1 means Z.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Bits {
     pub width: u32,
-    pub signed: bool,
     pub val: Vec<u64>,
     pub unknown: Option<Vec<u64>>,
 }
 
-// ---------------------------------------------------------------- expressions
+// ---------------------------------------------------------------- code
 
-/// A typed expression. `ty` is the type of the result after the LRM width
-/// rules have been applied.
+/// A process. Every process is a coroutine: its body loops forever (or runs
+/// once, for `initial`/`final`), suspending at [`Terminator::Suspend`].
+///
+/// `always @(posedge clk) s` lowers to
+/// `entry: suspend Edge(clk, Pos) -> body;  body: s; jump entry`.
+/// `always_comb` and `assign` lower to
+/// `entry: <compute>; suspend AnyChange(reads) -> entry`.
 #[derive(Clone, Debug)]
-pub struct Expr {
-    pub kind: ExprKind,
-    pub ty: TypeId,
+pub struct Process<'a> {
+    pub kind: ProcKind,
+    pub scope: ScopeId,
+    pub body: Body<'a>,
+    pub at: &'a str,
+}
+
+/// What a process came from. Only a hint: the body alone defines behaviour,
+/// but the scheduler can use the kind (and [`Body::reads`]) to run
+/// combinational processes in dependency order instead of as coroutines.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProcKind {
+    Initial,
+    Final,
+    Always,
+    AlwaysComb,
+    AlwaysLatch,
+    AlwaysFf,
+    ContAssign,
 }
 
 #[derive(Clone, Debug)]
-pub enum ExprKind {
-    Const(Value),
-    Var(VarId),
-    /// A bit or part select of a packed value: `width` bits from bit `lsb`.
-    /// Every form (`a[i]`, `a[7:4]`, `a[i+:4]`, `a[i-:4]`, a packed struct
-    /// member) is lowered to this, with any declared range offset applied.
+pub struct Func<'a> {
+    pub name: &'a str,
+    pub scope: ScopeId,
+    /// Arguments arrive as the entry block's parameters.
+    pub params: Vec<TypeId>,
+    pub ret: Option<TypeId>,
+    pub is_task: bool,
+    pub body: Body<'a>,
+    pub at: &'a str,
+}
+
+/// A control-flow graph.
+#[derive(Clone, Debug, Default)]
+pub struct Body<'a> {
+    /// `blocks[0]` is the entry.
+    pub blocks: Vec<Block<'a>>,
+    /// The type of each SSA value, indexed by [`Val`].
+    pub vals: Vec<TypeId>,
+    /// The type of each frame slot, indexed by [`SlotId`].
+    pub slots: Vec<TypeId>,
+    /// Design state this body reads, for sensitivity and scheduling.
+    pub reads: Vec<VarId>,
+    /// Design state this body writes.
+    pub writes: Vec<VarId>,
+}
+
+#[derive(Clone, Debug)]
+pub struct Block<'a> {
+    /// Values passed in by the jumps that reach this block.
+    pub params: Vec<Val>,
+    pub insts: Vec<Inst<'a>>,
+    pub term: Terminator,
+}
+
+/// One instruction. `dst` is the value it defines, if any.
+#[derive(Clone, Debug)]
+pub struct Inst<'a> {
+    pub dst: Option<Val>,
+    pub op: Op,
+    /// Source position, for run-time diagnostics.
+    pub at: &'a str,
+}
+
+#[derive(Clone, Debug)]
+pub enum Op {
+    // Constants and storage
+    Const(Bits),
+    ConstReal(f64),
+    ConstStr(String),
+    /// Read design state.
+    Load(VarId),
+    /// Write design state now (blocking), optionally only `width` bits from bit `lsb`.
+    Store {
+        var: VarId,
+        part: Option<Part>,
+        value: Val,
+    },
+    /// Schedule a write for the NBA region (`<=`).
+    NbaStore {
+        var: VarId,
+        part: Option<Part>,
+        value: Val,
+    },
+    /// Read or write an element of an unpacked or dynamic array in design state.
+    LoadElem {
+        var: VarId,
+        index: Val,
+    },
+    StoreElem {
+        var: VarId,
+        index: Val,
+        part: Option<Part>,
+        value: Val,
+        nba: bool,
+    },
+    LoadSlot(SlotId),
+    StoreSlot {
+        slot: SlotId,
+        part: Option<Part>,
+        value: Val,
+    },
+
+    // Bit vectors
+    Unary(UnOp, Val),
+    Binary(BinOp, Val, Val),
+    /// `width` bits of `value` from bit `lsb` (constant or computed).
     Select {
-        base: Box<Expr>,
-        lsb: Box<Expr>,
+        value: Val,
+        lsb: Val,
         width: u32,
     },
-    /// An element of an unpacked, dynamic, queue or associative array.
-    Index {
-        base: Box<Expr>,
-        index: Box<Expr>,
-    },
-    /// A member of an unpacked struct, by field position.
-    Field {
-        base: Box<Expr>,
-        field: u32,
-    },
-    Unary(UnOp, Box<Expr>),
-    Binary(BinOp, Box<Expr>, Box<Expr>),
-    /// `cond ? then : els`. With an X/Z condition the LRM merges both results.
-    Cond {
-        cond: Box<Expr>,
-        then: Box<Expr>,
-        els: Box<Expr>,
-    },
-    /// Most significant first, as written.
-    Concat(Vec<Expr>),
+    /// Most significant first.
+    Concat(Vec<Val>),
     Repl {
+        value: Val,
         count: u32,
-        expr: Box<Expr>,
     },
-    /// Change width or signedness. Inserted by elaboration wherever the LRM
-    /// implicitly extends or truncates.
+    /// Change width or signedness; the result type is the instruction's type.
     Resize {
-        expr: Box<Expr>,
-        to: TypeId,
+        value: Val,
         extend: Extend,
     },
-    /// A conversion that is not a resize: integral to real, real to integral,
-    /// or to string.
-    Convert {
-        expr: Box<Expr>,
-        to: TypeId,
+    /// `cond ? a : b` without branching. With an X/Z condition the LRM
+    /// merges the two values bit by bit.
+    Mux {
+        cond: Val,
+        then: Val,
+        els: Val,
     },
-    Inside {
-        expr: Box<Expr>,
-        set: Vec<InsideItem>,
-    },
+    /// Integral to real, real to integral, number to string.
+    Convert(Val),
+
+    // Calls and system services
     Call {
         func: FuncId,
-        args: Vec<Expr>,
+        args: Vec<Val>,
     },
+    /// Format and emit text (`$display`, `$write`, `$fdisplay`, ...).
+    Display {
+        kind: DisplayKind,
+        format: FormatId,
+        args: Vec<Val>,
+    },
+    /// A system function returning a value (`$time`, `$random`, `$clog2` at run time, ...).
     SysFunc {
         func: SysFunc,
-        args: Vec<Expr>,
+        args: Vec<Val>,
     },
+    /// `-> ev`
+    TriggerEvent(VarId),
+    /// `$error`, `$warning`, `$info`, or a failed assertion.
+    Report {
+        severity: ReportSeverity,
+        format: Option<FormatId>,
+        args: Vec<Val>,
+    },
+}
+
+/// A part of a value to write: `width` bits from bit `lsb`.
+#[derive(Clone, Copy, Debug)]
+pub struct Part {
+    pub lsb: Val,
+    pub width: u32,
+}
+
+#[derive(Clone, Debug)]
+pub enum Terminator {
+    Jump(BlockId, Vec<Val>),
+    Branch {
+        cond: Val,
+        then: (BlockId, Vec<Val>),
+        els: (BlockId, Vec<Val>),
+    },
+    /// Multi-way branch on exact values (lowered `case`). `casez`, `casex`
+    /// and `inside` are lowered to compares and branches instead.
+    Switch {
+        value: Val,
+        cases: Vec<(Bits, BlockId)>,
+        default: BlockId,
+    },
+    Return(Option<Val>),
+    /// Stop running until `wait` is satisfied, then continue at `resume`.
+    Suspend {
+        wait: Wait,
+        resume: BlockId,
+    },
+    /// Start child threads (`fork`), each a body sharing this frame's slots,
+    /// and continue at `resume` when the join condition is met.
+    Fork {
+        children: Vec<BlockId>,
+        join: Join,
+        resume: BlockId,
+    },
+    /// End of a forked child thread.
+    EndThread,
+    /// `$finish`, `$stop` or `$fatal`: end the simulation.
+    Finish(FinishKind),
+    Unreachable,
+}
+
+/// What a suspended process waits for.
+#[derive(Clone, Debug)]
+pub enum Wait {
+    /// `#delay`, in the design's precision.
+    Delay(Val),
+    /// The next time-step region with no delay (`#0`).
+    Inactive,
+    /// A change on any of these. `@(a or b)`, `@*`, `always_comb`, and
+    /// `wait (cond)` loops (which re-check `cond` after the change).
+    AnyChange(Vec<VarId>),
+    /// An edge on a single-bit value: `@(posedge clk)`. An event control on an
+    /// arbitrary expression is lowered to `AnyChange` on what it reads plus a
+    /// compare loop.
+    Edge(Vec<(VarId, Edge)>),
+    /// `@ev` on a named event.
+    Event(VarId),
+    /// `wait fork`.
+    Children,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Edge {
+    Pos,
+    Neg,
+    Both,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Join {
+    All,
+    Any,
+    None,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Extend {
     Zero,
     Sign,
-    /// Narrowing: drop the high bits.
     Truncate,
-}
-
-#[derive(Clone, Debug)]
-pub enum InsideItem {
-    Value(Expr),
-    Range(Expr, Expr),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UnOp {
-    /// `-`
     Neg,
-    /// `~`
     Not,
-    /// `!`
     LogNot,
     RedAnd,
     RedNand,
@@ -318,8 +446,7 @@ pub enum UnOp {
     RedXnor,
 }
 
-/// Binary operators. Signedness comes from the operand types, so there is
-/// one `Lt`, not a signed and an unsigned one.
+/// Signedness comes from the operand types, so there is one `Lt`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BinOp {
     Add,
@@ -333,33 +460,30 @@ pub enum BinOp {
     Xor,
     Xnor,
     Shl,
-    /// `>>`: logical shift right.
     Shr,
-    /// `>>>`: arithmetic when the left operand is signed.
     AShr,
     Eq,
     Ne,
-    /// `===`
     CaseEq,
-    /// `!==`
     CaseNe,
-    /// `==?`
     WildEq,
-    /// `!=?`
     WildNe,
     Lt,
     Le,
     Gt,
     Ge,
-    LogAnd,
-    LogOr,
-    /// `->`
-    LogImplies,
-    /// `<->`
-    LogEquiv,
 }
 
-/// System functions that return a value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DisplayKind {
+    /// `$display`: ends with a newline.
+    Display,
+    /// `$write`: no newline.
+    Write,
+    /// `$strobe`: at the end of the time step.
+    Strobe,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SysFunc {
     Time,
@@ -368,265 +492,43 @@ pub enum SysFunc {
     Random,
     Urandom,
     UrandomRange,
-    Signed,
-    Unsigned,
-    Clog2,
     Countones,
     Onehot,
     Onehot0,
     IsUnknown,
-    Sformatf,
     TestPlusargs,
     ValuePlusargs,
-    Itor,
-    Rtoi,
     RealToBits,
     BitsToReal,
-    Fopen,
-    Feof,
-    Fgetc,
-}
-
-// ---------------------------------------------------------------- statements
-
-/// Something that can be assigned to.
-#[derive(Clone, Debug)]
-pub enum LValue {
-    Var(VarId),
-    Select {
-        base: Box<LValue>,
-        lsb: Expr,
-        width: u32,
-    },
-    Index {
-        base: Box<LValue>,
-        index: Expr,
-    },
-    Field {
-        base: Box<LValue>,
-        field: u32,
-    },
-    /// `{a, b} = ...`, most significant first.
-    Concat(Vec<LValue>),
-}
-
-#[derive(Clone, Debug)]
-pub enum Stmt<'a> {
-    Block(Vec<Stmt<'a>>),
-    /// `lhs = rhs` (blocking) or `lhs <= rhs` (non-blocking). Compound
-    /// assignments (`+=`) are lowered to plain ones.
-    Assign {
-        lhs: LValue,
-        rhs: Expr,
-        kind: AssignKind,
-        delay: Option<Delay>,
-    },
-    If {
-        cond: Expr,
-        then: Box<Stmt<'a>>,
-        els: Option<Box<Stmt<'a>>>,
-        check: CaseCheck,
-    },
-    Case {
-        kind: CaseKind,
-        expr: Expr,
-        items: Vec<(Vec<CaseLabel>, Stmt<'a>)>,
-        default: Option<Box<Stmt<'a>>>,
-        check: CaseCheck,
-    },
-    /// All loops are `while`, `do while`, `repeat` or `forever`; `for` and
-    /// `foreach` become a block with a `while`.
-    While {
-        cond: Expr,
-        body: Box<Stmt<'a>>,
-        test_first: bool,
-    },
-    Repeat {
-        count: Expr,
-        body: Box<Stmt<'a>>,
-    },
-    Forever(Box<Stmt<'a>>),
-    Break,
-    Continue,
-    Return(Option<Expr>),
-    /// `#delay`.
-    Delay(Delay),
-    /// `@(...)`: suspend until one of the triggers fires.
-    WaitEvent(Vec<Trigger>),
-    /// `wait (cond)`.
-    Wait(Expr),
-    /// `wait fork`.
-    WaitFork,
-    Fork {
-        join: Join,
-        branches: Vec<Stmt<'a>>,
-    },
-    /// `-> ev`.
-    TriggerEvent(VarId),
-    /// `disable name`.
-    Disable(ScopeId),
-    DisableFork,
-    Call {
-        func: FuncId,
-        args: Vec<Expr>,
-    },
-    SysTask {
-        task: SysTask,
-        args: Vec<Expr>,
-        at: &'a str,
-    },
-    /// An immediate assertion. `pass` and `fail` are the action blocks.
-    Assert {
-        cond: Expr,
-        pass: Option<Box<Stmt<'a>>>,
-        fail: Option<Box<Stmt<'a>>>,
-        at: &'a str,
-    },
-    Force {
-        lhs: LValue,
-        rhs: Expr,
-    },
-    Release(LValue),
-    Nop,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum AssignKind {
-    Blocking,
-    NonBlocking,
-}
-
-/// A delay, already scaled to the design's time precision.
-#[derive(Clone, Debug)]
-pub enum Delay {
-    Const(u64),
-    Expr(Expr),
+pub enum ReportSeverity {
+    Info,
+    Warning,
+    Error,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CaseKind {
-    /// `case`: 4-state equality.
-    Exact,
-    /// `casez`: Z and `?` are wildcards.
-    Z,
-    /// `casex`: X, Z and `?` are wildcards.
-    X,
-    /// `case ... inside`.
-    Inside,
-}
-
-#[derive(Clone, Debug)]
-pub enum CaseLabel {
-    Value(Expr),
-    Range(Expr, Expr),
-}
-
-/// `unique`, `unique0` and `priority` checks on `if` and `case`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CaseCheck {
-    None,
-    Unique,
-    Unique0,
-    Priority,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Join {
-    All,
-    Any,
-    None,
-}
-
-/// One entry in an event control.
-#[derive(Clone, Debug)]
-pub struct Trigger {
-    pub edge: Edge,
-    pub expr: Expr,
-    pub iff: Option<Expr>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Edge {
-    /// Any change.
-    Any,
-    Pos,
-    Neg,
-    /// `edge`: either edge.
-    Both,
-}
-
-/// System tasks: called for their effect.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SysTask {
-    Display,
-    Write,
-    Strobe,
-    Monitor,
-    Fdisplay,
-    Fwrite,
+pub enum FinishKind {
     Finish,
     Stop,
     Fatal,
-    Error,
-    Warning,
-    Info,
-    Readmemh,
-    Readmemb,
-    Writememh,
-    Fclose,
-    Dumpfile,
-    Dumpvars,
 }
 
-// ---------------------------------------------------------------- processes
-
-/// A process: something the scheduler runs. Continuous assignments are
-/// processes too, so the scheduler sees one kind of thing.
+/// A parsed format string: literal text and `%` conversions.
 #[derive(Clone, Debug)]
-pub struct Process<'a> {
-    pub kind: ProcKind,
-    pub scope: ScopeId,
-    pub body: Stmt<'a>,
-    /// When the process wakes. For `always_comb`, `@*` and continuous
-    /// assignments, elaboration computes this from what the body reads.
-    pub sensitivity: Sensitivity,
-    pub at: &'a str,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ProcKind {
-    Initial,
-    Final,
-    Always,
-    AlwaysComb,
-    AlwaysLatch,
-    AlwaysFf,
-    /// `assign lhs = rhs;`, or a net declaration's initialiser.
-    ContAssign,
+pub struct Format<'a> {
+    pub pieces: Vec<FormatPiece<'a>>,
 }
 
 #[derive(Clone, Debug)]
-pub enum Sensitivity {
-    /// Runs once (`initial`, `final`), or its body contains its own timing
-    /// controls (`always begin @(...) ... end`).
-    None,
-    /// An explicit event control at the top of the process.
-    Events(Vec<Trigger>),
-    /// Implicit: wake when any of these variables changes.
-    Reads(Vec<VarId>),
-}
-
-/// A function or task, elaborated once per scope it is declared in.
-#[derive(Clone, Debug)]
-pub struct Func<'a> {
-    pub name: &'a str,
-    pub scope: ScopeId,
-    /// `None` for a task or a void function.
-    pub ret: Option<TypeId>,
-    /// Arguments, in order. Each is a variable in the function's scope.
-    pub args: Vec<(VarId, PortDir)>,
-    pub body: Stmt<'a>,
-    pub lifetime: Lifetime,
-    pub is_task: bool,
-    pub at: &'a str,
+pub enum FormatPiece<'a> {
+    Text(&'a str),
+    /// `%d`, `%0h`, `%5b`, `%s`, `%t`, `%m`, ... consuming the next argument (except `%m`).
+    Conv {
+        spec: char,
+        width: Option<u32>,
+        zero_pad: bool,
+    },
 }
