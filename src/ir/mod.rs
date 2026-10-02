@@ -83,6 +83,8 @@ pub struct Design<'a> {
     /// Input ports of the top modules, which a test bench may drive.
     pub top_inputs: Vec<VarId>,
     pub classes: Vec<Class<'a>>,
+    /// The built-in `process` class, once used.
+    pub process_class: Option<ClassId>,
     /// The name of the test bench the tops are instantiated in, if any: it
     /// prefixes hierarchical names (`%m` is `top.t` under Verilator's).
     pub root_name: Option<String>,
@@ -421,6 +423,8 @@ pub enum Op {
     /// A virtual method call: `args[0]` is the object, whose class's
     /// vtable gives the function for `slot`.
     VCall { slot: u32, args: Vec<Val> },
+    /// The built-in `process` class (LRM 9.7).
+    Process { func: ProcFunc, args: Vec<Val> },
     /// Is the handle not null and its object of `class` or derived from it?
     IsA { value: Val, class: ClassId },
     /// Entering a named block or task body that `disable` can name; `exit`
@@ -487,6 +491,21 @@ pub enum ArrFunc {
     Xor,
     Min,
     Max,
+}
+
+/// Methods of the built-in `process` class. A process handle is an object
+/// of [`Design::process_class`] whose one property is the thread number.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProcFunc {
+    /// `process::self()`
+    SelfHandle,
+    /// `p.status()`: FINISHED 0, RUNNING 1, WAITING 2, SUSPENDED 3, KILLED 4.
+    Status,
+    Kill,
+    /// `srandom`, `set_randstate`: accepted, with no effect.
+    Ignore,
+    /// `get_randstate`: a string.
+    GetRandstate,
 }
 
 /// What `disable` names: a named block (by its scope) or a task.
@@ -590,6 +609,8 @@ pub enum Wait {
     Event(VarId),
     /// `wait fork`.
     Children,
+    /// `p.await()`: until the process `p` (a `process` handle) has ended.
+    Process(Val),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

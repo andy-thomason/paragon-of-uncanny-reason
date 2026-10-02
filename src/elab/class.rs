@@ -317,6 +317,133 @@ impl<'a, 't> Elab<'a, 't> {
         id
     }
 
+    /// The built-in `process` class (LRM 9.7), made on first use.
+    pub(crate) fn process_class(&mut self) -> ClassId {
+        if let Some(c) = self.d.process_class {
+            return c;
+        }
+        let unit = self.unit_scope;
+        let scope = self.new_scope("process", Some(unit), None, Some(unit), -12, &[]);
+        let int = Ty::bits(32, true, false);
+        for (i, n) in ["FINISHED", "RUNNING", "WAITING", "SUSPENDED", "KILLED"]
+            .iter()
+            .enumerate()
+        {
+            self.scopes[scope.0 as usize].syms.insert(
+                n,
+                Sym::Param(crate::eval::Value::Bits(Bits::from_u64(32, i as u64)), int.clone()),
+            );
+        }
+        let id = ClassId(self.d.classes.len() as u32);
+        let it = self.ir_type(&int);
+        self.d.classes.push(Class {
+            name: "process",
+            base: None,
+            fields: vec![("id", it)],
+            vtable: Vec::new(),
+        });
+        self.classes.push(ClassInfo {
+            def: usize::MAX,
+            scope,
+            overrides: Vec::new(),
+            started: true,
+            base: None,
+            fields: vec![("id", int)],
+            inits: Vec::new(),
+            methods: HashMap::new(),
+            ctor: None,
+            is_virtual: true,
+        });
+        self.d.process_class = Some(id);
+        id
+    }
+
+    /// A method of the built-in `process` class.
+    fn process_method(
+        &mut self,
+        cx: &mut Cx<'a>,
+        obj: Option<Val>,
+        name: &'a str,
+    ) -> EResult<Option<(Val, STy)>> {
+        let int = STy::Bits {
+            w: 32,
+            s: true,
+            f: false,
+        };
+        let c = self.process_class();
+        if name == "self" {
+            let t = self.ir_type(&Self::class_ty(c));
+            let v = cx.b.emit(
+                Op::Process {
+                    func: ProcFunc::SelfHandle,
+                    args: vec![],
+                },
+                t,
+                name,
+            );
+            return Ok(Some((v, STy::Class(Some(c)))));
+        }
+        let Some(h) = obj else {
+            return Err(self.error(name, format!("process::{name} needs a process handle")));
+        };
+        Ok(match name {
+            "status" => {
+                let t = self.bits_type(32, true, false);
+                let v = cx.b.emit(
+                    Op::Process {
+                        func: ProcFunc::Status,
+                        args: vec![h],
+                    },
+                    t,
+                    name,
+                );
+                Some((v, int))
+            }
+            "kill" => {
+                cx.b.effect(
+                    Op::Process {
+                        func: ProcFunc::Kill,
+                        args: vec![h],
+                    },
+                    name,
+                );
+                None
+            }
+            "await" => {
+                let resume = cx.b.new_block();
+                cx.b.terminate(Terminator::Suspend {
+                    wait: Wait::Process(h),
+                    resume,
+                });
+                cx.b.switch_to(resume);
+                None
+            }
+            "srandom" | "set_randstate" => {
+                cx.b.effect(
+                    Op::Process {
+                        func: ProcFunc::Ignore,
+                        args: vec![h],
+                    },
+                    name,
+                );
+                None
+            }
+            "get_randstate" => {
+                let t = self.add_type(Type::String);
+                let v = cx.b.emit(
+                    Op::Process {
+                        func: ProcFunc::GetRandstate,
+                        args: vec![h],
+                    },
+                    t,
+                    name,
+                );
+                Some((v, STy::Str))
+            }
+            _ => return Err(self.not_yet(name, &format!("process::{name}"))),
+        })
+    }
+
     /// The class of a handle type.
     pub(crate) fn class_of(t: &Ty<'a>) -> Option<ClassId> {
         match t.base {
@@ -374,6 +501,10 @@ impl<'a, 't> Elab<'a, 't> {
         args: &[Arg<'a>],
         direct: bool,
     ) -> EResult<Option<(Val, STy)>> {
+        if Some(c) == self.d.process_class {
+            let _ = args;
+            return self.process_method(cx, obj, name);
+        }
         self.ensure_class(c)?;
         let m = if name == "new" {
             self.classes[c.0 as usize].ctor.map(|func| Method {

@@ -207,7 +207,8 @@ impl<'a, 't> Elab<'a, 't> {
                 }
                 let mut t = match self.lookup_type(*scope, name)? {
                     Some(t) => t,
-                    None if matches!(*name, "process" | "semaphore" | "mailbox") => {
+                    None if *name == "process" => super::class::ClassInfo::ty(self.process_class()),
+                    None if matches!(*name, "semaphore" | "mailbox") => {
                         return Err(
                             self.not_yet(name, "built-in classes (process, semaphore, mailbox)")
                         );

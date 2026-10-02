@@ -212,6 +212,7 @@ impl BodyFmt<'_, '_> {
                 value.0
             ),
             Op::VCall { slot, args } => format!("vcall #{slot}({})", Self::vals(args)),
+            Op::Process { func, args } => format!("process.{func:?}({})", Self::vals(args)),
             Op::IsA { value, class } => {
                 format!("isa %{} {}", value.0, d.classes[class.0 as usize].name)
             }
@@ -300,6 +301,7 @@ impl BodyFmt<'_, '_> {
             ),
             Wait::Event(v) => format!("Event({})", self.var(*v)),
             Wait::Children => "Children".into(),
+            Wait::Process(v) => format!("Process(%{})", v.0),
         }
     }
 }

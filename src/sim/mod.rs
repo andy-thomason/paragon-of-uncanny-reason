@@ -93,6 +93,12 @@ struct Thread<'d, 'a> {
     /// Blocks its ancestors were executing when they started it: disabling
     /// one ends this thread.
     inherited: Vec<DisableTag>,
+    /// Ended by `kill` or `disable`, rather than by finishing.
+    killed: bool,
+    /// Its `process` object, once asked for.
+    handle: Option<crate::eval::ObjRef>,
+    /// Threads waiting in `await` for this one to end.
+    awaiting: Vec<(ThreadId, u64)>,
 }
 
 /// A thread waiting on design state.
@@ -220,6 +226,9 @@ impl<'d, 'a> Simulator<'d, 'a> {
             join: None,
             blocks: Vec::new(),
             inherited: Vec::new(),
+            killed: false,
+            handle: None,
+            awaiting: Vec::new(),
         });
         self.epochs.push(0);
         self.threads.len() - 1
@@ -753,6 +762,60 @@ impl<'d, 'a> Simulator<'d, 'a> {
                 }
                 None
             }
+            Op::Process { func, args } => {
+                let target = |this: &Self, i: usize| -> Option<ThreadId> {
+                    match this.val(t, args[i]) {
+                        Value::Obj(Some(o)) => o.0.borrow().fields[0]
+                            .bits()
+                            .map(|b| b.to_u64() as ThreadId),
+                        _ => None,
+                    }
+                };
+                match func {
+                    ProcFunc::SelfHandle => {
+                        if self.threads[t].handle.is_none() {
+                            let class = self.d.process_class.expect("process class");
+                            let o = crate::eval::ObjRef(Rc::new(RefCell::new(crate::eval::Object {
+                                class,
+                                fields: vec![Value::Bits(Bits::from_u64(32, t as u64))],
+                                names: Rc::new(vec!["id".into()]),
+                            })));
+                            self.threads[t].handle = Some(o);
+                        }
+                        Some(Value::Obj(self.threads[t].handle.clone()))
+                    }
+                    ProcFunc::Status => {
+                        let Some(p) = target(self, 0) else {
+                            return Some(self.null_error(inst.at, sink));
+                        };
+                        let th = &self.threads[p];
+                        let s = match th.state {
+                            State::Done if th.killed => 4,
+                            State::Done => 0,
+                            State::Waiting => 2,
+                            State::Ready if p == t => 1,
+                            State::Ready => 1,
+                        };
+                        Some(Value::Bits(Bits::from_u64(32, s)))
+                    }
+                    ProcFunc::Kill => {
+                        let Some(p) = target(self, 0) else {
+                            return Some(self.null_error(inst.at, sink));
+                        };
+                        for d in self.descendants(p) {
+                            self.threads[d].killed = true;
+                            self.finish_thread(d);
+                        }
+                        if self.threads[p].state != State::Done {
+                            self.threads[p].killed = true;
+                            self.finish_thread(p);
+                        }
+                        None
+                    }
+                    ProcFunc::Ignore => None,
+                    ProcFunc::GetRandstate => Some(Value::Str(format!("{:016x}", self.rng))),
+                }
+            }
             Op::IsA { value, class } => {
                 let mut ok = false;
                 if let Value::Obj(Some(o)) = self.val(t, *value) {
@@ -1102,6 +1165,22 @@ impl<'d, 'a> Simulator<'d, 'a> {
                 edge: Edge::Any,
                 epoch,
             }),
+            Wait::Process(v) => {
+                let p = match self.val(t, *v) {
+                    Value::Obj(Some(o)) => o.0.borrow().fields[0].bits().map(|b| b.to_u64() as ThreadId),
+                    _ => None,
+                };
+                match p {
+                    Some(p) if self.threads[p].state != State::Done => {
+                        self.threads[p].awaiting.push((t, epoch));
+                    }
+                    // Already ended (or null): carry on.
+                    _ => {
+                        self.threads[t].state = State::Ready;
+                        self.active.push_back(t);
+                    }
+                }
+            }
             Wait::Children => {
                 if self.threads[t].live_children == 0 {
                     self.threads[t].state = State::Ready;
@@ -1169,6 +1248,13 @@ impl<'d, 'a> Simulator<'d, 'a> {
     fn finish_thread(&mut self, t: ThreadId) {
         self.threads[t].state = State::Done;
         self.threads[t].frames.clear();
+        for (w, e) in std::mem::take(&mut self.threads[t].awaiting) {
+            if self.epochs[w] == e && self.threads[w].state == State::Waiting {
+                self.epochs[w] += 1;
+                self.threads[w].state = State::Ready;
+                self.active.push_back(w);
+            }
+        }
         if let Some(p) = self.threads[t].parent {
             let parent = &mut self.threads[p];
             parent.live_children = parent.live_children.saturating_sub(1);

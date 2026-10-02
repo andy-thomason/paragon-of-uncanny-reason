@@ -489,6 +489,18 @@ impl<'a, 't> Elab<'a, 't> {
                 }
             }
             Expr::MinTypMax(v) => self.self_type_cx(cx, &v[1])?,
+            Expr::Call { func, .. } if self.process_call(cx, func).is_some() => {
+                match self.process_call(cx, func).unwrap() {
+                    "status" => STy::Bits {
+                        w: 32,
+                        s: true,
+                        f: false,
+                    },
+                    "get_randstate" => STy::Str,
+                    "self" => STy::Class(self.d.process_class),
+                    n => return Err(self.error(n, format!("process::{n} has no value"))),
+                }
+            }
             Expr::Call { func, .. } if self.method_of(cx, func).is_some() => {
                 let f = self.method_of(cx, func).unwrap()?;
                 match self.sig(f)?.ret {
@@ -763,6 +775,7 @@ impl<'a, 't> Elab<'a, 't> {
             Expr::Ident(p) => match self.lookup(p) {
                 Some(Sym::ClassDef(d)) => Some(self.specialise(d, None, p)),
                 Some(Sym::Type(t)) => Self::class_of(&t).map(Ok),
+                None if *p == "process" => Some(Ok(self.process_class())),
                 _ => None,
             },
             Expr::Type(t) => {
@@ -788,6 +801,16 @@ impl<'a, 't> Elab<'a, 't> {
         }
     }
 
+    /// The method name of a call on the built-in `process` class.
+    fn process_call(&mut self, cx: Option<&Cx<'a>>, func: &Expr<'a>) -> Option<&'a str> {
+        let (c, name) = match func {
+            Expr::Member { base, name } => (self.handle_class(cx, base)?, *name),
+            Expr::Scoped { scope, name } => (self.scope_class(scope)?.ok()?, *name),
+            _ => return None,
+        };
+        (Some(c) == self.d.process_class).then_some(name)
+    }
+
     /// The method a call names, if it is a method of a class handle or
     /// class scope: `obj.f`, `super.f`, `C::f`.
     pub(crate) fn method_of(&mut self, cx: Option<&Cx<'a>>, func: &Expr<'a>) -> Option<EResult<FuncId>> {
@@ -799,6 +822,9 @@ impl<'a, 't> Elab<'a, 't> {
             },
             _ => return None,
         };
+        if Some(c) == self.d.process_class {
+            return None;
+        }
         if let Err(e) = self.ensure_class(c) {
             return Some(Err(e));
         }
