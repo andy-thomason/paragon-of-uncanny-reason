@@ -34,8 +34,8 @@ pub enum Token<'a> {
     /// A simple identifier or keyword: `[A-Za-z_][A-Za-z0-9_$]*`.
     Ident(&'a str),
     /// `\name`: the backslash and the name, not the terminating whitespace.
-    /// It also stops before ``` `` ```, so a macro body can paste onto an
-    /// escaped identifier.
+    /// It also stops before ``` `` ``` and `` `" ``, so a macro body can paste
+    /// onto an escaped identifier and `\n` can end a stringification.
     EscapedIdent(&'a str),
     /// `$name`: a system task or function name.
     SystemIdent(&'a str),
@@ -241,7 +241,12 @@ impl<'a> Lexer<'a> {
         i += 1;
         while i < bytes.len() {
             let b = bytes[i];
-            if is_space(b) || b == b'\n' || b == b'\r' || bytes[i..].starts_with(b"``") {
+            if is_space(b)
+                || b == b'\n'
+                || b == b'\r'
+                || bytes[i..].starts_with(b"``")
+                || bytes[i..].starts_with(b"`\"")
+            {
                 break;
             }
             i += 1;
@@ -316,7 +321,7 @@ impl<'a> Iterator for Lexer<'a> {
                 let nl = newline_len(bytes, start + 1);
                 if nl > 0 {
                     (start + 1 + nl, Token::LineContinuation)
-                } else if next.is_some_and(|c| !(is_space(c) || c == b'`')) {
+                } else if next.is_some_and(|c| !is_space(c)) {
                     (self.escaped_ident_end(start), Token::EscapedIdent)
                 } else {
                     (start + 1, Token::Punct)
@@ -448,6 +453,30 @@ mod tests {
                 Paste("``"),
                 Ident("out"),
                 Whitespace(" ")
+            ]
+        );
+    }
+
+    #[test]
+    fn escaped_ident_stops_at_macro_quote() {
+        assert_eq!(
+            toks("\\n`\")"),
+            vec![EscapedIdent("\\n"), MacroQuote("`\""), Punct(")")]
+        );
+    }
+
+    #[test]
+    fn escaped_ident_may_start_with_backtick() {
+        assert_eq!(
+            toks("Not a \\`define x"),
+            vec![
+                Ident("Not"),
+                Whitespace(" "),
+                Ident("a"),
+                Whitespace(" "),
+                EscapedIdent("\\`define"),
+                Whitespace(" "),
+                Ident("x"),
             ]
         );
     }

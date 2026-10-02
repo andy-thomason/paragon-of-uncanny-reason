@@ -17,6 +17,9 @@ Only add files whose header says CC0. Files licensed under LGPL (including every
 | `t_preproc_stringend_bad.v`, `t_preproc_eof4_bad.v` | Unterminated `"` string |
 | `t_preproc_cmtend_bad.v`, `t_preproc_eof1_bad.v` | Unterminated `/*` comment |
 | `t_preproc_eof_qqq_bad.v` | Unterminated `"""` string |
+| `t_preproc_inc2.vh`, `t_preproc_inc3.vh`, `t_preproc_inc4.vh` | Files included by `t_preproc.v` |
+| `t_preproc_noline.v`, `t_preproc_ttempty.v`, `t_preproc_persist*.v` | `-E -P` golden comparisons |
+| `*.out` | Verilator's golden output for the tests above. `REUSE.toml` marks `test_regress/t/*.out` as CC0 |
 
 ## Where Verilator reports errors (from the golden `.out` files)
 

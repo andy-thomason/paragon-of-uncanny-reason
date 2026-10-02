@@ -281,7 +281,7 @@ Behaviour that golden files pin down (`t_preproc*`, 51 tests):
 - Errors exist for too many arguments, a missing `(` for a function-like macro, EOF inside an argument list, and
   "Unterminated ( in define formal arguments".
 - Arguments are macro-expanded *after* substitution, so recursive definitions are legal: `` `define quux(x) `qux(`"x`") ``.
-- Inside a stringified body `` `" … `" ``, formal names **are** substituted, but other macro uses are not expanded **(probe)**.
+- Inside a stringification `` `" … `" ``, formal names are substituted **and macro uses are expanded**. An undefined macro stays as literal text (`t_preproc_strify_join`, `t_preproc`). Full rules are in §3.10.
 - Redefining a macro with a different body is a warning (`REDEFMACRO`).
 - `` `undefineall `` removes every user macro but keeps the predefines **(probe)**.
 
@@ -299,7 +299,9 @@ cond_unary     ::= "!" cond_unary | MACRO_NAME | "(" cond_or ")"
 ```
 
 - An unmatched `` `elsif ``, `` `else `` or `` `endif `` is an error (golden: ``"`elsif with no matching `if"``).
-- An expression whose value is only defined/undefined status is required. Using a numeric `0` is an error (`t_preproc_preproczero_bad`).
+- Operands are define names; their values don't matter. A define whose value is `0` draws a `PREPROCZERO` warning (`t_preproc_preproczero_bad`).
+- **Precedence as observed:** `&&`, `||`, `->` and `<->` have equal precedence and associate left to right. For example, `( ONE || ZERO && ZERO )` is false. This differs from expression precedence in the LRM, but Verilator's golden output requires it.
+- **Known deviation:** Verilator's golden omits the branch for `` `elsif ( ONE && !( ZERO && ONE ) ) `` (with `ONE` defined), which is true under any reading. We keep the true result. The test `ifexpr_exact_except_known_deviation` records this.
 - Skipped regions are still lexed for **comments and strings**, so `` `endif `` inside a skipped `/* */` is not seen.
 
 ### 3.5 Include
@@ -344,6 +346,12 @@ Verilator options `--timescale` and `--timescale-override` affect the result **(
 Plus every `-D<name>[=<val>]` and `+define+<name>[=<val>]` from the command line. `--dump-defines` prints them sorted
 by name, with the `SV_COV_*` values as listed in [LRM 40.3.2.1].
 
+### 3.8a Comments in preprocessor output
+
+- An ordinary comment becomes a single space. `integer/*x*/foo` gives `integer foo`.
+- Metacomments are kept and normalised to `/*verilator …*/`. This applies to both the `/* verilator … */` and `// verilator …` forms. Runs of spaces and tabs collapse to one space, backslash-newline becomes a newline, and the ends are trimmed. A `//` metacomment ends at the next `//`.
+- `/*verilator_…*/` and `/*synopsys_…*/` (an underscore instead of a space) give `BADVLTPRAGMA` and are dropped.
+
 ### 3.9 Raw-text regions [VLT]
 
 ```
@@ -356,6 +364,25 @@ config_region   ::= "`verilator_config" control_command* ( "`verilog" | EOF )   
 The raw text is captured verbatim, with `` `systemc_class_name `` substituted. It is only legal as a module or class item.
 It is C++ text, so our Rust back end must decide what to do with it. Proposal: accept it, ignore it with a warning, and
 waive tests whose behaviour depends on it.
+
+### 3.10 Macro expansion rules (from Verilator's golden output)
+
+These rules come from `t_preproc`, `t_preproc_def09`, `t_preproc_strify_join` and `t_preproc_noline`. The implementation is `src/pp/mod.rs`.
+
+1. **The body** runs to the first newline not preceded by `\`. A block comment that spans lines does not end it. Ordinary line comments are dropped. Trailing spaces are then trimmed, and only after that do block comments become one space. So `` `define A x // c `` gives `x`, but `` `define B x /* c */ `` gives `x  `. Leading spaces are stripped, and a backslash-newline in the body becomes a newline in the expansion.
+2. **Formals:** a `(` *immediately* after the name starts the formals. With a space before it, the macro is object-like and the parentheses are body text. The formal list may span lines and contain comments. A default value keeps its trailing whitespace.
+3. **Actuals** are split at commas at bracket depth 0, counting `()`, `[]` and `{}`; strings are atomic. Splitting happens on the **raw** text, so with `` `define a x,y ``, `` `B(`a,`a) `` has two arguments. Each actual is trimmed. An empty actual takes the default. `` `F() `` is legal for a macro with zero formals.
+4. **Substitution is textual.** Formals are replaced by the raw actual text, but not inside string literals (IEEE 1800-2023). The result is then **rescanned**. Rescanning continues into the text after the use, so `` `CAT(`R_, 2)(d) `` builds `` `R_2 `` and then takes `(d)` as its arguments.
+5. **Paste ``` `` ```** joins its neighbours and keeps any whitespace beside it (`` f`` y `` gives `a y`). If an operand is a use of a **defined** macro, it is expanded *before* joining. If the macro is undefined, the joined text is rescanned, so `` `QA``_b `` becomes `` `QA_b `` when `QA` is undefined.
+6. **Escaped identifiers** in a body are split, so formals inside them are substituted (`\name``_x`). In the rescanned text they are atomic again, so `` \`FOO `` is not expanded.
+7. **Define names can be pasted:** `` `define X_```SOME `` defines `X_some`.
+8. **Directives inside expansions work**, including `` `define ``, `` `undef `` and `` `ifdef ``. An inner define ends at a newline in the expansion, which is why `` `define DEFINEIT(d) d \ `` needs its trailing continuation.
+9. **`` `__LINE__ ``** inside an expansion gives the line of the outermost use. **`` `__FILE__ ``** gives the current name, after any `` `line ``, with `\` and `"` re-escaped.
+10. **`` `line `__LINE__ "name" 0 ``** renames the file without changing the line numbering (user guide). With a literal number N, the next line is N.
+11. **Undefined macros pass through** literally. The "Define or directive not defined" error comes from the parser, not the preprocessor.
+12. **`` `error ``** takes one string argument and nothing else on the line.
+13. **Known deviation:** Verilator's golden for `bug202` in `t_preproc.v` comes from a `` `define `` whose name follows a multi-line block comment ending in `\`. Verilator emits a stray `\` and leaves the formal unsubstituted. We follow the LRM. The test `preproc_words_except_known_deviation` records this.
+14. **`-E` layout:** we match Verilator byte for byte for `-E -P`. For plain `-E`, we match the words and the line numbering but not Verilator's exact placement of line breaks and `` `line `` markers. For example, Verilator starts a new line before a multi-line comment that comes from an expansion. That is a later polish task.
 
 ---
 
