@@ -392,6 +392,8 @@ pub enum Op {
     ArrayElem { value: Val, index: Val },
     /// `len` elements of an array value from linear element `start`.
     ArraySlice { value: Val, start: Val, len: u32 },
+    /// A built-in array method or array operation; pure.
+    ArrFunc { func: ArrFunc, args: Vec<Val> },
     /// A built-in string method; pure.
     StrFunc {
         func: StrFunc,
@@ -402,6 +404,45 @@ pub enum Op {
         format: FormatId,
         args: Vec<Val>,
     },
+}
+
+/// Built-in operations on dynamic arrays and queues (LRM 7.5, 7.10) and
+/// array methods (7.12). Element 0 of a dynamic array or queue value is its
+/// leftmost (index 0); those that change the array return the new array.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArrFunc {
+    Size,
+    /// `(n, default, [old])`: `new[n]` or `new[n](old)`.
+    New,
+    /// `(a, x)`
+    PushBack,
+    PushFront,
+    /// `(a)`: `a` without its last or first element.
+    DropBack,
+    DropFront,
+    /// `(a)`: the last or first element (the default if empty).
+    Last,
+    First,
+    /// `(a, i, x)`
+    Insert,
+    /// `(a, i)`
+    DeleteAt,
+    /// `(a)`: empty.
+    Clear,
+    /// `(a, lo, hi)`: `a[lo:hi]`.
+    Slice,
+    /// Reverses the order of elements: also converts between a fixed-size
+    /// array's order (element 0 at the right-hand index) and a queue's.
+    Reverse,
+    Sort,
+    Rsort,
+    Sum,
+    Product,
+    And,
+    Or,
+    Xor,
+    Min,
+    Max,
 }
 
 /// What `disable` names: a named block (by its scope) or a task.

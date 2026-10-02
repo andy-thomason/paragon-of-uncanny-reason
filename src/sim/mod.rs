@@ -384,6 +384,16 @@ impl<'d, 'a> Simulator<'d, 'a> {
 
     fn read_elem(&self, var: VarId, i: Option<i64>) -> Value {
         match (&self.store[var.0 as usize], i) {
+            // A dynamic array or queue.
+            (Store::Scalar(Value::Array(a)), i) => match i {
+                Some(i) if i >= 0 && (i as usize) < a.len() => a[i as usize].clone(),
+                _ => match &self.d.types[self.d.vars[var.0 as usize].ty.0 as usize] {
+                    Type::Dynamic { elem } | Type::Queue { elem, .. } => {
+                        crate::eval::default_for(&self.d.types, &self.d.types[elem.0 as usize])
+                    }
+                    _ => Value::Bits(Bits::all_x(1)),
+                },
+            },
             (Store::Array(a), Some(i)) if i >= 0 && (i as usize) < a.len() => a[i as usize].clone(),
             (Store::Array(a), _) => {
                 // Out of range: the element type's default (X for 4-state).
@@ -399,6 +409,29 @@ impl<'d, 'a> Simulator<'d, 'a> {
 
     /// Write design state, converting to the stored type, and wake waiters if it changed.
     fn write(&mut self, var: VarId, elem: Option<i64>, part: Option<(i64, u32)>, value: Value) {
+        if let Store::Scalar(Value::Array(_)) = &self.store[var.0 as usize] {
+            // A dynamic array or queue: the whole value, or one element.
+            let ety = match &self.d.types[self.d.vars[var.0 as usize].ty.0 as usize] {
+                Type::Dynamic { elem } | Type::Queue { elem, .. } => *elem,
+                _ => return,
+            };
+            let ety = &self.d.types[ety.0 as usize];
+            let Store::Scalar(slot) = &mut self.store[var.0 as usize] else {
+                unreachable!()
+            };
+            let changed = match elem {
+                None => {
+                    let changed = *slot != value;
+                    *slot = value;
+                    changed
+                }
+                Some(i) => crate::eval::store_elem(slot, i, part, value, ety),
+            };
+            if changed {
+                self.wake(var, &Value::Bits(Bits::zero(1)), &Value::Bits(Bits::ones(1)));
+            }
+            return;
+        }
         if let Value::Array(vals) = value {
             // Consecutive elements from `elem` (the whole array from 0).
             let start = elem.unwrap_or(0);

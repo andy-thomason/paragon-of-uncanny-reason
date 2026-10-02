@@ -194,6 +194,18 @@ pub fn eval_pure<'v, 't: 'v>(
                     .collect(),
             )
         }
+        Op::Concat(parts) if matches!(ty, Type::Dynamic { .. } | Type::Queue { .. }) => {
+            // `{q, x}` or `'{a, b}`: element 0 is the leftmost; arrays splice in.
+            let mut v = Vec::new();
+            for p in parts {
+                match arg(*p).0 {
+                    Value::Array(a) => v.extend(a.iter().cloned()),
+                    x => v.push(x.clone()),
+                }
+            }
+            Value::Array(v)
+        }
+        Op::ArrFunc { func, args } => return arr_func(*func, args, ty, &arg, &fix),
         Op::Concat(parts) if *ty == Type::String => {
             Value::Str(parts.iter().map(|p| to_string(arg(*p).0)).collect())
         }
@@ -316,6 +328,164 @@ pub fn eval_pure<'v, 't: 'v>(
         _ => return None,
     };
     Some(v)
+}
+
+fn arr_func<'v, 't: 'v>(
+    func: ArrFunc,
+    args: &[Val],
+    ty: &Type<'t>,
+    arg: &impl Fn(Val) -> (&'v Value, &'v Type<'t>),
+    fix: &dyn Fn(Bits) -> Value,
+) -> Option<Value> {
+    let a = |i: usize| arg(args[i]).0;
+    let int = |i: usize| {
+        let s = bits_info(arg(args[i]).1).is_some_and(|(_, s, _)| s);
+        a(i).bits().and_then(|b| b.to_i64(s))
+    };
+    let arr = |i: usize| match a(i) {
+        Value::Array(v) => v.clone(),
+        _ => Vec::new(),
+    };
+    let w = bits_info(ty).map_or(32, |(w, _, _)| w);
+    Some(match func {
+        ArrFunc::Size => fix(Bits::from_i64(w, arr(0).len() as i64)),
+        ArrFunc::New => {
+            let n = int(0).unwrap_or(0).max(0) as usize;
+            let dflt = a(1).clone();
+            let old = if args.len() > 2 { arr(2) } else { Vec::new() };
+            Value::Array((0..n).map(|i| old.get(i).cloned().unwrap_or_else(|| dflt.clone())).collect())
+        }
+        ArrFunc::PushBack => {
+            let mut v = arr(0);
+            v.push(a(1).clone());
+            Value::Array(v)
+        }
+        ArrFunc::PushFront => {
+            let mut v = arr(0);
+            v.insert(0, a(1).clone());
+            Value::Array(v)
+        }
+        ArrFunc::DropBack => {
+            let mut v = arr(0);
+            v.pop();
+            Value::Array(v)
+        }
+        ArrFunc::DropFront => {
+            let mut v = arr(0);
+            if !v.is_empty() {
+                v.remove(0);
+            }
+            Value::Array(v)
+        }
+        ArrFunc::Last => {
+            let v = arr(0);
+            v.last().cloned().unwrap_or_else(|| default_for(&[], ty))
+        }
+        ArrFunc::First => {
+            let v = arr(0);
+            v.first().cloned().unwrap_or_else(|| default_for(&[], ty))
+        }
+        ArrFunc::Insert => {
+            let mut v = arr(0);
+            if let Some(i) = int(1)
+                && i >= 0
+                && i as usize <= v.len()
+            {
+                v.insert(i as usize, a(2).clone());
+            }
+            Value::Array(v)
+        }
+        ArrFunc::DeleteAt => {
+            let mut v = arr(0);
+            if let Some(i) = int(1)
+                && i >= 0
+                && (i as usize) < v.len()
+            {
+                v.remove(i as usize);
+            }
+            Value::Array(v)
+        }
+        ArrFunc::Clear => Value::Array(Vec::new()),
+        ArrFunc::Slice => {
+            let v = arr(0);
+            match (int(1), int(2)) {
+                (Some(lo), Some(hi)) => {
+                    let lo = lo.max(0) as usize;
+                    let hi = hi.min(v.len() as i64 - 1);
+                    if hi < 0 || lo > hi as usize {
+                        Value::Array(Vec::new())
+                    } else {
+                        Value::Array(v[lo..=hi as usize].to_vec())
+                    }
+                }
+                _ => Value::Array(Vec::new()),
+            }
+        }
+        ArrFunc::Reverse => {
+            let mut v = arr(0);
+            v.reverse();
+            Value::Array(v)
+        }
+        ArrFunc::Sort | ArrFunc::Rsort => {
+            let mut v = arr(0);
+            let signed = bits_info(arg(args[0]).1).is_some_and(|(_, s, _)| s);
+            v.sort_by(|x, y| compare_values(x, y, signed));
+            if func == ArrFunc::Rsort {
+                v.reverse();
+            }
+            Value::Array(v)
+        }
+        ArrFunc::Min | ArrFunc::Max => {
+            let v = arr(0);
+            let best = v.iter().cloned().reduce(|p, q| {
+                let o = compare_values(&p, &q, false);
+                let keep_p = if func == ArrFunc::Min { o.is_le() } else { o.is_ge() };
+                if keep_p { p } else { q }
+            });
+            Value::Array(best.into_iter().collect())
+        }
+        ArrFunc::Sum | ArrFunc::Product | ArrFunc::And | ArrFunc::Or | ArrFunc::Xor => {
+            let v = arr(0);
+            let start = match func {
+                ArrFunc::Product => Bits::from_u64(w, 1),
+                ArrFunc::And => Bits::ones(w),
+                _ => Bits::zero(w),
+            };
+            let r = v.iter().fold(start, |acc, x| {
+                let x = match x {
+                    Value::Bits(b) => b.resize(w, false),
+                    Value::Real(r) => Bits::from_f64(w, *r),
+                    _ => Bits::zero(w),
+                };
+                match func {
+                    ArrFunc::Sum => acc.add(&x),
+                    ArrFunc::Product => acc.mul(&x),
+                    ArrFunc::And => acc.and(&x),
+                    ArrFunc::Or => acc.or(&x),
+                    _ => acc.xor(&x),
+                }
+            });
+            fix(r)
+        }
+    })
+}
+
+/// An ordering of element values, for `sort`.
+fn compare_values(x: &Value, y: &Value, signed: bool) -> std::cmp::Ordering {
+    match (x, y) {
+        (Value::Bits(a), Value::Bits(b)) => {
+            if a.relational(b, signed, Rel::Lt).truth() == Some(true) {
+                std::cmp::Ordering::Less
+            } else if b.relational(a, signed, Rel::Lt).truth() == Some(true) {
+                std::cmp::Ordering::Greater
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        }
+        (Value::Real(a), Value::Real(b)) => a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal),
+        (Value::Str(a), Value::Str(b)) => a.cmp(b),
+        _ => std::cmp::Ordering::Equal,
+    }
 }
 
 /// Are two arrays equal element by element? `None` if unknown (X bits
@@ -523,6 +693,7 @@ pub fn eval_const(body: &Body<'_>, design: &Design<'_>) -> Result<Value, NotCons
 /// array of defaults for an unpacked array.
 pub fn default_for(types: &[Type<'_>], ty: &Type<'_>) -> Value {
     match ty {
+        Type::Dynamic { .. } | Type::Queue { .. } => Value::Array(Vec::new()),
         Type::Unpacked { elem, left, right } => {
             let n = (right - left).unsigned_abs() as usize + 1;
             Value::Array(vec![default_for(types, &types[elem.0 as usize]); n])

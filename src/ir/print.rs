@@ -194,6 +194,7 @@ impl BodyFmt<'_, '_> {
             Op::ArraySlice { value, start, len } => {
                 format!("slice %{}[%{} +: {len}]", value.0, start.0)
             }
+            Op::ArrFunc { func, args } => format!("arr.{func:?}({})", Self::vals(args)),
             Op::StrFunc { func, args } => format!("str.{func:?}({})", Self::vals(args)),
             Op::Sformat { format, args } => {
                 format!("sformat fmt#{}({})", format.0, Self::vals(args))

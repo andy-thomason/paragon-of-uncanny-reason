@@ -429,7 +429,17 @@ impl<'a, 't> Elab<'a, 't> {
             }
             let mut ty = base.clone();
             ty.unpacked = self.unpacked_dims(&v.dims)?;
-            if automatic && !ty.unpacked.is_empty() && super::expr::fixed_count(&ty).is_none() {
+            if automatic
+                && !ty.unpacked.is_empty()
+                && super::expr::fixed_count(&ty).is_none()
+                && !(matches!(ty.unpacked[0], UDim::Dynamic | UDim::Queue)
+                    && super::expr::fixed_count(&{
+                        let mut t = ty.clone();
+                        t.unpacked.remove(0);
+                        t
+                    })
+                    .is_some())
+            {
                 return Err(self.not_yet(v.name, "dynamic arrays, queues and associative arrays"));
             }
             let irt = self.ir_type(&ty);
@@ -1098,6 +1108,17 @@ impl<'a, 't> Elab<'a, 't> {
     fn expr_stmt(&mut self, cx: &mut Cx<'a>, e: &'t Expr<'a>) -> EResult<()> {
         match e {
             Expr::SysCall { name, args } => self.lower_systask(cx, name, args),
+            Expr::Call { func, args }
+                if matches!(&**func, Expr::Member { base, .. } if self.array_type(cx, base).is_some()) =>
+            {
+                let Expr::Member { base, name } = &**func else {
+                    unreachable!()
+                };
+                if !self.array_mutate(cx, base, name, args)? {
+                    self.array_method(cx, base, name, args)?;
+                }
+                Ok(())
+            }
             Expr::Call { func, args } if matches!(&**func, Expr::Member { base, .. } if self.is_str(Some(cx), base)) =>
             {
                 let Expr::Member { base, name } = &**func else {
@@ -1270,10 +1291,21 @@ impl<'a, 't> Elab<'a, 't> {
             return Err(self.error(array.at(), "foreach needs an array"));
         };
         let mut dims: Vec<(i64, i64)> = Vec::new();
-        for d in &p.ty.unpacked {
+        // A dynamic first dimension runs from 0 to its size less one, at run time.
+        let mut dyn_end = None;
+        for (k, d) in p.ty.unpacked.iter().enumerate() {
             match d {
                 UDim::Fixed(l, r) => dims.push((*l, *r)),
-                _ => return Err(self.not_yet(kw, "foreach over dynamic arrays and queues")),
+                UDim::Dynamic | UDim::Queue if k == 0 => {
+                    let (whole, _) = self.load_path(cx, &p)?;
+                    let int = Ty::bits(32, true, false);
+                    let size = self.arr_op(cx, ArrFunc::Size, vec![whole], &int, kw);
+                    let it = self.ir_type(&int);
+                    let one = cx.b.emit(Op::Const(Bits::from_i64(32, 1)), it, kw);
+                    dyn_end = Some(cx.b.emit(Op::Binary(BinOp::Sub, size, one), it, kw));
+                    dims.push((0, i64::MAX));
+                }
+                _ => return Err(self.not_yet(kw, "foreach over associative arrays")),
             }
         }
         dims.extend(p.ty.packed.iter().copied());
@@ -1307,7 +1339,10 @@ impl<'a, 't> Elab<'a, 't> {
             let (head, body_b, exit) = (cx.b.new_block(), cx.b.new_block(), cx.b.new_block());
             cx.b.goto(head);
             let i = cx.b.emit(Op::LoadSlot(slot), it, name);
-            let end = cx.b.emit(Op::Const(Bits::from_i64(32, r)), it, name);
+            let end = match dyn_end {
+                Some(e) if r == i64::MAX => e,
+                _ => cx.b.emit(Op::Const(Bits::from_i64(32, r)), it, name),
+            };
             let bit = self.bits_type(1, false, false);
             let cmp = if l <= r { BinOp::Le } else { BinOp::Ge };
             let c = cx.b.emit(Op::Binary(cmp, i, end), bit, name);
@@ -1654,6 +1689,10 @@ impl<'a, 't> Elab<'a, 't> {
     fn format_arg(&mut self, cx: &mut Cx<'a>, e: &Expr<'a>, spec: char) -> EResult<Val> {
         if matches!(spec, 'e' | 'f' | 'g') {
             return self.lower_real(cx, e);
+        }
+        if let Some(t) = self.array_type(cx, e) {
+            // A whole array (for `%p`).
+            return self.lower_array(cx, e, &t);
         }
         let (v, st) = self.lower_self(cx, e)?;
         if spec == 't' && st != STy::Real {

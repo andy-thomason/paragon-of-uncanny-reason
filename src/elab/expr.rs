@@ -33,6 +33,8 @@ pub(crate) struct Cx<'a> {
     /// For a subroutine with output arguments: the block every return goes
     /// to, which collects the results.
     pub(crate) exit: Option<BlockId>,
+    /// While lowering a queue index: the value of `$` (its last index).
+    pub(crate) dollar: Option<Val>,
 }
 
 impl<'a> Cx<'a> {
@@ -45,6 +47,7 @@ impl<'a> Cx<'a> {
             const_mode,
             block_scope: None,
             exit: None,
+            dollar: None,
         }
     }
 }
@@ -175,6 +178,26 @@ pub(crate) fn fixed_count(t: &Ty) -> Option<u32> {
             _ => None,
         })
         .product()
+}
+
+/// The type of an array method's value; `None` for one without a value.
+fn array_method_type(t: &Ty, name: &str) -> Option<STy> {
+    let mut elem = t.clone();
+    elem.unpacked.remove(0);
+    Some(match name {
+        "size" | "num" => STy::Bits {
+            w: 32,
+            s: true,
+            f: false,
+        },
+        "sum" | "product" | "and" | "or" | "xor" | "pop_front" | "pop_back" => sty_of(&elem),
+        "min" | "max" => {
+            let mut q = elem;
+            q.unpacked.insert(0, UDim::Queue);
+            sty_of(&q)
+        }
+        _ => return None,
+    })
 }
 
 /// The type of a string method's value; `None` for one that has none.
@@ -338,6 +361,27 @@ impl<'a, 't> Elab<'a, 't> {
                 s: false,
                 f: false,
             },
+            Expr::Member { base, name } if self.array_type_opt(cx, base).is_some() => {
+                let t = self.array_type_opt(cx, base).unwrap();
+                match array_method_type(&t, name) {
+                    Some(st) => st,
+                    None => return Err(self.not_yet(name, &format!("array method {name}"))),
+                }
+            }
+            Expr::Call { func, .. }
+                if matches!(&**func, Expr::Member { base, .. } if self.array_type_opt(cx, base).is_some()) =>
+            {
+                let Expr::Member { base, name } = &**func else {
+                    unreachable!()
+                };
+                let t = self.array_type_opt(cx, base).unwrap();
+                match array_method_type(&t, name) {
+                    Some(st) => st,
+                    None => {
+                        return Err(self.error(name, format!("Array method '{name}' has no value")));
+                    }
+                }
+            }
             Expr::Member { base, name } if self.is_str(cx, base) => match str_method_type(name) {
                 Some(t) => t,
                 None => return Err(self.not_yet(name, &format!("string method {name}"))),
@@ -478,6 +522,11 @@ impl<'a, 't> Elab<'a, 't> {
                     }
                 }
             }
+            Expr::Keyword("$") if cx.is_some_and(|c| c.dollar.is_some()) => STy::Bits {
+                w: 32,
+                s: true,
+                f: false,
+            },
             Expr::Keyword("$") => return Err(self.not_yet(e.at(), "$ outside a queue or range")),
             Expr::Pattern { .. } => {
                 return Err(self.not_yet(e.at(), "assignment patterns without a target type"));
@@ -506,7 +555,7 @@ impl<'a, 't> Elab<'a, 't> {
             "$realtime" | "$itor" | "$bitstoreal" | "$sqrt" | "$ln" | "$log10" | "$exp"
             | "$pow" | "$floor" | "$ceil" => STy::Real,
             "$random" | "$clog2" | "$bits" | "$size" | "$countones" | "$rtoi" | "$left"
-            | "$right" | "$low" | "$high" | "$dimensions" | "$test$plusargs" => int,
+            | "$right" | "$low" | "$high" | "$dimensions" | "$increment" | "$test$plusargs" => int,
             "$urandom" | "$urandom_range" => STy::Bits {
                 w: 32,
                 s: false,
@@ -851,6 +900,17 @@ impl<'a, 't> Elab<'a, 't> {
                 let Some(mut p) = self.path(cx, base)? else {
                     return Ok(None);
                 };
+                if matches!(p.ty.unpacked.first(), Some(UDim::Dynamic | UDim::Queue)) {
+                    if p.elem.is_some() || p.ty.unpacked.len() > 1 {
+                        return Err(self.not_yet(at, "arrays of arrays with dynamic dimensions"));
+                    }
+                    let i = self.queue_index(cx, &p, index)?;
+                    p.elem = Some(i);
+                    p.ty.unpacked.remove(0);
+                    p.base = p.ty.clone();
+                    p.width = p.ty.width();
+                    return Ok(Some(p));
+                }
                 let i = self.index_val(cx, index)?;
                 if !p.ty.unpacked.is_empty() {
                     let UDim::Fixed(l, r) = p.ty.unpacked[0] else {
@@ -1003,6 +1063,15 @@ impl<'a, 't> Elab<'a, 't> {
 
     /// Load a path's value.
     pub(crate) fn load_path(&mut self, cx: &mut Cx<'a>, p: &Path<'a>) -> EResult<(Val, STy)> {
+        if matches!(p.ty.unpacked.first(), Some(UDim::Dynamic | UDim::Queue)) {
+            let aty = self.ir_type(&p.ty);
+            let v = match (&p.root, p.elem) {
+                (Root::Var(v), None) => cx.b.emit(Op::Load(*v), aty, p.at),
+                (Root::Slot(s), None) => cx.b.emit(Op::LoadSlot(*s), aty, p.at),
+                _ => return Err(self.not_yet(p.at, "this dynamic array or queue")),
+            };
+            return Ok((v, sty_of(&p.ty)));
+        }
         if !p.ty.unpacked.is_empty() {
             // A whole array, or the sub-array `mem[i]` of a multi-dimensional one.
             let Some(len) = fixed_count(&p.ty) else {
@@ -1285,6 +1354,11 @@ impl<'a, 't> Elab<'a, 't> {
     /// array, or a conditional choice between them.
     pub(crate) fn lower_array(&mut self, cx: &mut Cx<'a>, e: &Expr<'a>, ty: &Ty<'a>) -> EResult<Val> {
         let at = e.at();
+        if matches!(ty.unpacked[0], UDim::Dynamic | UDim::Queue)
+            && ty.unpacked[1..].iter().all(|d| matches!(d, UDim::Fixed(..)))
+        {
+            return self.lower_dynamic(cx, e, ty);
+        }
         if fixed_count(ty).is_none() {
             return Err(self.not_yet(at, "dynamic arrays, queues and associative arrays"));
         }
@@ -1348,6 +1422,11 @@ impl<'a, 't> Elab<'a, 't> {
                 if p.ty.unpacked.is_empty() {
                     return Err(self.error(at, "Assigning a non-array value to an unpacked array"));
                 }
+                if matches!(p.ty.unpacked[0], UDim::Dynamic | UDim::Queue) {
+                    // A queue's element 0 is its leftmost; a fixed array's is its rightmost.
+                    let (v, _) = self.load_path(cx, &p)?;
+                    return Ok(self.arr_op(cx, ArrFunc::Reverse, vec![v], ty, at));
+                }
                 if fixed_count(&p.ty) != fixed_count(ty) {
                     return Err(self.error(at, "Unpacked array sizes differ in assignment"));
                 }
@@ -1355,6 +1434,294 @@ impl<'a, 't> Elab<'a, 't> {
             }
             _ => Err(self.not_yet(at, "this unpacked array expression")),
         }
+    }
+
+    /// [`array_type`](Self::array_type) without a lowering context.
+    pub(crate) fn array_type_opt(&mut self, cx: Option<&Cx<'a>>, e: &Expr<'a>) -> Option<Ty<'a>> {
+        let n = self.diags.len();
+        let r = self.path_type(cx, e).ok().flatten();
+        self.diags.truncate(n);
+        r.map(|(t, _)| t).filter(|t| !t.unpacked.is_empty())
+    }
+
+    /// Emit an array operation giving a value of type `ty`.
+    pub(crate) fn arr_op(
+        &mut self,
+        cx: &mut Cx<'a>,
+        func: ArrFunc,
+        args: Vec<Val>,
+        ty: &Ty<'a>,
+        at: &'a str,
+    ) -> Val {
+        let t = self.ir_type(ty);
+        cx.b.emit(Op::ArrFunc { func, args }, t, at)
+    }
+
+    /// The index of a queue or dynamic array element, with `$` standing for
+    /// the last index.
+    fn queue_index(&mut self, cx: &mut Cx<'a>, p: &Path<'a>, index: &Expr<'a>) -> EResult<Val> {
+        let whole = self.load_path(cx, p)?.0;
+        let saved = cx.dollar;
+        let int = Ty::bits(32, true, false);
+        let size = self.arr_op(cx, ArrFunc::Size, vec![whole], &int, index.at());
+        let it = self.ir_type(&int);
+        let one = cx.b.emit(Op::Const(Bits::from_i64(32, 1)), it, index.at());
+        cx.dollar = Some(cx.b.emit(Op::Binary(BinOp::Sub, size, one), it, index.at()));
+        let r = self.index_val(cx, index);
+        cx.dollar = saved;
+        r
+    }
+
+    /// A value for a dynamic array or queue type.
+    fn lower_dynamic(&mut self, cx: &mut Cx<'a>, e: &Expr<'a>, ty: &Ty<'a>) -> EResult<Val> {
+        let at = e.at();
+        let mut elem = ty.clone();
+        elem.unpacked.remove(0);
+        let dt = self.ir_type(ty);
+        match e {
+            Expr::Pattern { items, .. } => {
+                if items.iter().any(|i| matches!(i, ast::PatItem::Keyed(..))) {
+                    return Err(self.not_yet(at, "keyed patterns for dynamic arrays and queues"));
+                }
+                let mut parts = Vec::new();
+                for i in items {
+                    match i {
+                        ast::PatItem::Value(v) => parts.push(self.lower_to(cx, v, &elem)?),
+                        ast::PatItem::Repeat(count, vs) => {
+                            let c = self.const_int(count)?;
+                            for _ in 0..c.max(0) {
+                                for v in vs {
+                                    parts.push(self.lower_to(cx, v, &elem)?);
+                                }
+                            }
+                        }
+                        ast::PatItem::Keyed(..) => unreachable!(),
+                    }
+                }
+                Ok(cx.b.emit(Op::Concat(parts), dt, at))
+            }
+            Expr::Concat(items) => {
+                let mut parts = Vec::new();
+                for i in items {
+                    match self.array_type(cx, i) {
+                        Some(t) if elem.unpacked.is_empty() => {
+                            // Splice the elements in, as a queue.
+                            let mut q = t.clone();
+                            q.unpacked[0] = UDim::Queue;
+                            parts.push(self.lower_array(cx, i, &q)?);
+                        }
+                        _ => parts.push(self.lower_to(cx, i, &elem)?),
+                    }
+                }
+                Ok(cx.b.emit(Op::Concat(parts), dt, at))
+            }
+            Expr::New {
+                size: Some(n),
+                args,
+                ..
+            } => {
+                let n = self.lower_to(cx, n, &Ty::bits(32, true, false))?;
+                let et = self.ir_type(&elem);
+                let d = crate::eval::default_for(&self.d.types, &self.d.types[et.0 as usize]);
+                let dv = self.emit_value(cx, &d, &elem, at);
+                let mut vals = vec![n, dv];
+                if let Some(Arg::Ordered(Some(old))) = args.first() {
+                    vals.push(self.lower_array(cx, old, ty)?);
+                }
+                Ok(self.arr_op(cx, ArrFunc::New, vals, ty, at))
+            }
+            Expr::Slice {
+                base,
+                op: ":",
+                left,
+                right,
+            } if self.array_type(cx, base).is_some() => {
+                let Some(p) = self.path(cx, base)? else {
+                    return Err(self.not_yet(at, "this slice"));
+                };
+                let lo = self.queue_index(cx, &p, left)?;
+                let hi = self.queue_index(cx, &p, right)?;
+                let (whole, _) = self.load_path(cx, &p)?;
+                Ok(self.arr_op(cx, ArrFunc::Slice, vec![whole, lo, hi], ty, at))
+            }
+            Expr::Cond {
+                cond, then, els, ..
+            } => {
+                let c = self.truth(cx, cond)?;
+                let a = self.lower_dynamic(cx, then, ty)?;
+                let b = self.lower_dynamic(cx, els, ty)?;
+                Ok(cx.b.emit(
+                    Op::Mux {
+                        cond: c,
+                        then: a,
+                        els: b,
+                    },
+                    dt,
+                    at,
+                ))
+            }
+            Expr::Call { func, args } => Ok(self.lower_call(cx, func, args)?.0),
+            Expr::Cast { expr, .. } => self.lower_dynamic(cx, expr, ty),
+            Expr::Ident(_) | Expr::Member { .. } | Expr::Index { .. } | Expr::Scoped { .. } => {
+                let Some(p) = self.path(cx, e)? else {
+                    return Err(self.not_yet(at, "this kind of name"));
+                };
+                match p.ty.unpacked.first() {
+                    Some(UDim::Dynamic | UDim::Queue) => Ok(self.load_path(cx, &p)?.0),
+                    Some(UDim::Fixed(..)) => {
+                        let (v, _) = self.load_path(cx, &p)?;
+                        Ok(self.arr_op(cx, ArrFunc::Reverse, vec![v], ty, at))
+                    }
+                    _ => Err(self.error(at, "Assigning a non-array value to a dynamic array")),
+                }
+            }
+            _ => Err(self.not_yet(at, "this dynamic array expression")),
+        }
+    }
+
+    /// An array method with a value: `q.size()`, `a.sum()`, `q.pop_front()`...
+    pub(crate) fn array_method(
+        &mut self,
+        cx: &mut Cx<'a>,
+        base: &Expr<'a>,
+        name: &'a str,
+        args: &[Arg<'a>],
+    ) -> EResult<(Val, STy)> {
+        let Some(t) = self.array_type(cx, base) else {
+            return Err(self.error(base.at(), "Not an array"));
+        };
+        if matches!(name, "pop_front" | "pop_back") {
+            let v = self.array_pop(cx, base, name)?;
+            let mut elem = t.clone();
+            elem.unpacked.remove(0);
+            return Ok((v, sty_of(&elem)));
+        }
+        let Some(st) = array_method_type(&t, name) else {
+            return Err(self.not_yet(name, &format!("array method {name}")));
+        };
+        let _ = args;
+        let Some(p) = self.path(cx, base)? else {
+            return Err(self.error(base.at(), "Not an array"));
+        };
+        let (whole, _) = self.load_path(cx, &p)?;
+        let mut elem = t.clone();
+        elem.unpacked.remove(0);
+        let func = match name {
+            "size" | "num" => ArrFunc::Size,
+            "sum" => ArrFunc::Sum,
+            "product" => ArrFunc::Product,
+            "and" => ArrFunc::And,
+            "or" => ArrFunc::Or,
+            "xor" => ArrFunc::Xor,
+            "min" => ArrFunc::Min,
+            "max" => ArrFunc::Max,
+            _ => return Err(self.not_yet(name, &format!("array method {name}"))),
+        };
+        let rty = if matches!(func, ArrFunc::Min | ArrFunc::Max) {
+            let mut q = elem.clone();
+            q.unpacked.insert(0, UDim::Queue);
+            q
+        } else {
+            st.ty()
+        };
+        Ok((self.arr_op(cx, func, vec![whole], &rty, name), st))
+    }
+
+    /// `q.pop_front()` / `q.pop_back()`: the element, and the queue without it.
+    fn array_pop(&mut self, cx: &mut Cx<'a>, base: &Expr<'a>, name: &'a str) -> EResult<Val> {
+        let Some(t) = self.array_type(cx, base) else {
+            return Err(self.error(base.at(), "Not an array"));
+        };
+        let Some(p) = self.path(cx, base)? else {
+            return Err(self.error(base.at(), "Not an array"));
+        };
+        let mut elem = t.clone();
+        elem.unpacked.remove(0);
+        let (whole, _) = self.load_path(cx, &p)?;
+        let (take, drop) = if name == "pop_front" {
+            (ArrFunc::First, ArrFunc::DropFront)
+        } else {
+            (ArrFunc::Last, ArrFunc::DropBack)
+        };
+        let x = self.arr_op(cx, take, vec![whole], &elem, name);
+        let rest = self.arr_op(cx, drop, vec![whole], &t, name);
+        self.store_path(cx, &p, rest, false)?;
+        Ok(x)
+    }
+
+    /// An array method that changes the array. False if `name` is not one.
+    pub(crate) fn array_mutate(
+        &mut self,
+        cx: &mut Cx<'a>,
+        base: &Expr<'a>,
+        name: &'a str,
+        args: &[Arg<'a>],
+    ) -> EResult<bool> {
+        if matches!(name, "pop_front" | "pop_back") {
+            self.array_pop(cx, base, name)?;
+            return Ok(true);
+        }
+        if !matches!(
+            name,
+            "push_back" | "push_front" | "insert" | "delete" | "reverse" | "sort" | "rsort"
+        ) {
+            return Ok(false);
+        }
+        let Some(t) = self.array_type(cx, base) else {
+            return Ok(false);
+        };
+        let Some(p) = self.path(cx, base)? else {
+            return Err(self.error(base.at(), "Not an array"));
+        };
+        let mut elem = t.clone();
+        elem.unpacked.remove(0);
+        let arg = |i: usize| match args.get(i) {
+            Some(Arg::Ordered(Some(e))) => Some(e.clone()),
+            _ => None,
+        };
+        let int = Ty::bits(32, true, false);
+        let (whole, _) = self.load_path(cx, &p)?;
+        let need = |this: &mut Self, i: usize| {
+            arg(i).ok_or_else(|| this.error(name, format!("Too few arguments to '{name}'")))
+        };
+        let new = match name {
+            "push_back" | "push_front" => {
+                let x = need(self, 0)?;
+                let x = self.lower_to(cx, &x, &elem)?;
+                let f = if name == "push_back" {
+                    ArrFunc::PushBack
+                } else {
+                    ArrFunc::PushFront
+                };
+                self.arr_op(cx, f, vec![whole, x], &t, name)
+            }
+            "insert" => {
+                let i = need(self, 0)?;
+                let i = self.lower_to(cx, &i, &int)?;
+                let x = need(self, 1)?;
+                let x = self.lower_to(cx, &x, &elem)?;
+                self.arr_op(cx, ArrFunc::Insert, vec![whole, i, x], &t, name)
+            }
+            "delete" => match arg(0) {
+                Some(i) => {
+                    let i = self.lower_to(cx, &i, &int)?;
+                    self.arr_op(cx, ArrFunc::DeleteAt, vec![whole, i], &t, name)
+                }
+                None => self.arr_op(cx, ArrFunc::Clear, vec![whole], &t, name),
+            },
+            "reverse" => self.arr_op(cx, ArrFunc::Reverse, vec![whole], &t, name),
+            _ => {
+                // A fixed array's elements are stored right to left.
+                let fixed = matches!(t.unpacked[0], UDim::Fixed(..));
+                let f = match (name, fixed) {
+                    ("sort", false) | ("rsort", true) => ArrFunc::Sort,
+                    _ => ArrFunc::Rsort,
+                };
+                self.arr_op(cx, f, vec![whole], &t, name)
+            }
+        };
+        self.store_path(cx, &p, new, false)?;
+        Ok(true)
     }
 
     /// The type of `e` if it names an unpacked array (or a sub-array).
@@ -1519,6 +1886,19 @@ impl<'a, 't> Elab<'a, 't> {
             Expr::Member { base, name } if self.is_str(Some(cx), base) => {
                 let (v, st) = self.str_method(cx, base, name, &[])?;
                 return Ok(self.resize(cx, v, st, want, at));
+            }
+            Expr::Member { base, name } if self.array_type(cx, base).is_some() => {
+                let (v, st) = self.array_method(cx, base, name, &[])?;
+                return Ok(self.resize(cx, v, st, want, at));
+            }
+            Expr::Keyword("$") if cx.dollar.is_some() => {
+                let d = cx.dollar.unwrap();
+                let st = STy::Bits {
+                    w: 32,
+                    s: true,
+                    f: false,
+                };
+                return Ok(self.resize(cx, d, st, want, at));
             }
             Expr::Index { base, index } if self.is_str(Some(cx), base) => {
                 let args = [Arg::Ordered(Some((**index).clone()))];
@@ -2087,6 +2467,11 @@ impl<'a, 't> Elab<'a, 't> {
         {
             return self.str_method(cx, base, name, args);
         }
+        if let Expr::Member { base, name } = func
+            && self.array_type(cx, base).is_some()
+        {
+            return self.array_method(cx, base, name, args);
+        }
         let f = self.resolve_func(Some(cx), func)?;
         if cx.const_mode {
             // A constant function: make sure its body exists to be evaluated.
@@ -2271,6 +2656,80 @@ impl<'a, 't> Elab<'a, 't> {
                     ),
                     st,
                 ))
+            }
+            "$size" | "$left" | "$right" | "$low" | "$high" | "$dimensions" | "$increment" => {
+                let Some(a) = arg(0) else {
+                    return Err(self.error(name, format!("{name} needs an argument")));
+                };
+                // The type: of a name, or a type itself.
+                let t = match a {
+                    Expr::Type(t) => self.resolve_type(t)?,
+                    Expr::Ident(n) if matches!(self.lookup_cx(Some(cx), n), Some(Sym::Type(_))) => {
+                        let Some(Sym::Type(t)) = self.lookup_cx(Some(cx), n) else {
+                            unreachable!()
+                        };
+                        t
+                    }
+                    e => match self.path_type(Some(cx), e)? {
+                        Some((t, _)) => t,
+                        None => self.self_type_cx(Some(cx), e)?.ty(),
+                    },
+                };
+                let dim = match arg(1) {
+                    Some(d) => self.const_int(d)?,
+                    None => 1,
+                };
+                if name == "$dimensions" {
+                    let n = t.unpacked.len() + t.packed.len().max(usize::from(t.width() > 1));
+                    return Ok((konst(cx, n as i64), st));
+                }
+                // Dimensions: unpacked ones first, then packed.
+                let mut ranges: Vec<Option<(i64, i64)>> = t
+                    .unpacked
+                    .iter()
+                    .map(|d| match d {
+                        UDim::Fixed(l, r) => Some((*l, *r)),
+                        _ => None,
+                    })
+                    .collect();
+                if t.packed.is_empty() && t.unpacked.is_empty() {
+                    ranges.push(Some((t.width() as i64 - 1, 0)));
+                }
+                ranges.extend(t.packed.iter().map(|r| Some(*r)));
+                let Some(range) = ranges.get(dim as usize - 1).copied() else {
+                    return Err(self.error(name, format!("{name} dimension {dim} is out of range")));
+                };
+                match range {
+                    Some((l, r)) => {
+                        let v = match name {
+                            "$size" => range_len((l, r)) as i64,
+                            "$left" => l,
+                            "$right" => r,
+                            "$low" => l.min(r),
+                            "$high" => l.max(r),
+                            _ => if l >= r { 1 } else { -1 },
+                        };
+                        Ok((konst(cx, v), st))
+                    }
+                    None => {
+                        // A dynamic array or queue: from its size, at run time.
+                        let int_ty = Ty::bits(32, true, false);
+                        let (size, _) = self.array_method(cx, a, "size", &[])?;
+                        let one = konst(cx, 1);
+                        let zero = konst(cx, 0);
+                        let last = cx.b.emit(Op::Binary(BinOp::Sub, size, one), int, name);
+                        let _ = int_ty;
+                        Ok((
+                            match name {
+                                "$size" => size,
+                                "$left" | "$low" => zero,
+                                "$increment" => cx.b.emit(Op::Const(Bits::from_i64(32, -1)), int, name),
+                                _ => last,
+                            },
+                            st,
+                        ))
+                    }
+                }
             }
             "$bits" => {
                 let w = match arg(0) {

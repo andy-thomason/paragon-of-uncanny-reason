@@ -83,7 +83,12 @@ fn conv(
             if natural { format!("{s:>20}") } else { s }
         }
         ('p', Value::Array(a)) => {
-            let items: Vec<String> = a.iter().rev().map(pattern_elem).collect();
+            // A fixed-size array's element 0 is its rightmost; a queue's its leftmost.
+            let items: Vec<String> = if matches!(ty, Type::Unpacked { .. }) {
+                a.iter().rev().map(pattern_elem).collect()
+            } else {
+                a.iter().map(pattern_elem).collect()
+            };
             format!("'{{{}}}", items.join(", "))
         }
         ('p', Value::Bits(b)) if natural => decimal(b, signed),
