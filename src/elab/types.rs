@@ -207,7 +207,22 @@ impl<'a, 't> Elab<'a, 't> {
                 t.packed = dims;
                 t
             }
-            D::IfaceType { name, .. } => return Err(self.not_yet(name, "interface types")),
+            D::IfaceType {
+                iface,
+                name,
+                packed,
+            } => {
+                let Some(s) = self.hier_scope(None, iface) else {
+                    return Err(self.error(iface.at(), format!("Can't find interface '{}'", iface.at())));
+                };
+                let Some(super::Sym::Type(mut t)) = self.lookup_child(s, name) else {
+                    return Err(self.error(name, format!("Can't find typedef: '{name}'")));
+                };
+                let mut dims = self.packed_dims(packed)?;
+                dims.extend(t.packed);
+                t.packed = dims;
+                t
+            }
             D::Enum {
                 kw,
                 base,

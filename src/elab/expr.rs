@@ -545,6 +545,11 @@ impl<'a, 't> Elab<'a, 't> {
                 Expr::Ident(p) => self.lookup_scoped(p, name),
                 _ => None,
             },
+            // A task or function of an instance or interface: `ifc.f()`.
+            Expr::Member { base, name } => match self.hier_scope(cx, base) {
+                Some(s) => self.lookup_child(s, name),
+                None => return Err(self.not_yet(func.at(), "method calls")),
+            },
             _ => return Err(self.not_yet(func.at(), "method calls")),
         };
         match sym {

@@ -99,6 +99,9 @@ pub(crate) enum Dir {
     Input,
     Output,
     Inout,
+    /// An interface port: the name stands for the connected interface
+    /// instance (its `var` is not used).
+    Interface,
 }
 
 #[derive(Clone, Debug)]
@@ -513,7 +516,7 @@ impl<'a, 't> Elab<'a, 't> {
                 Some(n) => self.sm.add(n.clone(), crate::source::Origin::CommandLine).1,
                 None => m.name,
             };
-            if let Ok(s) = self.instantiate_begin(m, inst, None, &ov, m.name) {
+            if let Ok(s) = self.instantiate_begin(m, inst, None, &ov, &[], m.name) {
                 if self.d.top.is_none() {
                     self.d.top = Some(s);
                 }
@@ -549,6 +552,7 @@ impl<'a, 't> Elab<'a, 't> {
         name: &'a str,
         parent: Option<ScopeId>,
         overrides: &[(Option<&'a str>, Override<'a>)],
+        conns: &'t [ast::PortConn<'a>],
         at: &'a str,
     ) -> EResult<ScopeId> {
         if self.depth > 200 {
@@ -556,9 +560,6 @@ impl<'a, 't> Elab<'a, 't> {
                 at,
                 format!("Recursive module instantiation of '{}'", m.name),
             ));
-        }
-        if m.kind == "interface" {
-            return Err(self.not_yet(at, "interfaces"));
         }
         let unit = self.modules.get(m.name).map_or(-12, |(_, t)| t.0);
         let s = self.new_scope(
@@ -577,7 +578,7 @@ impl<'a, 't> Elab<'a, 't> {
         let saved = std::mem::replace(&mut self.cur, s);
         self.depth += 1;
         let r = self
-            .module_decls(m, overrides)
+            .module_decls(m, overrides, parent.map(|p| (p, conns)))
             .and_then(|_| self.implicit_nets(&m.items));
         self.depth -= 1;
         self.cur = saved;
@@ -712,6 +713,7 @@ impl<'a, 't> Elab<'a, 't> {
         &mut self,
         m: &'t ast::Module<'a>,
         overrides: &[(Option<&'a str>, Override<'a>)],
+        iface: Option<(ScopeId, &'t [ast::PortConn<'a>])>,
     ) -> EResult<()> {
         for imp in &m.imports {
             self.import(imp)?;
@@ -787,10 +789,31 @@ impl<'a, 't> Elab<'a, 't> {
             ast::Ports::Ansi(ports) => {
                 for p in ports {
                     self.last_at = p.name;
-                    if p.interface.is_some()
-                        || matches!(p.ty, ast::DataType::Named { .. } if !self.is_type_name(&p.ty))
-                    {
-                        return Err(self.not_yet(p.name, "interface ports"));
+                    let iface = match (&p.interface, &p.ty) {
+                        (Some((i, _)), _) => Some(*i),
+                        (None, ast::DataType::Named { scope: None, name, .. })
+                            if !self.is_type_name(&p.ty) =>
+                        {
+                            Some(*name)
+                        }
+                        _ => None,
+                    };
+                    if let Some(i) = iface {
+                        if i != "interface"
+                            && !matches!(self.modules.get(i), Some((m, _)) if m.kind == "interface")
+                        {
+                            return Err(self.error(p.name, format!("Cannot find interface '{i}'")));
+                        }
+                        if !p.dims.is_empty() {
+                            return Err(self.not_yet(p.name, "arrays of interface ports"));
+                        }
+                        self.info(cur).ports.push(PortInfo {
+                            name: p.name,
+                            dir: Dir::Interface,
+                            var: VarId(u32::MAX),
+                            ty: Ty::scalar(Base::Void),
+                        });
+                        continue;
                     }
                     if p.default.is_some() {
                         return Err(self.not_yet(p.name, "port default values"));
@@ -827,6 +850,16 @@ impl<'a, 't> Elab<'a, 't> {
                 }
             }
             ast::Ports::NonAnsi(_) => {}
+        }
+
+        // Interface ports first: declarations may use their types.
+        if let Some((p, conns)) = iface
+            && !conns.is_empty()
+        {
+            let saved = std::mem::replace(&mut self.cur, p);
+            let r = self.connect_ifaces(cur, conns, m.name);
+            self.cur = saved;
+            r?;
         }
 
         // The other declarations, in order.
@@ -1596,7 +1629,8 @@ impl<'a, 't> Elab<'a, 't> {
             } else {
                 i.name
             };
-            let child = self.instantiate_begin(m, name, Some(parent), &overrides, name)?;
+            let child =
+                self.instantiate_begin(m, name, Some(parent), &overrides, &i.conns, name)?;
             self.connect(child, &i.conns, name)?;
             self.depth += 1;
             let r = self.expand_scope(child);
@@ -1627,7 +1661,7 @@ impl<'a, 't> Elab<'a, 't> {
                 .sm
                 .add(format!("{}[{idx}]", i.name), crate::source::Origin::CommandLine)
                 .1;
-            let child = self.instantiate_begin(m, name, Some(parent), overrides, i.name)?;
+            let child = self.instantiate_begin(m, name, Some(parent), overrides, &[], i.name)?;
             let conns = self.array_conns(child, &i.conns, k, n)?;
             self.connect(child, conns, name)?;
             self.depth += 1;
@@ -1666,6 +1700,25 @@ impl<'a, 't> Elab<'a, 't> {
                 out.push(c.clone());
                 continue;
             };
+            if port.dir == Dir::Interface {
+                // An array of interfaces: instance k takes element k.
+                if let ast::Expr::Ident(base) = e
+                    && let Some(Sym::Scope(_)) = self.lookup(&format!("{base}[{}]", k))
+                {
+                    let index = Box::new(num(self, k));
+                    let p = ast::Expr::Index {
+                        base: Box::new(e.clone()),
+                        index,
+                    };
+                    out.push(match c {
+                        ast::PortConn::Named(name, _) => ast::PortConn::Named(name, Some(Some(p))),
+                        _ => ast::PortConn::Ordered(Some(p)),
+                    });
+                } else {
+                    out.push(c.clone());
+                }
+                continue;
+            }
             let pw = port.ty.width() as i64;
             let cx = expr::Cx::new(false);
             let part = if let Some(at) = self.array_type(&cx, e)
@@ -1776,6 +1829,42 @@ impl<'a, 't> Elab<'a, 't> {
         Ok(Override::Value(v, ty))
     }
 
+    /// Bind just the interface ports of `child`.
+    fn connect_ifaces(
+        &mut self,
+        child: ScopeId,
+        conns: &'t [ast::PortConn<'a>],
+        at: &'a str,
+    ) -> EResult<()> {
+        let ports = self.scopes[child.0 as usize].ports.clone();
+        for (pos, c) in conns.iter().enumerate() {
+            let (port, e) = match c {
+                ast::PortConn::Ordered(Some(e)) => (ports.get(pos), PortExpr::Expr(e)),
+                ast::PortConn::Named(n, Some(Some(e))) => {
+                    (ports.iter().find(|p| p.name == *n), PortExpr::Expr(e))
+                }
+                ast::PortConn::Named(n, None) => {
+                    (ports.iter().find(|p| p.name == *n), PortExpr::Name(n))
+                }
+                _ => continue,
+            };
+            if let Some(p) = port
+                && p.dir == Dir::Interface
+            {
+                self.connect_port(child, p, e)?;
+            }
+        }
+        if conns.iter().any(|c| matches!(c, ast::PortConn::Wildcard)) {
+            for p in ports.iter().filter(|p| p.dir == Dir::Interface) {
+                if !self.scopes[child.0 as usize].syms.contains_key(p.name) {
+                    self.connect_port(child, p, PortExpr::Name(p.name))?;
+                }
+            }
+        }
+        let _ = at;
+        Ok(())
+    }
+
     /// Connect a child's ports to expressions in the parent (the current scope).
     fn connect(
         &mut self,
@@ -1845,6 +1934,24 @@ impl<'a, 't> Elab<'a, 't> {
                 &name_expr
             }
         };
+        if p.dir == Dir::Interface {
+            // The port names the interface instance; `ifc.modport` names the
+            // instance too (modport restrictions are not checked).
+            let s = self.hier_scope(None, e).or_else(|| match e {
+                ast::Expr::Member { base, .. } => self.hier_scope(None, base),
+                _ => None,
+            });
+            let Some(s) = s else {
+                return Err(self.error(
+                    e.at(),
+                    format!("Interface port '{}' is not connected to an interface", p.name),
+                ));
+            };
+            self.scopes[child.0 as usize]
+                .syms
+                .insert(p.name, Sym::Scope(s));
+            return Ok(());
+        }
         // A plain name of the same width: the port and the net are one variable.
         if let ast::Expr::Ident(n) = e
             && let Some(Sym::Var(pv, pty)) = self.lookup(n)
@@ -1861,6 +1968,7 @@ impl<'a, 't> Elab<'a, 't> {
             Dir::Input => self.cont_assign_to_var(p.var, &p.ty, e),
             Dir::Output => self.cont_assign_from_var(e, p.var, &p.ty),
             Dir::Inout => Err(self.not_yet(e.at(), "inout ports connected to expressions")),
+            Dir::Interface => unreachable!("handled above"),
         }
     }
 
