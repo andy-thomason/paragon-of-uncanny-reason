@@ -543,12 +543,8 @@ impl<'a, 't> Elab<'a, 't> {
                 if let Some(e) = &v.init {
                     match self.try_const(e, &ty) {
                         Some(Value::Bits(b)) => self.d.vars[id.0 as usize].init = Some(b),
-                        _ => {
-                            return Err(self.not_yet(
-                                v.name,
-                                "non-constant initialisers of static block variables",
-                            ));
-                        }
+                        // Anything else is set once, at time 0.
+                        _ => self.init_process(id, ty.clone(), e, false)?,
                     }
                 }
             }

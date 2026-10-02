@@ -445,6 +445,7 @@ impl<'a, 't> Elab<'a, 't> {
                 }
             }
             Expr::IncDec { arg, .. } => self.self_type_cx(cx, arg)?,
+            Expr::Assign { lhs, .. } => self.self_type_cx(cx, lhs)?,
             Expr::Binary { op, lhs, rhs } => {
                 let (a, b) = (self.self_type_cx(cx, lhs)?, self.self_type_cx(cx, rhs)?);
                 match *op {
@@ -2916,8 +2917,40 @@ impl<'a, 't> Elab<'a, 't> {
                 let st = sty_of(&target);
                 Ok(self.resize(cx, v, st, want, at))
             }
-            Expr::IncDec { .. } | Expr::Assign { .. } => {
-                Err(self.not_yet(at, "assignments inside expressions"))
+            Expr::IncDec { op, prefix, arg } => {
+                // `x++` is x's old value, `++x` its new one.
+                let old = if *prefix {
+                    None
+                } else {
+                    Some(self.lower(cx, arg, want)?)
+                };
+                let one = Expr::Number("1");
+                let rhs = Expr::Binary {
+                    op: if *op == "++" { "+" } else { "-" },
+                    lhs: arg.clone(),
+                    rhs: Box::new(one),
+                };
+                self.assign(cx, arg, &rhs, false)?;
+                match old {
+                    Some(v) => Ok(v),
+                    None => self.lower(cx, arg, want),
+                }
+            }
+            Expr::Assign { lhs, op, rhs } => {
+                // `(a = b)`: assign, then the value of `a`.
+                let rhs_expr;
+                let rhs: &Expr<'a> = if *op != "=" {
+                    rhs_expr = Expr::Binary {
+                        op: &op[..op.len() - 1],
+                        lhs: lhs.clone(),
+                        rhs: rhs.clone(),
+                    };
+                    &rhs_expr
+                } else {
+                    rhs
+                };
+                self.assign(cx, lhs, rhs, false)?;
+                self.lower(cx, lhs, want)
             }
             other => Err(self.not_yet(other.at(), "this expression")),
         }
