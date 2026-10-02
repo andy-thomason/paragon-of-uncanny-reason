@@ -280,12 +280,14 @@ impl<'a, 't> Elab<'a, 't> {
                         fields.push((v.name, t));
                     }
                 }
-                if !packed {
-                    return Err(self.not_yet(kw, "unpacked structs"));
+                // An unpacked struct of integral members is laid out like a
+                // packed one: members, patterns and copies behave the same.
+                if !packed && !fields.iter().all(|(_, t)| t.is_integral()) {
+                    return Err(self.not_yet(kw, "unpacked structs with non-integral members"));
                 }
                 let mut t = Ty::scalar(Base::Struct {
                     fields: Rc::new(fields),
-                    packed: *packed,
+                    packed: true,
                     union: *kw == "union",
                 });
                 t.signed = *signing == Some("signed");
