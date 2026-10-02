@@ -55,7 +55,7 @@ Each design doc ends with a **Provenance** section that lists the sources used.
 | 00 | [Analysis plan](00-analysis-plan.md): how we gather everything needed to pass the test suite | Draft |
 | 01 | `01-test-suite-taxonomy.md`: machine-generated classification of every regression test | Planned |
 | 02 | `02-feature-inventory.md`: language features mapped to LRM clauses and tests | Planned |
-| 03 | `03-grammar.md`: formal grammar (preprocessor and language) with Verilator specialities | Planned |
+| 03 | [Grammar](03-grammar.md): formal grammar (preprocessor and language) with Verilator specialities | Draft (probes pending) |
 | 04 | `04-verilator-extensions.md`: metacomments, config files, `$c`, Verilator-only system tasks | Planned |
 | 05 | `05-simulation-semantics.md`: observable scheduling, 2-state/X rules, timing and display formatting | Planned |
 | 06 | `06-runtime-api.md`: the C++ harness API surface the tests use, plus DPI/VPI | Planned |
