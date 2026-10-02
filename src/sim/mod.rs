@@ -436,7 +436,7 @@ impl<'d, 'a> Simulator<'d, 'a> {
             if self.steps > self.max_steps {
                 return Some(End::Hung);
             }
-            if self.steps % 65536 == 0 && sink.cancelled() {
+            if self.steps.is_multiple_of(65536) && sink.cancelled() {
                 return Some(End::Cancelled);
             }
             let Some(frame) = self.threads[t].frames.last_mut() else {

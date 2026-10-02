@@ -493,7 +493,7 @@ impl sim::Sink for EventSink<'_> {
     fn cancelled(&self) -> bool {
         let n = self.checks.get().wrapping_add(1);
         self.checks.set(n);
-        self.events.is_closed() || (n % 1024 == 0 && self.timed_out())
+        self.events.is_closed() || (n.is_multiple_of(1024) && self.timed_out())
     }
 }
 
