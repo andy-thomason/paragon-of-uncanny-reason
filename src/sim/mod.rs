@@ -142,6 +142,8 @@ pub struct Simulator<'d, 'a> {
     forced: std::collections::HashMap<(VarId, Option<i64>), Forced>,
     /// Set while a write to a forced variable must not wake anyone itself.
     quiet: bool,
+    /// Combinational logic is settling before time 0 starts.
+    settling: bool,
     tokens: u64,
     /// Clocks driven from outside the design: the variable and its half period.
     clocks: Vec<(VarId, u64)>,
@@ -184,6 +186,7 @@ impl<'d, 'a> Simulator<'d, 'a> {
             clocks: Vec::new(),
             forced: Default::default(),
             quiet: false,
+            settling: false,
             tokens: 0,
             seq: 0,
             nba: Vec::new(),
@@ -276,12 +279,14 @@ impl<'d, 'a> Simulator<'d, 'a> {
             self.active.push_back(t);
         }
         let mut settled = None;
+        self.settling = true;
         while let Some(t) = self.active.pop_front() {
             if let Some(end) = self.run_thread(t, sink) {
                 settled = Some(end);
                 break;
             }
         }
+        self.settling = false;
         for p in &d.procs {
             if p.kind == ProcKind::Final || comb(p.kind) {
                 continue;
@@ -924,6 +929,21 @@ impl<'d, 'a> Simulator<'d, 'a> {
                     self.force(tok, *var, e.flatten(), p, v);
                 }
                 Some(Value::Bits(Bits::from_u64(64, tok)))
+            }
+            Op::Violation { format } => {
+                if self.settling {
+                    return None;
+                }
+                let unit = self.d.scopes[frame_scope.0 as usize].unit;
+                let text = format_display(
+                    &self.d.formats[format.0 as usize],
+                    &[],
+                    self.time,
+                    unit,
+                    self.d.precision,
+                );
+                sink.report(ReportSeverity::Error, &text, inst.at, self.time);
+                return Some(End::Stop);
             }
             Op::Release { var, elem, part } => {
                 let e = elem.map(|e| self.int(t, e)).flatten();

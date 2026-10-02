@@ -537,6 +537,8 @@ fn options(test: &Value, top: &str, name: &str) -> Result<Options, String> {
             o.include_dirs.push(dir.into());
         } else if f == "--top-module" || f == "--top" || f == "-top-module" {
             o.top = it.next().map(String::from);
+        } else if f == "--assert" || f == "--assert-case" {
+            o.assertions = true;
         } else if f == "-v" {
             o.lib_files.extend(it.next().map(String::from));
         } else if f == "--l2-name" {

@@ -46,6 +46,8 @@ pub struct ElabOptions {
     /// Indices of the files that are libraries (`-v`, `-y`): their modules
     /// are used where instantiated but are never tops.
     pub library_files: Vec<usize>,
+    /// Check `unique` and `priority` (Verilator's `--assert`).
+    pub assertions: bool,
 }
 
 /// Elaborate parsed files into a design.
@@ -58,6 +60,7 @@ pub fn elaborate<'a>(
     let made_subs = Arena::default();
     let mut e = Elab::new(sm, &made, &made_subs);
     e.d.root_name = opts.root_name.clone();
+    e.assertions = opts.assertions;
     e.run(files, opts);
     (e.d, e.diags)
 }
@@ -202,6 +205,8 @@ pub(crate) struct Elab<'a, 't> {
     pub(crate) func_class: HashMap<FuncId, (ClassId, bool)>,
     /// The built-in `randomize` method of each class.
     pub(crate) rand_funcs: HashSet<FuncId>,
+    /// See [`ElabOptions::assertions`].
+    pub(crate) assertions: bool,
     /// Out-of-class method bodies (`function C::f`), by class and name.
     pub(crate) out_of_class: HashMap<(&'a str, &'a str), &'t ast::Subroutine<'a>>,
     /// Interface instances made early, because a declaration used a type
@@ -248,6 +253,7 @@ impl<'a, 't> Elab<'a, 't> {
             classes: Vec::new(),
             func_class: HashMap::new(),
             rand_funcs: HashSet::new(),
+            assertions: false,
             out_of_class: HashMap::new(),
             early_insts: HashSet::new(),
             d: Design::default(),

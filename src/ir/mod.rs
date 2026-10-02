@@ -433,6 +433,9 @@ pub enum Op {
         value: Val,
         token: Option<Val>,
     },
+    /// A `unique`/`priority` violation: an error, then a stop. Not
+    /// reported while combinational logic first settles at time 0.
+    Violation { format: FormatId },
     /// `release`.
     Release {
         var: VarId,

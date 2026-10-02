@@ -680,6 +680,69 @@ impl<'a, 't> Elab<'a, 't> {
         Ok(())
     }
 
+    /// `unique`, `unique0` and `priority` checks (LRM 12.4.2, 12.5.3): an
+    /// error, and a stop, if more than one choice matches (`unique`,
+    /// `unique0`) or none does without an `else` or `default` (`unique`,
+    /// `priority`).
+    fn unique_check(
+        &mut self,
+        cx: &mut Cx<'a>,
+        kind: &'a str,
+        what: &str,
+        conds: &[&Expr<'a>],
+        has_else: bool,
+        at: &'a str,
+    ) -> EResult<()> {
+        let int = self.bits_type(32, false, false);
+        let bit = self.bits_type(1, false, false);
+        let mut count = cx.b.emit(Op::Const(Bits::zero(32)), int, at);
+        for c in conds {
+            let t = self.truth(cx, c)?;
+            let one = cx.b.emit(Op::Const(Bits::ones(1)), bit, at);
+            let hit = cx.b.emit(Op::Binary(BinOp::CaseEq, t, one), bit, at);
+            let w = cx.b.emit(
+                Op::Resize {
+                    value: hit,
+                    extend: Extend::Zero,
+                },
+                int,
+                at,
+            );
+            count = cx.b.emit(Op::Binary(BinOp::Add, count, w), int, at);
+        }
+        let zero = cx.b.emit(Op::Const(Bits::zero(32)), int, at);
+        let one = cx.b.emit(Op::Const(Bits::from_u64(32, 1)), int, at);
+        let f = cx.b.emit(Op::Const(Bits::zero(1)), bit, at);
+        let many = if kind == "priority" {
+            f
+        } else {
+            cx.b.emit(Op::Binary(BinOp::Gt, count, one), bit, at)
+        };
+        let none = if kind == "unique0" || has_else {
+            f
+        } else {
+            cx.b.emit(Op::Binary(BinOp::Eq, count, zero), bit, at)
+        };
+        let bad = cx.b.emit(Op::Binary(BinOp::Or, many, none), bit, at);
+        let (fail, ok) = (cx.b.new_block(), cx.b.new_block());
+        cx.b.terminate(Terminator::Branch {
+            cond: bad,
+            then: (fail, vec![]),
+            els: (ok, vec![]),
+        });
+        cx.b.switch_to(fail);
+        let path = self.d.scope_path(self.cur);
+        let text = self.sm.derive(
+            format!("Assertion failed in {path}: '{kind} {what}' statement violated"),
+            at,
+        );
+        let format = self.add_format(vec![FormatPiece::Text(text)]);
+        cx.b.effect(Op::Violation { format }, at);
+        cx.b.goto(ok);
+        cx.b.switch_to(ok);
+        Ok(())
+    }
+
     /// The value a force gives a target: all of `rhs`, or `width` bits from
     /// `offset` of it as `total` bits (one part of a concatenation).
     fn force_value(
@@ -934,8 +997,32 @@ impl<'a, 't> Elab<'a, 't> {
             } => self.lower_assign(cx, lhs, op, timing.as_ref(), rhs),
             Stmt::Expr(e) => self.expr_stmt(cx, e),
             Stmt::If {
-                cond, then, els, ..
+                cond,
+                then,
+                els,
+                unique,
+                kw,
             } => {
+                if let Some(u) = unique
+                    && self.assertions
+                {
+                    // The conditions of the whole `else if` chain, and whether
+                    // it ends in a plain `else`.
+                    let mut conds = vec![cond];
+                    let mut tail = els.as_deref();
+                    while let Some(Stmt::If {
+                        unique: None,
+                        cond,
+                        els,
+                        ..
+                    }) = tail
+                    {
+                        conds.push(cond);
+                        tail = els.as_deref();
+                    }
+                    let has_else = tail.is_some();
+                    self.unique_check(cx, u, "if", &conds, has_else, kw)?;
+                }
                 let c = self.truth(cx, cond)?;
                 let (tb, eb, join) = (cx.b.new_block(), cx.b.new_block(), cx.b.new_block());
                 cx.b.terminate(Terminator::Branch {
@@ -958,8 +1045,43 @@ impl<'a, 't> Elab<'a, 't> {
                 expr,
                 inside,
                 items,
-                ..
-            } => self.lower_case(cx, kw, expr, *inside, items, waits),
+                unique,
+            } => {
+                if let Some(u) = unique
+                    && self.assertions
+                    && (*inside || *kw == "case")
+                {
+                    // Each item matches if any of its labels does.
+                    let mut conds = Vec::new();
+                    for item in items.iter().filter(|i| !i.labels.is_empty()) {
+                        let m = if *inside {
+                            Expr::Inside {
+                                expr: Box::new(expr.clone()),
+                                set: item.labels.clone(),
+                            }
+                        } else {
+                            item.labels
+                                .iter()
+                                .map(|l| Expr::Binary {
+                                    op: "===",
+                                    lhs: Box::new(expr.clone()),
+                                    rhs: Box::new(l.clone()),
+                                })
+                                .reduce(|a, b| Expr::Binary {
+                                    op: "||",
+                                    lhs: Box::new(a),
+                                    rhs: Box::new(b),
+                                })
+                                .unwrap()
+                        };
+                        conds.push(m);
+                    }
+                    let has_default = items.iter().any(|i| i.labels.is_empty());
+                    let refs: Vec<&Expr<'a>> = conds.iter().collect();
+                    self.unique_check(cx, u, "case", &refs, has_default, kw)?;
+                }
+                self.lower_case(cx, kw, expr, *inside, items, waits)
+            }
             Stmt::For {
                 init,
                 cond,

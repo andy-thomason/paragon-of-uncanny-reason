@@ -93,6 +93,8 @@ pub struct Options {
     /// Library files (`-v`): read like the others, but their modules are
     /// only used where instantiated.
     pub lib_files: Vec<String>,
+    /// Check `unique` and `priority` statements (Verilator's `--assert`).
+    pub assertions: bool,
 }
 
 impl Default for Options {
@@ -115,6 +117,7 @@ impl Default for Options {
             time_limit: None,
             top_instance: None,
             lib_files: Vec::new(),
+            assertions: false,
         }
     }
 }
@@ -676,6 +679,7 @@ fn front_end<'a>(
             params: opts.params.clone(),
             top_instance: opts.top_instance.clone(),
             library_files: library,
+            assertions: opts.assertions,
         };
         let (design, elab_diags) = elab::elaborate(sm, &trees, &eopts);
         diags.extend(elab_diags.iter().map(|d| resolve(sm, d)));

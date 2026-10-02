@@ -225,6 +225,7 @@ impl BodyFmt<'_, '_> {
                 Self::part(part),
                 value.0
             ),
+            Op::Violation { format } => format!("violation fmt#{}", format.0),
             Op::Release { var, elem, part } => format!(
                 "release {}{}{}",
                 self.var(*var),
