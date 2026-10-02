@@ -191,6 +191,22 @@ TIME_UNIT       ::= "s" | "ms" | "us" | "ns" | "ps" | "fs"
   `--max-num-width` **(probe: the default)**.
 - Truncation and extension of over-long or short literals produce warnings (`WIDTH` family), not syntax errors.
 
+### 2.6a Lexer decisions taken from Verilator's tests
+
+- **Size and apostrophe must touch.** `8'hFF` is one literal, but after `#` a
+  number is always a delay: Verilator documents `#100'b0` and `# 100 'b0` as
+  `[#] [100] ['b0]` (`t_parse_delay`). Whitespace *after* the base is allowed
+  (`'h FF`).
+- **`global` is contextual.** It is reserved only before `clocking`, so
+  `reg global;` is legal (`t_var_rsvd`).
+- **Attribute instances are dropped** in the lexer. `(*)` and `(* )` inside
+  `@(...)` are event controls, not attributes (`t_attr_parenstar`).
+- **`` `pragma protect begin_protected `` envelopes are skipped** up to
+  `` `pragma protect end_protected ``.
+- **Mixed headers:** Verilator accepts a module header that switches from
+  non-ANSI to ANSI style part way (`t_clk_concat2`). We report it as `NOTYET`
+  for now.
+
 ### 2.7 Strings [LRM 5.9]
 
 ```

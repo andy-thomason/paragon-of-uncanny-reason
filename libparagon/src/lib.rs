@@ -24,10 +24,10 @@
 //! # Status
 //!
 //! [`simulate`] compiles the source and returns a [`Simulation`] whose events
-//! arrive as it runs. The pipeline exists only as far as the preprocessor:
-//! a source that fails to preprocess returns [`Error::Diagnostics`], and one
-//! that preprocesses cleanly returns [`Error::NotImplemented`] naming the next
-//! stage. The signature will not change as later stages are added.
+//! arrive as it runs. The pipeline exists only as far as the parser: a source
+//! with errors returns [`Error::Diagnostics`], and one that parses cleanly
+//! returns [`Error::NotImplemented`] naming the next stage. The signature will
+//! not change as later stages are added.
 
 mod channel;
 mod executor;
@@ -39,9 +39,11 @@ pub struct ReadmeDoctests;
 
 pub use executor::block_on;
 
+use paragon_of_uncanny_reason::keywords::Lang;
 use paragon_of_uncanny_reason::pp::emit::{EmitOptions, write};
 use paragon_of_uncanny_reason::pp::{self, FileSystem, Preprocessor};
 use paragon_of_uncanny_reason::source::SourceMap;
+use paragon_of_uncanny_reason::{lex, parse};
 use std::fmt;
 
 /// Settings for a run. [`Options::default`] suits a single self-contained source.
@@ -57,6 +59,12 @@ pub struct Options {
     pub read_includes_from_disk: bool,
     /// Emit `` `line `` markers in [`Preprocessed::text`] (`-E` rather than `-E -P`).
     pub line_markers: bool,
+    /// The language version, as `--language` takes it (`"1800-2017"`,
+    /// `"1364-2005"`). `None` means IEEE 1800-2023.
+    pub language: Option<String>,
+    /// More source files read from disk and compiled after the source text,
+    /// sharing its defines, as with extra files on Verilator's command line.
+    pub extra_files: Vec<String>,
 }
 
 impl Default for Options {
@@ -67,6 +75,8 @@ impl Default for Options {
             defines: Vec::new(),
             read_includes_from_disk: true,
             line_markers: false,
+            language: None,
+            extra_files: Vec::new(),
         }
     }
 }
@@ -293,9 +303,9 @@ pub async fn simulate(source: &str) -> Result<Simulation, Error> {
 /// own thread and reports through the returned [`Simulation`]. Compile-time
 /// warnings are its first events.
 pub async fn simulate_with(source: &str, opts: &Options) -> Result<Simulation, Error> {
-    let _pre = preprocess_with(source, opts).await?;
+    let _warnings = on_big_stack(|| front_end(source, opts, true))?.1;
     Err(Error::NotImplemented {
-        stage: Stage::Parse,
+        stage: Stage::Elaborate,
     })
 }
 
@@ -306,34 +316,98 @@ pub async fn preprocess(source: &str) -> Result<Preprocessed, Error> {
 
 /// Preprocess SystemVerilog source text, as `-E` does.
 pub async fn preprocess_with(source: &str, opts: &Options) -> Result<Preprocessed, Error> {
+    let (text, warnings) = on_big_stack(|| front_end(source, opts, false))?;
+    Ok(Preprocessed { text, warnings })
+}
+
+/// Stack for the compiler front end. Real designs (and some Verilator tests)
+/// nest deeply, and the parser and later passes recurse. This reserves
+/// address space; memory is only committed as the stack is used.
+const FRONT_END_STACK: usize = 256 << 20;
+
+/// Run `f` on a thread with a [`FRONT_END_STACK`] stack and wait for it.
+fn on_big_stack<T: Send>(f: impl FnOnce() -> T + Send) -> T {
+    std::thread::scope(|s| {
+        std::thread::Builder::new()
+            .stack_size(FRONT_END_STACK)
+            .spawn_scoped(s, f)
+            .expect("spawn front-end thread")
+            .join()
+            .unwrap_or_else(|e| std::panic::resume_unwind(e))
+    })
+}
+
+/// Preprocess the source text and any extra files and, if `parse`, lex and
+/// parse each one. Returns the `-E` text (when not parsing) and the warnings,
+/// or every diagnostic if there was an error.
+fn front_end(
+    source: &str,
+    opts: &Options,
+    parse: bool,
+) -> Result<(String, Vec<Diagnostic>), Error> {
+    let sm = SourceMap::new();
+    let lang = match opts.language.as_deref() {
+        None => Lang::Sv2023,
+        Some(l) => Lang::parse(l).ok_or_else(|| {
+            Error::Diagnostics(vec![Diagnostic {
+                severity: Severity::Error,
+                code: None,
+                file: String::new(),
+                line: 0,
+                col: 0,
+                message: format!("Unknown language specified: {l}"),
+                notes: Vec::new(),
+            }])
+        })?,
+    };
     let fs = TextFs {
         name: &opts.source_name,
         text: source,
         disk: opts.read_includes_from_disk,
+        extra: &opts.extra_files,
     };
-    let sm = SourceMap::new();
     let pp_opts = pp::Options {
         include_dirs: opts.include_dirs.clone(),
         defines: opts.defines.clone(),
         ..pp::Options::default()
     };
     let mut pp = Preprocessor::new(&sm, &fs, pp_opts);
-    pp.process_file(&opts.source_name);
-    let diags: Vec<Diagnostic> = pp.diagnostics().iter().map(|d| resolve(&sm, d)).collect();
+    let mut text = String::new();
+    let mut diags = Vec::new();
+    let mut seen = 0;
+    for file in std::iter::once(&opts.source_name).chain(&opts.extra_files) {
+        pp.process_file(file);
+        let tokens = pp.take_output();
+        let new = &pp.diagnostics()[seen..];
+        seen = pp.diagnostics().len();
+        diags.extend(new.iter().map(|d| resolve(&sm, d)));
+        if !parse {
+            text.push_str(&write(
+                &sm,
+                &tokens,
+                EmitOptions {
+                    line_markers: opts.line_markers,
+                },
+            ));
+            continue;
+        }
+        if new.iter().any(|d| d.severity == pp::Severity::Error) {
+            continue;
+        }
+        let lexed = lex::lex(&sm, &tokens, lang);
+        let (_tree, parse_diags) = parse::parse(&lexed);
+        diags.extend(
+            lexed
+                .diags
+                .iter()
+                .chain(&parse_diags)
+                .map(|d| resolve(&sm, d)),
+        );
+    }
     if diags.iter().any(|d| d.severity == Severity::Error) {
         return Err(Error::Diagnostics(diags));
     }
-    let text = write(
-        &sm,
-        pp.output(),
-        EmitOptions {
-            line_markers: opts.line_markers,
-        },
-    );
-    Ok(Preprocessed {
-        text,
-        warnings: diags,
-    })
+    Ok((text, diags))
 }
 
 /// The source text under its name, plus the disk for includes if allowed.
@@ -341,13 +415,15 @@ struct TextFs<'s> {
     name: &'s str,
     text: &'s str,
     disk: bool,
+    /// Extra source files, always read from disk.
+    extra: &'s [String],
 }
 
 impl FileSystem for TextFs<'_> {
     fn read(&self, path: &str) -> Option<String> {
         if path == self.name {
             Some(self.text.to_string())
-        } else if self.disk {
+        } else if self.disk || self.extra.iter().any(|e| e == path) {
             std::fs::read_to_string(path).ok()
         } else {
             None

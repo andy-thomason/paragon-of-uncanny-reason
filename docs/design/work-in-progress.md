@@ -13,17 +13,24 @@ smaller items left open along the way. Update it as items land.
 | Lossless lexer (tokens are `&str` slices) | Done | `src/pp/lexer.rs` |
 | Source map (positions without spans) | Done | `src/source.rs` |
 | Preprocessor and `-E` writer | Done, with known gaps below | `src/pp/` |
-| Async library `libparagon` and `paragon` CLI | API in place; stops after preprocessing | `libparagon/` |
-| Test manifest and runner | Not started | Step 1 below |
-| Language lexer and parser | Not started | Step 2 |
+| Async library `libparagon` and `paragon` CLI | API in place; stops after parsing | `libparagon/` |
+| Test manifest and runner | Done ([`01`](01-test-suite-taxonomy.md)) | `tools/manifest.py`, `runner/` |
+| Language lexer, parser, AST (`&str` slices) | Common subset done: 65% of T1 tests parse | `src/lex.rs`, `src/parse/`, `src/ast.rs` |
+| Elaboration | Not started | Next |
 | Simulator | Not started | Step 3 |
+
+## Progress (2026-10-02)
+
+The runner shows **1,399 of 2,139 T1 tests (65%)** getting through the front end
+to elaboration. Another 722 stop at a named unsupported construct, and only 3
+hit genuine front-end errors. Full table: [`01`](01-test-suite-taxonomy.md).
 
 ## Next steps
 
 The aim is a thin slice through the whole pipeline, so the simplest Verilator
 tests pass through `simulate()` and progress is a measured pass rate.
 
-### Step 1: Test manifest and runner (Phase 1 of the plan)
+### Step 1: Test manifest and runner (Phase 1 of the plan): **done**
 
 - An extractor that reads the 4,478 `t_*.py` drivers **as data**. It must not
   run them or import Verilator's harness. It writes `tests/manifest.json`
@@ -37,7 +44,20 @@ tests pass through `simulate()` and progress is a measured pass rate.
 - **Done when:** every test is classified (any left over are listed for manual
   review), and the runner produces a per-tier summary in CI.
 
-### Step 2: Language lexer and parser
+### Step 2: Language lexer and parser: **common subset done**
+
+Status: about 64% of CC0 sources parse, and the rest stop at a named
+`NOTYET` construct. With no driver flags there are no remaining genuine syntax
+errors in non-`_bad` CC0 sources; the 12 left need `-D` defines or
+`--language`. The parser runs on a 256 MB stack (`libparagon`), with a
+nesting limit, because `t_if_deep.v` nests several hundred deep.
+
+Next parser work, by tests unlocked: classes (684), concurrent assertions and
+properties (128), virtual interfaces (76), covergroups (60), clocking blocks
+(60), user-defined primitives (26). Also needed: `.vlt` control files and `-f`
+option files (about 40 setup failures).
+
+Original plan:
 
 - A light lexer on top of the preprocessor's token stream, keeping the `&str`
   approach: keywords per language mode (`03-grammar.md` §1), numbers split
@@ -129,4 +149,8 @@ system bison is too old). Options: install Homebrew, or run Verilator in Docker.
 
 - [ ] Decide how to reproduce Verilator's end-of-file error positions, which
   differ by mode (see `tests/fixtures/verilator_cc0/README.md`).
+- [ ] The 37 T2 tests where our first diagnostic is at a different place from
+  the golden's (`paragon-runner --list wrong-diagnostic`). Verilator points at
+  operands (an include filename, the end of an `` `ifdef `` expression), past
+  end of file, or at the start of a construct.
 - [ ] Column numbering with tabs: we count a tab as one column (unconfirmed).

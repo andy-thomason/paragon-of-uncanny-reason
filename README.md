@@ -15,14 +15,15 @@ the rules, and [`docs/design/`](docs/design/) for the design documents.
 | Stage | State |
 |---|---|
 | Preprocessor (`` `define ``, `` `ifdef ``, `` `include ``, `-E`) | Working. Matches Verilator's golden output; see below |
-| Parser | Not started |
+| Lexer and parser (AST of `&str` slices) | Working for the common subset: 64% of CC0 test sources parse; the rest stop at a named unsupported construct, mostly classes |
+| Test manifest and runner | Working: classifies all 4,447 Verilator tests and reports progress by tier |
 | Elaboration | Not started |
 | Simulation | Not started |
 
 `simulate()` compiles the source and returns a running `Simulation` that
 streams events such as `$display` output. The pipeline exists only as far as
-the preprocessor, so today it returns
-`Error::NotImplemented { stage: Stage::Parse }` after preprocessing. The
+the parser, so today it returns
+`Error::NotImplemented { stage: Stage::Elaborate }` after parsing. The
 signature will stay the same as later stages arrive.
 
 The preprocessor is tested against Verilator's own CC0 golden files:
@@ -106,11 +107,11 @@ $ paragon counter.sv
 %Error: Exiting due to 1 error(s)
 ```
 
-Running without `-E` simulates. For now that stops after preprocessing:
+Running without `-E` simulates. For now that stops after parsing:
 
 ```console
 $ paragon +incdir+inc counter.sv
-%Error: Parse is not implemented yet
+%Error: Elaborate is not implemented yet
 ```
 
 ## Library
@@ -147,7 +148,7 @@ block_on(async {
     let mut sim = match simulate(source).await {
         Ok(sim) => sim,
         Err(Error::Diagnostics(diags)) => return diags.iter().for_each(|d| eprintln!("{d}")),
-        Err(e) => return eprintln!("{e}"), // today: "Parse is not implemented yet"
+        Err(e) => return eprintln!("{e}"), // today: "Elaborate is not implemented yet"
     };
     while let Some(event) = sim.next_event().await {
         match event {
@@ -210,16 +211,31 @@ async fn main() -> Result<(), libparagon::Error> {
 }
 ```
 
+## Progress against the Verilator test suite
+
+`paragon-runner` runs every Verilator regression test through `libparagon`
+and reports how far each one gets. Today, 1,399 of the 2,139 self-checking
+simulation tests (65%) get through preprocessing and parsing. Most of the rest
+stop at classes or assertions. See
+[`docs/design/01-test-suite-taxonomy.md`](docs/design/01-test-suite-taxonomy.md).
+
+```console
+$ python3 tools/manifest.py                 # classify the tests (needs ../verilator)
+$ cargo run --release -p paragon-runner     # summary by tier
+$ cargo run --release -p paragon-runner -- --tier T1 --list not-yet
+```
+
 ## Repository layout
 
 | Path | Contents |
 |---|---|
-| `src/` | Core crate: lossless lexer (`pp/lexer.rs`), preprocessor (`pp/mod.rs`), `-E` writer (`pp/emit.rs`), source map (`source.rs`) |
+| `src/` | Core crate: preprocessor lexer (`pp/lexer.rs`), preprocessor (`pp/mod.rs`), `-E` writer (`pp/emit.rs`), language lexer (`lex.rs`), parser (`parse/`), syntax tree (`ast.rs`), source map (`source.rs`) |
+| `runner/` | `paragon-runner`, which runs the Verilator tests and reports progress |
 | `libparagon/` | Async library API and the `paragon` command-line tool |
 | `docs/design/` | Design documents: analysis plan, grammar |
 | `tests/` | Golden-output and corpus tests |
 | `tests/fixtures/verilator_cc0/` | Test inputs and golden outputs copied from Verilator's CC0 test files |
-| `tools/` | Corpus survey scripts |
+| `tools/` | Test manifest extractor and corpus survey scripts |
 
 ## Testing
 

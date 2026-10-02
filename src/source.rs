@@ -76,6 +76,7 @@ struct LineRemap {
 }
 
 struct Buffer {
+    /// The text followed by one NUL guard byte (see [`SourceMap::add`]).
     text: Box<str>,
     origin: Origin,
     /// Byte offsets where each line starts. Built on first use.
@@ -112,9 +113,15 @@ impl SourceMap {
     }
 
     /// Add a buffer and borrow its text for the life of the map.
-    pub fn add(&self, text: String, origin: Origin) -> (BufId, &str) {
+    ///
+    /// Each buffer is stored with a trailing NUL guard byte that is not part of
+    /// the returned text. So no two buffers are ever adjacent in memory, and
+    /// two slices that touch (one ends where the other starts) must come from
+    /// the same buffer. [`join`] relies on this.
+    pub fn add(&self, mut text: String, origin: Origin) -> (BufId, &str) {
+        text.push('\0');
         let text = text.into_boxed_str();
-        let ptr: *const str = &*text;
+        let ptr: *const str = &text[..text.len() - 1];
         let mut bufs = self.buffers.borrow_mut();
         let id = BufId(bufs.len() as u32);
         bufs.push(Buffer {
@@ -143,8 +150,7 @@ impl SourceMap {
         let bufs = self.buffers.borrow();
         bufs.iter().enumerate().rev().find_map(|(i, b)| {
             let start = b.text.as_ptr() as usize;
-            (p >= start && p + s.len() <= start + b.text.len())
-                .then(|| (BufId(i as u32), p - start))
+            (p >= start && p + s.len() < start + b.text.len()).then(|| (BufId(i as u32), p - start))
         })
     }
 
@@ -154,7 +160,7 @@ impl SourceMap {
 
     /// The text of a buffer.
     pub fn text(&self, id: BufId) -> &str {
-        let ptr: *const str = &*self.buffers.borrow()[id.0 as usize].text;
+        let ptr: *const str = self.buffers.borrow()[id.0 as usize].body();
         // SAFETY: as in `add`.
         unsafe { &*ptr }
     }
@@ -183,7 +189,7 @@ impl SourceMap {
                 Origin::File { name, .. } => {
                     let bufs = self.buffers.borrow();
                     let b = &bufs[id.0 as usize];
-                    let starts = b.line_starts.get_or_init(|| line_starts(&b.text));
+                    let starts = b.line_starts.get_or_init(|| line_starts(b.body()));
                     let line0 = starts.partition_point(|&st| st <= off) - 1;
                     let col = b.text[starts[line0]..off].chars().count() + 1;
                     let phys = line0 + 1;
@@ -203,6 +209,30 @@ impl SourceMap {
     }
 }
 
+impl Buffer {
+    /// The text without its guard byte.
+    fn body(&self) -> &str {
+        &self.text[..self.text.len() - 1]
+    }
+}
+
+/// Join two touching slices into one: `b` must start exactly where `a` ends.
+/// Returns `None` if they don't touch.
+///
+/// Touching slices of text in a [`SourceMap`] always come from the same
+/// buffer, because buffers are separated by a guard byte.
+pub fn join<'a>(a: &'a str, b: &'a str) -> Option<&'a str> {
+    if a.as_ptr().wrapping_add(a.len()) != b.as_ptr() {
+        return None;
+    }
+    // SAFETY: `a` and `b` are adjacent, so the bytes from the start of `a` to
+    // the end of `b` are one allocation. Both are valid UTF-8 and the join is
+    // at a char boundary, so the whole range is valid UTF-8.
+    Some(unsafe {
+        std::str::from_utf8_unchecked(std::slice::from_raw_parts(a.as_ptr(), a.len() + b.len()))
+    })
+}
+
 fn line_starts(text: &str) -> Vec<usize> {
     let b = text.as_bytes();
     let mut v = vec![0];
@@ -217,6 +247,17 @@ fn line_starts(text: &str) -> Vec<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn join_touching_slices_only() {
+        let sm = SourceMap::new();
+        let (_, a) = sm.add("abc".into(), Origin::CommandLine);
+        let (_, b) = sm.add("def".into(), Origin::CommandLine);
+        assert_eq!(join(&a[0..1], &a[1..3]), Some("abc"));
+        assert_eq!(join(&a[0..1], &a[2..3]), None);
+        // Separate buffers never touch, thanks to the guard byte.
+        assert_eq!(join(a, b), None);
+    }
 
     #[test]
     fn source_map_follows_derived_text() {

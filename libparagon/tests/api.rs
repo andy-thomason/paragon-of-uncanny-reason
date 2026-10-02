@@ -15,21 +15,44 @@ fn simulate_reports_the_first_missing_stage() {
     assert_eq!(
         r,
         Some(Error::NotImplemented {
-            stage: Stage::Parse
+            stage: Stage::Elaborate
         })
     );
 }
 
 #[test]
-fn simulate_reports_preprocessor_errors_with_positions() {
-    let r = block_on(simulate_with("\n`ifdef X\n", &no_disk())).err();
+fn simulate_reports_syntax_errors() {
+    let r = block_on(simulate_with(
+        "module t;\n  wire = 1;\nendmodule\n",
+        &no_disk(),
+    ))
+    .err();
     let Some(Error::Diagnostics(d)) = r else {
         panic!("{r:?}")
     };
-    assert_eq!(d.len(), 1);
     assert_eq!(
         d[0].to_string(),
-        "%Error: input.sv:3:1: `ifdef not terminated at EOF"
+        "%Error: input.sv:2:8: syntax error, unexpected '=', expecting identifier"
+    );
+}
+
+#[test]
+fn language_option_changes_keywords() {
+    // `logic` is a keyword in SystemVerilog but an ordinary name in Verilog-2005.
+    let src = "module t; integer logic; endmodule\n";
+    assert!(matches!(
+        block_on(simulate_with(src, &no_disk())).err(),
+        Some(Error::Diagnostics(_))
+    ));
+    let opts = Options {
+        language: Some("1364-2005".into()),
+        ..no_disk()
+    };
+    assert_eq!(
+        block_on(simulate_with(src, &opts)).err(),
+        Some(Error::NotImplemented {
+            stage: Stage::Elaborate
+        })
     );
 }
 

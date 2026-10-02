@@ -8,4 +8,4 @@ repository = "https://github.com/andy-thomason/paragon-of-uncanny-reason"
 [dependencies]
 
 [workspace]
-members = ["libparagon"]
+members = ["libparagon", "runner"]

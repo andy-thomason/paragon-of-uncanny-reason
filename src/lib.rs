@@ -2,5 +2,10 @@
 //!
 //! DO NOT COPY CODE from Verilator. See `docs/design/README.md`.
 
+pub mod ast;
+pub mod diag;
+pub mod keywords;
+pub mod lex;
+pub mod parse;
 pub mod pp;
 pub mod source;

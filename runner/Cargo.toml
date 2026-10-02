@@ -1,0 +1,12 @@
+[package]
+name = "paragon-runner"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/andy-thomason/paragon-of-uncanny-reason"
+description = "Runs the Verilator regression tests through libparagon and reports progress"
+publish = false
+
+[dependencies]
+libparagon = { path = "../libparagon" }
+serde_json = "1"

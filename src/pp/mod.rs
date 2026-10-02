@@ -16,23 +16,7 @@ use crate::source::{BufId, Origin, SourceMap};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Severity {
-    Error,
-    Warning,
-}
-
-/// A preprocessor diagnostic. `at` is a slice of a source-map buffer and is
-/// resolved to a position with [`SourceMap::locate`].
-#[derive(Clone, Debug)]
-pub struct Diag<'a> {
-    pub severity: Severity,
-    pub code: Option<&'static str>,
-    pub at: &'a str,
-    pub message: String,
-    /// Related positions, such as a previous definition.
-    pub notes: Vec<(&'a str, String)>,
-}
+pub use crate::diag::{Diag, Severity};
 
 /// Where the preprocessor reads files from.
 pub trait FileSystem {

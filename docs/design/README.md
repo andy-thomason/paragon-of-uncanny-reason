@@ -54,7 +54,7 @@ Each design doc ends with a **Provenance** section that lists the sources used.
 |---|---|---|
 | WIP | [Work in progress](work-in-progress.md): current status, next steps and open items | Living |
 | 00 | [Analysis plan](00-analysis-plan.md): how we gather everything needed to pass the test suite | Draft |
-| 01 | `01-test-suite-taxonomy.md`: machine-generated classification of every regression test | Planned |
+| 01 | [Test-suite taxonomy](01-test-suite-taxonomy.md): classification of every regression test, and the runner | Draft |
 | 02 | `02-feature-inventory.md`: language features mapped to LRM clauses and tests | Planned |
 | 03 | [Grammar](03-grammar.md): formal grammar (preprocessor and language) with Verilator specialities | Draft (probes pending) |
 | 04 | `04-verilator-extensions.md`: metacomments, config files, `$c`, Verilator-only system tasks | Planned |
