@@ -16,14 +16,38 @@ smaller items left open along the way. Update it as items land.
 | Async library `libparagon` and `paragon` CLI | API in place; stops after parsing | `libparagon/` |
 | Test manifest and runner | Done ([`01`](01-test-suite-taxonomy.md)) | `tools/manifest.py`, `runner/` |
 | Language lexer, parser, AST (`&str` slices) | Common subset done: 65% of T1 tests parse | `src/lex.rs`, `src/parse/`, `src/ast.rs` |
-| Elaboration | Not started | Next |
-| Simulator | Not started | Step 3 |
+| Elaboration: AST → linear IR | Done for the common subset: 567 of 2,139 T1 tests (27%) elaborate completely | `src/elab/`, `src/ir/`, `src/bits.rs`, `src/eval.rs` |
+| Simulator | Not started | Next: the interpreter over the IR |
 
 ## Progress (2026-10-02)
 
-The runner shows **1,399 of 2,139 T1 tests (65%)** getting through the front end
-to elaboration. Another 722 stop at a named unsupported construct, and only 3
-hit genuine front-end errors. Full table: [`01`](01-test-suite-taxonomy.md).
+The runner shows **567 of 2,139 T1 tests (27%)** elaborating completely into
+IR and waiting only for the simulator. Another 1,508 stop at a named
+unsupported construct and 49 hit front-end errors. Before elaboration existed,
+1,399 parsed. 46 T2 tests already match Verilator's first diagnostic location.
+Full table: [`01`](01-test-suite-taxonomy.md).
+
+### Elaboration (done for the common subset)
+
+- **Two phases.** First the whole scope tree is built: parameters, ports,
+  implicit nets and generate expansion. Then the code of every scope is lowered.
+  Hierarchical references, including upward ones, therefore reach any scope.
+- **Declaration order.** Parameters and typedefs are resolved in dependency
+  order, because Verilator accepts forward references (`t_param`). Functions
+  are declared first and lowered on demand, so constant functions work in
+  parameter expressions; `eval.rs` runs them.
+- **Ports.** A port connected to a same-width variable becomes an alias of it.
+  Anything else becomes a continuous-assignment process.
+- **Library search.** A module that no file defines is looked for as
+  `<dir>/<module>.v`/`.sv` (`-y`); the runner searches `t/` as the test driver does.
+- **Width rules.** LRM §11.8 is applied in `elab/expr.rs` (self-determined
+  types, then propagation), with explicit `Resize`.
+- **Inspect the result:** `paragon --ir file.sv`.
+
+Biggest gaps by T1 tests blocked: classes (684), interfaces (189),
+assignments of non-integral types such as strings and unpacked arrays (157),
+concurrent assertions (102), keyed assignment patterns (85), output/inout
+subroutine arguments (78), instance arrays (70), unpacked structs (57).
 
 ## Next steps
 
@@ -73,7 +97,7 @@ Original plan:
   reports coverage. Every source in the chosen subset parses, and the expected
   syntax errors fail at the right first location.
 
-### Step 3: A minimal simulator for that subset
+### Step 3: A minimal simulator for that subset: **next**
 
 - An interpreter: 2-state values of any width, the active and NBA
   scheduling regions (`05-simulation-semantics.md` when written),

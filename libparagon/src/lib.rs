@@ -24,9 +24,9 @@
 //! # Status
 //!
 //! [`simulate`] compiles the source and returns a [`Simulation`] whose events
-//! arrive as it runs. The pipeline exists only as far as the parser: a source
-//! with errors returns [`Error::Diagnostics`], and one that parses cleanly
-//! returns [`Error::NotImplemented`] naming the next stage. The signature will
+//! arrive as it runs. The pipeline exists as far as elaboration: a source
+//! with errors returns [`Error::Diagnostics`], and one that elaborates
+//! cleanly returns [`Error::NotImplemented`] naming the next stage. The signature will
 //! not change as later stages are added.
 
 mod channel;
@@ -43,7 +43,7 @@ use paragon_of_uncanny_reason::keywords::Lang;
 use paragon_of_uncanny_reason::pp::emit::{EmitOptions, write};
 use paragon_of_uncanny_reason::pp::{self, FileSystem, Preprocessor};
 use paragon_of_uncanny_reason::source::SourceMap;
-use paragon_of_uncanny_reason::{lex, parse};
+use paragon_of_uncanny_reason::{elab, lex, parse};
 use std::fmt;
 
 /// Settings for a run. [`Options::default`] suits a single self-contained source.
@@ -65,6 +65,14 @@ pub struct Options {
     /// More source files read from disk and compiled after the source text,
     /// sharing its defines, as with extra files on Verilator's command line.
     pub extra_files: Vec<String>,
+    /// The top module (`--top-module`). By default, every module that no
+    /// other module instantiates is a top.
+    pub top: Option<String>,
+    /// Library directories (`-y`): a module that no file defines is looked
+    /// for as `<dir>/<module><ext>`.
+    pub lib_dirs: Vec<String>,
+    /// Extensions tried in library directories (`+libext+`).
+    pub lib_exts: Vec<String>,
 }
 
 impl Default for Options {
@@ -77,6 +85,9 @@ impl Default for Options {
             line_markers: false,
             language: None,
             extra_files: Vec::new(),
+            top: None,
+            lib_dirs: Vec::new(),
+            lib_exts: vec![".v".into(), ".sv".into()],
         }
     }
 }
@@ -303,10 +314,16 @@ pub async fn simulate(source: &str) -> Result<Simulation, Error> {
 /// own thread and reports through the returned [`Simulation`]. Compile-time
 /// warnings are its first events.
 pub async fn simulate_with(source: &str, opts: &Options) -> Result<Simulation, Error> {
-    let _warnings = on_big_stack(|| front_end(source, opts, true))?.1;
+    let _warnings = on_big_stack(|| front_end(source, opts, Goal::Elaborate))?.1;
     Err(Error::NotImplemented {
-        stage: Stage::Elaborate,
+        stage: Stage::Simulate,
     })
+}
+
+/// Compile SystemVerilog source text and return the elaborated IR as text,
+/// with any warnings, for inspection (`paragon --ir`).
+pub async fn lower_with(source: &str, opts: &Options) -> Result<(String, Vec<Diagnostic>), Error> {
+    on_big_stack(|| front_end(source, opts, Goal::Elaborate))
 }
 
 /// Preprocess SystemVerilog source text with default [`Options`].
@@ -316,7 +333,7 @@ pub async fn preprocess(source: &str) -> Result<Preprocessed, Error> {
 
 /// Preprocess SystemVerilog source text, as `-E` does.
 pub async fn preprocess_with(source: &str, opts: &Options) -> Result<Preprocessed, Error> {
-    let (text, warnings) = on_big_stack(|| front_end(source, opts, false))?;
+    let (text, warnings) = on_big_stack(|| front_end(source, opts, Goal::Preprocess))?;
     Ok(Preprocessed { text, warnings })
 }
 
@@ -337,14 +354,18 @@ fn on_big_stack<T: Send>(f: impl FnOnce() -> T + Send) -> T {
     })
 }
 
-/// Preprocess the source text and any extra files and, if `parse`, lex and
-/// parse each one. Returns the `-E` text (when not parsing) and the warnings,
-/// or every diagnostic if there was an error.
-fn front_end(
-    source: &str,
-    opts: &Options,
-    parse: bool,
-) -> Result<(String, Vec<Diagnostic>), Error> {
+/// How far [`front_end`] goes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Goal {
+    Preprocess,
+    Elaborate,
+}
+
+/// Preprocess the source text and any extra files, then (for
+/// [`Goal::Elaborate`]) lex, parse and elaborate them. Returns the `-E` text
+/// or the IR text, and the warnings; or every diagnostic if there was an error.
+fn front_end(source: &str, opts: &Options, goal: Goal) -> Result<(String, Vec<Diagnostic>), Error> {
+    let parse = goal == Goal::Elaborate;
     let sm = SourceMap::new();
     let lang = match opts.language.as_deref() {
         None => Lang::Sv2023,
@@ -375,8 +396,28 @@ fn front_end(
     let mut text = String::new();
     let mut diags = Vec::new();
     let mut seen = 0;
-    for file in std::iter::once(&opts.source_name).chain(&opts.extra_files) {
-        pp.process_file(file);
+    let mut trees = Vec::new();
+    // Files to compile: the source, the extra files, then library files found
+    // for modules nobody defines (as Verilator's -y does).
+    let mut queue: Vec<String> = std::iter::once(&opts.source_name)
+        .chain(&opts.extra_files)
+        .cloned()
+        .collect();
+    let mut next = 0;
+    loop {
+        if next == queue.len() {
+            if !parse || !opts.read_includes_from_disk {
+                break;
+            }
+            let found = library_files(&trees, opts, &queue);
+            if found.is_empty() {
+                break;
+            }
+            queue.extend(found);
+        }
+        let file = queue[next].clone();
+        next += 1;
+        pp.process_file(&file);
         let tokens = pp.take_output();
         let new = &pp.diagnostics()[seen..];
         seen = pp.diagnostics().len();
@@ -395,7 +436,7 @@ fn front_end(
             continue;
         }
         let lexed = lex::lex(&sm, &tokens, lang);
-        let (_tree, parse_diags) = parse::parse(&lexed);
+        let (tree, parse_diags) = parse::parse(&lexed);
         diags.extend(
             lexed
                 .diags
@@ -403,11 +444,61 @@ fn front_end(
                 .chain(&parse_diags)
                 .map(|d| resolve(&sm, d)),
         );
+        trees.push(tree);
     }
     if diags.iter().any(|d| d.severity == Severity::Error) {
         return Err(Error::Diagnostics(diags));
     }
+    if parse {
+        let eopts = elab::ElabOptions {
+            top: opts.top.clone(),
+        };
+        let (design, elab_diags) = elab::elaborate(&sm, &trees, &eopts);
+        diags.extend(elab_diags.iter().map(|d| resolve(&sm, d)));
+        if diags.iter().any(|d| d.severity == Severity::Error) {
+            return Err(Error::Diagnostics(diags));
+        }
+        text = design.to_string();
+    }
     Ok((text, diags))
+}
+
+/// Library files (`<dir>/<module><ext>`) for modules instantiated but not defined.
+fn library_files(
+    trees: &[paragon_of_uncanny_reason::ast::SourceText<'_>],
+    opts: &Options,
+    have: &[String],
+) -> Vec<String> {
+    let mut defined = std::collections::HashSet::new();
+    let mut used = Vec::new();
+    for t in trees {
+        let (d, u) = elab::module_refs(t);
+        defined.extend(d);
+        used.extend(u);
+    }
+    let mut found = Vec::new();
+    for m in used {
+        if defined.contains(m) {
+            continue;
+        }
+        'search: for dir in &opts.lib_dirs {
+            for ext in &opts.lib_exts {
+                let path = if dir == "." {
+                    format!("{m}{ext}")
+                } else {
+                    format!("{dir}/{m}{ext}")
+                };
+                if !have.contains(&path)
+                    && !found.contains(&path)
+                    && std::path::Path::new(&path).is_file()
+                {
+                    found.push(path);
+                    break 'search;
+                }
+            }
+        }
+    }
+    found
 }
 
 /// The source text under its name, plus the disk for includes if allowed.
@@ -424,6 +515,7 @@ impl FileSystem for TextFs<'_> {
         if path == self.name {
             Some(self.text.to_string())
         } else if self.disk || self.extra.iter().any(|e| e == path) {
+            // Library files are found by the caller and read from disk too.
             std::fs::read_to_string(path).ok()
         } else {
             None

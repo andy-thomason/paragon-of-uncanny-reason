@@ -50,6 +50,7 @@ impl Outcome {
             Outcome::WrongOutput(_) => "wrong-output",
             Outcome::NotYet(_) => "not-yet",
             Outcome::FrontEndError(_) => "front-end-error",
+            Outcome::Reached(Stage::Simulate) => "reached-simulate",
             Outcome::Reached(Stage::Elaborate) => "reached-elaborate",
             Outcome::Reached(_) => "reached-other",
             Outcome::Waived(_) => "waived",
@@ -348,6 +349,8 @@ fn options(test: &Value, top: &str, name: &str) -> Result<Options, String> {
     let mut o = Options {
         source_name: top.to_string(),
         include_dirs: vec!["t".into(), ".".into()],
+        // The test driver searches t/ for modules, as `-y t` would.
+        lib_dirs: vec!["t".into()],
         defines: vec![
             ("TEST_OBJ_DIR".into(), format!("obj_vlt/{name}")),
             ("TEST_DUMPFILE".into(), format!("obj_vlt/{name}/simx.vcd")),
@@ -368,8 +371,17 @@ fn options(test: &Value, top: &str, name: &str) -> Result<Options, String> {
         } else if let Some(dirs) = f.strip_prefix("+incdir+") {
             o.include_dirs
                 .extend(dirs.split('+').filter(|d| !d.is_empty()).map(String::from));
+        } else if f == "-y" {
+            if let Some(d) = it.next() {
+                o.lib_dirs.push(d.into());
+            }
+        } else if let Some(exts) = f.strip_prefix("+libext+") {
+            o.lib_exts
+                .extend(exts.split('+').filter(|e| !e.is_empty()).map(String::from));
         } else if let Some(dir) = f.strip_prefix("-I") {
             o.include_dirs.push(dir.into());
+        } else if f == "--top-module" || f == "--top" || f == "-top-module" {
+            o.top = it.next().map(String::from);
         } else if f == "--language" || f == "--default-language" || f == "-language" {
             o.language = it.next().map(String::from);
         } else if let Some((l, _suffix)) = f
@@ -456,6 +468,7 @@ const ORDER: &[&str] = &[
     "pass",
     "pass-diagnostic",
     "failed-as-expected",
+    "reached-simulate",
     "reached-elaborate",
     "reached-other",
     "wrong-output",

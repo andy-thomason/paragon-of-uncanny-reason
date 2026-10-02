@@ -454,8 +454,13 @@ impl<'a> Parser<'a> {
                 || self.is_op_at(1, ")")
                 || self.is_op_at(1, ";")
                 || (self.is_op_at(1, "[") && !self.ident_after_dims(self.pos + 1)));
+        // `ty` is `None` only for `parameter type`; a value parameter with no
+        // written type gets an implicit one.
         let ty = if name_first {
-            None
+            Some(DataType::Implicit {
+                signing: None,
+                packed: Vec::new(),
+            })
         } else {
             Some(self.data_type_or_implicit()?)
         };

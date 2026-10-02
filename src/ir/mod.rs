@@ -32,6 +32,8 @@
 //! As in the AST, names and diagnostic sites are `&'a str` slices of source
 //! text, so positions come from [`SourceMap::locate`](crate::source::SourceMap::locate).
 
+mod print;
+
 // ---------------------------------------------------------------- ids
 
 macro_rules! id {
@@ -414,6 +416,8 @@ pub enum Wait {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Edge {
+    /// Any change of value (`@(a)`).
+    Any,
     Pos,
     Neg,
     Both,
@@ -468,6 +472,10 @@ pub enum BinOp {
     CaseNe,
     WildEq,
     WildNe,
+    /// `casez` item match: Z or `?` bits in either operand match anything.
+    CaseZEq,
+    /// `casex` item match: X, Z or `?` bits in either operand match anything.
+    CaseXEq,
     Lt,
     Le,
     Gt,
@@ -486,6 +494,8 @@ pub enum DisplayKind {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SysFunc {
+    /// `$clog2` of a value known only at run time.
+    Clog2,
     Time,
     Stime,
     Realtime,

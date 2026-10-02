@@ -17,14 +17,14 @@ the rules, and [`docs/design/`](docs/design/) for the design documents.
 | Preprocessor (`` `define ``, `` `ifdef ``, `` `include ``, `-E`) | Working. Matches Verilator's golden output; see below |
 | Lexer and parser (AST of `&str` slices) | Working for the common subset: 64% of CC0 test sources parse; the rest stop at a named unsupported construct, mostly classes |
 | Test manifest and runner | Working: classifies all 4,447 Verilator tests and reports progress by tier |
-| Elaboration | Not started |
+| Elaboration to a linear IR | Working for the common subset: 27% of self-checking tests elaborate; `paragon --ir` prints the IR |
 | Simulation | Not started |
 
 `simulate()` compiles the source and returns a running `Simulation` that
-streams events such as `$display` output. The pipeline exists only as far as
-the parser, so today it returns
-`Error::NotImplemented { stage: Stage::Elaborate }` after parsing. The
-signature will stay the same as later stages arrive.
+streams events such as `$display` output. The pipeline exists as far as
+elaboration, so today it returns
+`Error::NotImplemented { stage: Stage::Simulate }` after elaborating. The
+signature will stay the same as the simulator arrives.
 
 The preprocessor is tested against Verilator's own CC0 golden files:
 
@@ -39,12 +39,14 @@ quirk are documented in [`docs/design/03-grammar.md`](docs/design/03-grammar.md)
 
 ```console
 $ cargo install --path libparagon
-$ paragon [-E [-P]] [-DNAME[=VALUE]] [+incdir+DIR] [-IDIR] FILE
+$ paragon [-E [-P] | --ir] [-DNAME[=VALUE]] [+incdir+DIR] [-IDIR] [--top-module NAME] FILE
 ```
 
 | Option | Meaning |
 |---|---|
 | `-E` | Preprocess only, writing the result to stdout with `` `line `` markers |
+| `--ir` | Compile and print the elaborated IR |
+| `--top-module NAME` | Choose the top module |
 | `-P` | With `-E`: no `` `line `` markers, and blank lines dropped |
 | `-DNAME[=VALUE]` | Define a macro |
 | `+incdir+DIR[+DIR...]`, `-IDIR` | Add include directories |
@@ -107,11 +109,54 @@ $ paragon counter.sv
 %Error: Exiting due to 1 error(s)
 ```
 
-Running without `-E` simulates. For now that stops after parsing:
+`--ir` compiles the design and prints the elaborated IR: basic blocks of
+typed, three-address instructions, with every width change explicit. Given
+`count.sv`:
+
+```systemverilog
+module count;
+  logic clk = 0;
+  logic [3:0] n = 0;
+  always #5 clk = ~clk;
+  always @(posedge clk) n <= n + 1;
+endmodule
+```
 
 ```console
-$ paragon +incdir+inc counter.sv
-%Error: Elaborate is not implemented yet
+$ paragon --ir count.sv
+var count.clk: logic = 1'h0
+var count.n: logic[4] = 4'h0
+proc Always in count:
+  bb0:
+    %0 = const 64'h5                              : bit[64]
+    suspend Delay(%0) -> bb1
+  bb1:
+    %1 = load count.clk                           : logic
+    %2 = Not %1                                   : logic
+    store count.clk = %2
+    jump bb0()
+proc Always in count:
+  bb0:
+    suspend Edge[(count.clk, Pos)] -> bb1
+  bb1:
+    %0 = load count.n                             : logic[4]
+    %1 = resize.Zero %0                           : logic[32]
+    %2 = const 32'h1                              : bit[32] signed
+    %3 = resize.Zero %2                           : logic[32]
+    %4 = Add %1, %3                               : logic[32]
+    %5 = resize.Truncate %4                       : logic[4]
+    nba_store count.n = %5
+    jump bb0()
+```
+
+`n + 1` is computed at 32 bits, because the unsized `1` is 32 bits wide, and
+then truncated to 4 bits, as IEEE 1800 §11.8 requires.
+
+Running without `-E` or `--ir` simulates. For now that stops after elaboration:
+
+```console
+$ paragon count.sv
+%Error: Simulate is not implemented yet
 ```
 
 ## Library
@@ -148,7 +193,7 @@ block_on(async {
     let mut sim = match simulate(source).await {
         Ok(sim) => sim,
         Err(Error::Diagnostics(diags)) => return diags.iter().for_each(|d| eprintln!("{d}")),
-        Err(e) => return eprintln!("{e}"), // today: "Elaborate is not implemented yet"
+        Err(e) => return eprintln!("{e}"), // today: "Simulate is not implemented yet"
     };
     while let Some(event) = sim.next_event().await {
         match event {
@@ -214,9 +259,9 @@ async fn main() -> Result<(), libparagon::Error> {
 ## Progress against the Verilator test suite
 
 `paragon-runner` runs every Verilator regression test through `libparagon`
-and reports how far each one gets. Today, 1,399 of the 2,139 self-checking
-simulation tests (65%) get through preprocessing and parsing. Most of the rest
-stop at classes or assertions. See
+and reports how far each one gets. Today, 567 of the 2,139 self-checking
+simulation tests (27%) elaborate completely and wait only for the simulator.
+Most of the rest stop at classes, interfaces or assertions. See
 [`docs/design/01-test-suite-taxonomy.md`](docs/design/01-test-suite-taxonomy.md).
 
 ```console

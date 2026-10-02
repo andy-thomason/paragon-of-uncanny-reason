@@ -1,18 +1,25 @@
 //! `paragon`: command-line front end.
 //!
 //! ```text
-//! paragon [-E [-P]] [-DNAME[=VALUE]] [+incdir+DIR] [-IDIR] FILE
+//! paragon [-E [-P] | --ir] [-DNAME[=VALUE]] [+incdir+DIR] [-IDIR] [--top-module NAME] FILE
 //! ```
 
-use libparagon::{Error, Event, Finish, Options, block_on, preprocess_with, simulate_with};
+use libparagon::{
+    Error, Event, Finish, Options, block_on, lower_with, preprocess_with, simulate_with,
+};
 use std::io::Write;
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
     let mut opts = Options::default();
-    let (mut preprocess_only, mut no_markers, mut file) = (false, false, None);
-    for arg in std::env::args().skip(1) {
-        if arg == "-E" {
+    let (mut preprocess_only, mut no_markers, mut ir, mut file) = (false, false, false, None);
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        if arg == "--ir" {
+            ir = true;
+        } else if arg == "--top-module" || arg == "--top" {
+            opts.top = args.next();
+        } else if arg == "-E" {
             preprocess_only = true;
         } else if arg == "-P" {
             no_markers = true;
@@ -32,7 +39,9 @@ fn main() -> ExitCode {
         }
     }
     let Some(file) = file else {
-        eprintln!("usage: paragon [-E [-P]] [-DNAME[=VALUE]] [+incdir+DIR] [-IDIR] FILE");
+        eprintln!(
+            "usage: paragon [-E [-P] | --ir] [-DNAME[=VALUE]] [+incdir+DIR] [-IDIR] [--top-module NAME] FILE"
+        );
         return ExitCode::FAILURE;
     };
     let source = match std::fs::read_to_string(&file) {
@@ -45,6 +54,16 @@ fn main() -> ExitCode {
     opts.source_name = file;
     opts.line_markers = !no_markers;
 
+    if ir {
+        return match block_on(lower_with(&source, &opts)) {
+            Ok((text, warnings)) => {
+                print!("{text}");
+                warnings.iter().for_each(|w| eprintln!("{w}"));
+                ExitCode::SUCCESS
+            }
+            Err(e) => report(e),
+        };
+    }
     if preprocess_only {
         return match block_on(preprocess_with(&source, &opts)) {
             Ok(p) => {

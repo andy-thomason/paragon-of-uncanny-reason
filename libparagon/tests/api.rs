@@ -15,9 +15,17 @@ fn simulate_reports_the_first_missing_stage() {
     assert_eq!(
         r,
         Some(Error::NotImplemented {
-            stage: Stage::Elaborate
+            stage: Stage::Simulate
         })
     );
+}
+
+#[test]
+fn lower_returns_ir_text() {
+    let (ir, _) = block_on(lower_with(HELLO, &no_disk())).unwrap();
+    assert!(ir.contains("proc Initial in t:"), "{ir}");
+    assert!(ir.contains("Display fmt#0"), "{ir}");
+    assert!(ir.contains("finish Finish"), "{ir}");
 }
 
 #[test]
@@ -51,7 +59,7 @@ fn language_option_changes_keywords() {
     assert_eq!(
         block_on(simulate_with(src, &opts)).err(),
         Some(Error::NotImplemented {
-            stage: Stage::Elaborate
+            stage: Stage::Simulate
         })
     );
 }
