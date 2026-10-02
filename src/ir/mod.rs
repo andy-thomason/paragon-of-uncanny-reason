@@ -423,6 +423,29 @@ pub enum Op {
     /// A virtual method call: `args[0]` is the object, whose class's
     /// vtable gives the function for `slot`.
     VCall { slot: u32, args: Vec<Val> },
+    /// `force` (LRM 10.6.2): reads of the variable (element, bits) see
+    /// `value` until released. Gives a token for the force; with `token`,
+    /// renews that force instead.
+    Force {
+        var: VarId,
+        elem: Option<Val>,
+        part: Option<Part>,
+        value: Val,
+        token: Option<Val>,
+    },
+    /// `release`.
+    Release {
+        var: VarId,
+        elem: Option<Val>,
+        part: Option<Part>,
+    },
+    /// Is the force with `token` still in effect on the variable?
+    IsForcer {
+        var: VarId,
+        elem: Option<Val>,
+        part: Option<Part>,
+        token: Val,
+    },
     /// The built-in `process` class (LRM 9.7).
     Process { func: ProcFunc, args: Vec<Val> },
     /// Is the handle not null and its object of `class` or derived from it?

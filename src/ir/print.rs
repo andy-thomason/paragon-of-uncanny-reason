@@ -212,6 +212,31 @@ impl BodyFmt<'_, '_> {
                 value.0
             ),
             Op::VCall { slot, args } => format!("vcall #{slot}({})", Self::vals(args)),
+            Op::Force {
+                var,
+                elem,
+                part,
+                value,
+                ..
+            } => format!(
+                "force {}{}{} = %{}",
+                self.var(*var),
+                elem.map_or(String::new(), |e| format!("[%{}]", e.0)),
+                Self::part(part),
+                value.0
+            ),
+            Op::Release { var, elem, part } => format!(
+                "release {}{}{}",
+                self.var(*var),
+                elem.map_or(String::new(), |e| format!("[%{}]", e.0)),
+                Self::part(part)
+            ),
+            Op::IsForcer { var, elem, part, .. } => format!(
+                "is_forcer {}{}{}",
+                self.var(*var),
+                elem.map_or(String::new(), |e| format!("[%{}]", e.0)),
+                Self::part(part)
+            ),
             Op::Process { func, args } => format!("process.{func:?}({})", Self::vals(args)),
             Op::IsA { value, class } => {
                 format!("isa %{} {}", value.0, d.classes[class.0 as usize].name)

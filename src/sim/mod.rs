@@ -121,6 +121,15 @@ enum Wake {
     Clock(usize),
 }
 
+/// A force on a variable (or element): which bits, their value, and the
+/// thread that keeps it up to date.
+struct Forced {
+    mask: Bits,
+    value: Bits,
+    /// The force statement execution that set it.
+    token: u64,
+}
+
 pub struct Simulator<'d, 'a> {
     d: &'d Design<'a>,
     store: Vec<Store>,
@@ -129,6 +138,11 @@ pub struct Simulator<'d, 'a> {
     active: VecDeque<ThreadId>,
     inactive: VecDeque<(ThreadId, u64)>,
     future: BTreeMap<(u64, u64), Wake>,
+    /// Forced variables (and elements).
+    forced: std::collections::HashMap<(VarId, Option<i64>), Forced>,
+    /// Set while a write to a forced variable must not wake anyone itself.
+    quiet: bool,
+    tokens: u64,
     /// Clocks driven from outside the design: the variable and its half period.
     clocks: Vec<(VarId, u64)>,
     seq: u64,
@@ -168,6 +182,9 @@ impl<'d, 'a> Simulator<'d, 'a> {
             inactive: VecDeque::new(),
             future: BTreeMap::new(),
             clocks: Vec::new(),
+            forced: Default::default(),
+            quiet: false,
+            tokens: 0,
             seq: 0,
             nba: Vec::new(),
             waiters: d.vars.iter().map(|_| Vec::new()).collect(),
@@ -375,6 +392,22 @@ impl<'d, 'a> Simulator<'d, 'a> {
     // ------------------------------------------------------------ state
 
     fn read(&self, var: VarId) -> Value {
+        let raw = self.read_raw(var);
+        self.overlay(var, None, raw)
+    }
+
+    /// A value with any force on it applied.
+    fn overlay(&self, var: VarId, elem: Option<i64>, v: Value) -> Value {
+        match (self.forced.get(&(var, elem)), v) {
+            (Some(f), Value::Bits(b)) => {
+                let b = b.resize(f.mask.width, false);
+                Value::Bits(b.and(&f.mask.not()).or(&f.value.and(&f.mask)))
+            }
+            (_, v) => v,
+        }
+    }
+
+    fn read_raw(&self, var: VarId) -> Value {
         match &self.store[var.0 as usize] {
             Store::Scalar(v) => v.clone(),
             Store::Array(a) => Value::Array(a.clone()),
@@ -392,6 +425,14 @@ impl<'d, 'a> Simulator<'d, 'a> {
     }
 
     fn read_elem(&self, var: VarId, i: Option<i64>) -> Value {
+        let raw = self.read_elem_raw(var, i);
+        match i {
+            Some(_) => self.overlay(var, i, raw),
+            None => raw,
+        }
+    }
+
+    fn read_elem_raw(&self, var: VarId, i: Option<i64>) -> Value {
         match (&self.store[var.0 as usize], i) {
             // A dynamic array or queue.
             (Store::Scalar(Value::Array(a)), i) => match i {
@@ -418,6 +459,102 @@ impl<'d, 'a> Simulator<'d, 'a> {
 
     /// Write design state, converting to the stored type, and wake waiters if it changed.
     fn write(&mut self, var: VarId, elem: Option<i64>, part: Option<(i64, u32)>, value: Value) {
+        if !self.forced.is_empty() && self.forced.contains_key(&(var, elem)) {
+            // Forced: the stored value changes, but waiters see only what
+            // reads see.
+            let before = self.visible(var, elem);
+            self.quiet = true;
+            self.write_raw(var, elem, part, value);
+            self.quiet = false;
+            let after = self.visible(var, elem);
+            if before != after {
+                self.wake(var, &before, &after);
+            }
+            return;
+        }
+        self.write_raw(var, elem, part, value)
+    }
+
+    /// What reads of a variable (or element) see.
+    fn visible(&self, var: VarId, elem: Option<i64>) -> Value {
+        match elem {
+            Some(_) => self.read_elem(var, elem),
+            None => self.read(var),
+        }
+    }
+
+    /// The bits of `part` (all of them if `None`) of a `width`-bit value.
+    fn part_mask(width: u32, part: Option<(i64, u32)>) -> Bits {
+        match part {
+            None => Bits::ones(width),
+            Some((lsb, w)) => {
+                let mut m = Bits::zero(width);
+                m.insert(lsb, &Bits::ones(w));
+                m
+            }
+        }
+    }
+
+    /// `force`: keep the forced bits, and wake anyone who sees a change.
+    fn force(&mut self, token: u64, var: VarId, elem: Option<i64>, part: Option<(i64, u32)>, value: Value) {
+        let Value::Bits(v) = self.visible(var, elem) else {
+            return;
+        };
+        let before = Value::Bits(v.clone());
+        let width = v.width;
+        let mask = Self::part_mask(width, part);
+        let Value::Bits(nv) = value else { return };
+        let placed = match part {
+            None => nv.resize(width, false),
+            Some((lsb, w)) => {
+                let mut p = Bits::zero(width);
+                p.insert(lsb, &nv.resize(w, false));
+                p
+            }
+        };
+        let e = self.forced.entry((var, elem)).or_insert(Forced {
+            mask: Bits::zero(width),
+            value: Bits::zero(width),
+            token,
+        });
+        e.value = e.value.and(&mask.not()).or(&placed.and(&mask));
+        e.mask = e.mask.or(&mask);
+        e.token = token;
+        let after = self.visible(var, elem);
+        if before != after {
+            self.wake(var, &before, &after);
+        }
+    }
+
+    /// `release`: a variable keeps the forced value until next assigned;
+    /// a net goes back to what drives it.
+    fn release(&mut self, var: VarId, elem: Option<i64>, part: Option<(i64, u32)>) {
+        let Some(f) = self.forced.get(&(var, elem)) else {
+            return;
+        };
+        let before = self.visible(var, elem);
+        let mask = Self::part_mask(f.mask.width, part).and(&f.mask);
+        if matches!(self.d.vars[var.0 as usize].kind, VarKind::Variable)
+            && let Value::Bits(b) = &before
+        {
+            // Keep the forced bits as the variable's own value.
+            let keep = b.clone();
+            self.quiet = true;
+            self.write_raw(var, elem, None, Value::Bits(keep));
+            self.quiet = false;
+        }
+        let f = self.forced.get_mut(&(var, elem)).unwrap();
+        f.mask = f.mask.and(&mask.not());
+        if f.mask.is_zero() {
+            self.forced.remove(&(var, elem));
+        }
+        let after = self.visible(var, elem);
+        if before != after {
+            self.wake(var, &before, &after);
+        }
+    }
+
+    fn write_raw(&mut self, var: VarId, elem: Option<i64>, part: Option<(i64, u32)>, value: Value) {
         if let Store::Scalar(Value::Array(_)) = &self.store[var.0 as usize] {
             // A dynamic array or queue: the whole value, or one element.
             let ety = match &self.d.types[self.d.vars[var.0 as usize].ty.0 as usize] {
@@ -491,6 +628,9 @@ impl<'d, 'a> Simulator<'d, 'a> {
     }
 
     fn wake(&mut self, var: VarId, old: &Value, new: &Value) {
+        if self.quiet {
+            return;
+        }
         let ws = std::mem::take(&mut self.waiters[var.0 as usize]);
         let mut keep = Vec::new();
         for w in ws {
@@ -761,6 +901,52 @@ impl<'d, 'a> Simulator<'d, 'a> {
                     crate::eval::store_elem(&mut ob.fields[*field as usize], i, p, v, elem);
                 }
                 None
+            }
+            Op::Force {
+                var,
+                elem,
+                part,
+                value,
+                token,
+            } => {
+                let tok = match token {
+                    Some(k) => self.int(t, *k).unwrap_or(0) as u64,
+                    None => {
+                        self.tokens += 1;
+                        self.tokens
+                    }
+                };
+                let e = elem.map(|e| self.int(t, e));
+                if let (Some(p), e) = (self.part(t, part), e)
+                    && e != Some(None)
+                {
+                    let v = self.val(t, *value);
+                    self.force(tok, *var, e.flatten(), p, v);
+                }
+                Some(Value::Bits(Bits::from_u64(64, tok)))
+            }
+            Op::Release { var, elem, part } => {
+                let e = elem.map(|e| self.int(t, e)).flatten();
+                if let Some(p) = self.part(t, part) {
+                    self.release(*var, e, p);
+                }
+                None
+            }
+            Op::IsForcer {
+                var,
+                elem,
+                part,
+                token,
+            } => {
+                let e = elem.map(|e| self.int(t, e)).flatten();
+                let tok = self.int(t, *token).unwrap_or(0) as u64;
+                let mine = match (self.forced.get(&(*var, e)), self.part(t, part)) {
+                    (Some(f), Some(p)) => {
+                        f.token == tok && !Self::part_mask(f.mask.width, p).and(&f.mask).is_zero()
+                    }
+                    _ => false,
+                };
+                Some(Value::Bits(Bits::from_bool(mine)))
             }
             Op::Process { func, args } => {
                 let target = |this: &Self, i: usize| -> Option<ThreadId> {

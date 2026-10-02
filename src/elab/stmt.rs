@@ -552,6 +552,123 @@ impl<'a, 't> Elab<'a, 't> {
         Ok(())
     }
 
+    /// `force lhs = rhs;` and `release lhs;` (and procedural `assign` and
+    /// `deassign`, treated the same). A force takes effect at once; a child
+    /// thread renews it whenever what `rhs` reads changes, until it is
+    /// released or forced again.
+    fn lower_force(
+        &mut self,
+        cx: &mut Cx<'a>,
+        kw: &'a str,
+        lhs: &'t Expr<'a>,
+        rhs: Option<&'t Expr<'a>>,
+    ) -> EResult<()> {
+        let targets: Vec<&'t Expr<'a>> = match lhs {
+            Expr::Concat(parts) => parts.iter().collect(),
+            e => vec![e],
+        };
+        if targets.len() > 1 && rhs.is_some() {
+            return Err(self.not_yet(kw, "forcing a concatenation"));
+        }
+        for target in targets {
+            let Some(p) = self.path(cx, target)? else {
+                return Err(self.error(target.at(), format!("Illegal {kw} target")));
+            };
+            let super::expr::Root::Var(var) = p.root else {
+                return Err(self.not_yet(target.at(), &format!("{kw} of this target")));
+            };
+            if p.key.is_some() || !p.ty.unpacked.is_empty() {
+                return Err(self.not_yet(target.at(), &format!("{kw} of whole or associative arrays")));
+            }
+            let part = p.lsb.map(|lsb| Part {
+                lsb,
+                width: p.width,
+            });
+            let Some(rhs) = rhs else {
+                cx.b.effect(
+                    Op::Release {
+                        var,
+                        elem: p.elem,
+                        part,
+                    },
+                    kw,
+                );
+                continue;
+            };
+            let tt = self.bits_type(64, false, false);
+            cx.b.read_scopes.push(BTreeSet::new());
+            let v = self.lower_to(cx, rhs, &p.ty)?;
+            let reads = cx.b.read_scopes.pop().unwrap();
+            let token = cx.b.emit(
+                Op::Force {
+                    var,
+                    elem: p.elem,
+                    part,
+                    value: v,
+                    token: None,
+                },
+                tt,
+                kw,
+            );
+            if reads.is_empty() {
+                continue;
+            }
+            // The watcher: wait for a change, then renew while still forced.
+            let (watch, check, renew, resume) = (
+                cx.b.new_block(),
+                cx.b.new_block(),
+                cx.b.new_block(),
+                cx.b.new_block(),
+            );
+            cx.b.terminate(Terminator::Fork {
+                children: vec![watch],
+                join: Join::None,
+                resume,
+            });
+            cx.b.switch_to(watch);
+            cx.b.terminate(Terminator::Suspend {
+                wait: Wait::AnyChange(reads.into_iter().collect()),
+                resume: check,
+            });
+            cx.b.switch_to(check);
+            let bit = self.bits_type(1, false, false);
+            let still = cx.b.emit(
+                Op::IsForcer {
+                    var,
+                    elem: p.elem,
+                    part,
+                    token,
+                },
+                bit,
+                kw,
+            );
+            let done = cx.b.new_block();
+            cx.b.terminate(Terminator::Branch {
+                cond: still,
+                then: (renew, vec![]),
+                els: (done, vec![]),
+            });
+            cx.b.switch_to(done);
+            cx.b.terminate(Terminator::EndThread);
+            cx.b.switch_to(renew);
+            let v = self.lower_to(cx, rhs, &p.ty)?;
+            cx.b.emit(
+                Op::Force {
+                    var,
+                    elem: p.elem,
+                    part,
+                    value: v,
+                    token: Some(token),
+                },
+                tt,
+                kw,
+            );
+            cx.b.terminate(Terminator::Jump(watch, vec![]));
+            cx.b.switch_to(resume);
+        }
+        Ok(())
+    }
+
     /// Lower `f` inside markers that let `disable tag` leave it.
     fn tagged(
         &mut self,
@@ -1074,7 +1191,7 @@ impl<'a, 't> Elab<'a, 't> {
                 cx.b.terminate(Terminator::Jump(target, vec![]));
                 Ok(())
             }
-            Stmt::ProcAssign { kw, .. } => Err(self.not_yet(kw, &format!("procedural {kw}"))),
+            Stmt::ProcAssign { kw, lhs, rhs } => self.lower_force(cx, kw, lhs, rhs.as_ref()),
             Stmt::Assert {
                 kw,
                 cond,
