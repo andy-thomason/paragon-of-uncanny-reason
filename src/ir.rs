@@ -75,7 +75,9 @@ pub enum ScopeKind<'a> {
     /// An instance of this module (the module name).
     Instance(&'a str),
     /// A generate block; `index` is set for a block inside a generate loop.
-    Generate { index: Option<i64> },
+    Generate {
+        index: Option<i64>,
+    },
     /// A named `begin`/`fork` block.
     Block,
     Package,
@@ -155,15 +157,29 @@ pub enum Type<'a> {
     Event,
     Chandle,
     /// `elem name [left:right]`.
-    Unpacked { elem: TypeId, left: i64, right: i64 },
+    Unpacked {
+        elem: TypeId,
+        left: i64,
+        right: i64,
+    },
     /// `elem name []`.
-    Dynamic { elem: TypeId },
+    Dynamic {
+        elem: TypeId,
+    },
     /// `elem name [$]` or `[$:max]`.
-    Queue { elem: TypeId, max: Option<u32> },
+    Queue {
+        elem: TypeId,
+        max: Option<u32>,
+    },
     /// `elem name [key]`; `key` is `None` for `[*]`.
-    Assoc { elem: TypeId, key: Option<TypeId> },
+    Assoc {
+        elem: TypeId,
+        key: Option<TypeId>,
+    },
     /// An unpacked struct.
-    Struct { fields: Vec<Field<'a>> },
+    Struct {
+        fields: Vec<Field<'a>>,
+    },
     Void,
 }
 
@@ -216,27 +232,60 @@ pub enum ExprKind {
     /// A bit or part select of a packed value: `width` bits from bit `lsb`.
     /// Every form (`a[i]`, `a[7:4]`, `a[i+:4]`, `a[i-:4]`, a packed struct
     /// member) is lowered to this, with any declared range offset applied.
-    Select { base: Box<Expr>, lsb: Box<Expr>, width: u32 },
+    Select {
+        base: Box<Expr>,
+        lsb: Box<Expr>,
+        width: u32,
+    },
     /// An element of an unpacked, dynamic, queue or associative array.
-    Index { base: Box<Expr>, index: Box<Expr> },
+    Index {
+        base: Box<Expr>,
+        index: Box<Expr>,
+    },
     /// A member of an unpacked struct, by field position.
-    Field { base: Box<Expr>, field: u32 },
+    Field {
+        base: Box<Expr>,
+        field: u32,
+    },
     Unary(UnOp, Box<Expr>),
     Binary(BinOp, Box<Expr>, Box<Expr>),
     /// `cond ? then : els`. With an X/Z condition the LRM merges both results.
-    Cond { cond: Box<Expr>, then: Box<Expr>, els: Box<Expr> },
+    Cond {
+        cond: Box<Expr>,
+        then: Box<Expr>,
+        els: Box<Expr>,
+    },
     /// Most significant first, as written.
     Concat(Vec<Expr>),
-    Repl { count: u32, expr: Box<Expr> },
+    Repl {
+        count: u32,
+        expr: Box<Expr>,
+    },
     /// Change width or signedness. Inserted by elaboration wherever the LRM
     /// implicitly extends or truncates.
-    Resize { expr: Box<Expr>, to: TypeId, extend: Extend },
+    Resize {
+        expr: Box<Expr>,
+        to: TypeId,
+        extend: Extend,
+    },
     /// A conversion that is not a resize: integral to real, real to integral,
     /// or to string.
-    Convert { expr: Box<Expr>, to: TypeId },
-    Inside { expr: Box<Expr>, set: Vec<InsideItem> },
-    Call { func: FuncId, args: Vec<Expr> },
-    SysFunc { func: SysFunc, args: Vec<Expr> },
+    Convert {
+        expr: Box<Expr>,
+        to: TypeId,
+    },
+    Inside {
+        expr: Box<Expr>,
+        set: Vec<InsideItem>,
+    },
+    Call {
+        func: FuncId,
+        args: Vec<Expr>,
+    },
+    SysFunc {
+        func: SysFunc,
+        args: Vec<Expr>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -344,9 +393,19 @@ pub enum SysFunc {
 #[derive(Clone, Debug)]
 pub enum LValue {
     Var(VarId),
-    Select { base: Box<LValue>, lsb: Expr, width: u32 },
-    Index { base: Box<LValue>, index: Expr },
-    Field { base: Box<LValue>, field: u32 },
+    Select {
+        base: Box<LValue>,
+        lsb: Expr,
+        width: u32,
+    },
+    Index {
+        base: Box<LValue>,
+        index: Expr,
+    },
+    Field {
+        base: Box<LValue>,
+        field: u32,
+    },
     /// `{a, b} = ...`, most significant first.
     Concat(Vec<LValue>),
 }
@@ -356,13 +415,36 @@ pub enum Stmt<'a> {
     Block(Vec<Stmt<'a>>),
     /// `lhs = rhs` (blocking) or `lhs <= rhs` (non-blocking). Compound
     /// assignments (`+=`) are lowered to plain ones.
-    Assign { lhs: LValue, rhs: Expr, kind: AssignKind, delay: Option<Delay> },
-    If { cond: Expr, then: Box<Stmt<'a>>, els: Option<Box<Stmt<'a>>>, check: CaseCheck },
-    Case { kind: CaseKind, expr: Expr, items: Vec<(Vec<CaseLabel>, Stmt<'a>)>, default: Option<Box<Stmt<'a>>>, check: CaseCheck },
+    Assign {
+        lhs: LValue,
+        rhs: Expr,
+        kind: AssignKind,
+        delay: Option<Delay>,
+    },
+    If {
+        cond: Expr,
+        then: Box<Stmt<'a>>,
+        els: Option<Box<Stmt<'a>>>,
+        check: CaseCheck,
+    },
+    Case {
+        kind: CaseKind,
+        expr: Expr,
+        items: Vec<(Vec<CaseLabel>, Stmt<'a>)>,
+        default: Option<Box<Stmt<'a>>>,
+        check: CaseCheck,
+    },
     /// All loops are `while`, `do while`, `repeat` or `forever`; `for` and
     /// `foreach` become a block with a `while`.
-    While { cond: Expr, body: Box<Stmt<'a>>, test_first: bool },
-    Repeat { count: Expr, body: Box<Stmt<'a>> },
+    While {
+        cond: Expr,
+        body: Box<Stmt<'a>>,
+        test_first: bool,
+    },
+    Repeat {
+        count: Expr,
+        body: Box<Stmt<'a>>,
+    },
     Forever(Box<Stmt<'a>>),
     Break,
     Continue,
@@ -375,17 +457,35 @@ pub enum Stmt<'a> {
     Wait(Expr),
     /// `wait fork`.
     WaitFork,
-    Fork { join: Join, branches: Vec<Stmt<'a>> },
+    Fork {
+        join: Join,
+        branches: Vec<Stmt<'a>>,
+    },
     /// `-> ev`.
     TriggerEvent(VarId),
     /// `disable name`.
     Disable(ScopeId),
     DisableFork,
-    Call { func: FuncId, args: Vec<Expr> },
-    SysTask { task: SysTask, args: Vec<Expr>, at: &'a str },
+    Call {
+        func: FuncId,
+        args: Vec<Expr>,
+    },
+    SysTask {
+        task: SysTask,
+        args: Vec<Expr>,
+        at: &'a str,
+    },
     /// An immediate assertion. `pass` and `fail` are the action blocks.
-    Assert { cond: Expr, pass: Option<Box<Stmt<'a>>>, fail: Option<Box<Stmt<'a>>>, at: &'a str },
-    Force { lhs: LValue, rhs: Expr },
+    Assert {
+        cond: Expr,
+        pass: Option<Box<Stmt<'a>>>,
+        fail: Option<Box<Stmt<'a>>>,
+        at: &'a str,
+    },
+    Force {
+        lhs: LValue,
+        rhs: Expr,
+    },
     Release(LValue),
     Nop,
 }
